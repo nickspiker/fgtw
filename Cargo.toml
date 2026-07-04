@@ -10,17 +10,23 @@ readme = "README.md"
 keywords = ["identity", "fleet", "trust", "decentralized", "token"]
 categories = ["cryptography", "authentication"]
 
-# 0.0.0 is a name-reservation + architecture scaffold.
-# Modules are stubs; code migrates in from photon/src/network/fgtw/ per MIGRATION.md, published-dep-by-published-dep.
-# Deliberately dependency-free at 0.0.0 so it publishes clean today; real deps (vsf, blake3, ed25519-dalek, …) land as each module's code moves in and its deps are themselves published.
+# 0.0.0 is a name-reservation + live migration target.
+# Code migrates in from photon/src/network/fgtw/ per MIGRATION.md, module by module, keeping photon + the FGTW worker green at each step.
+# Consumers use it as a PATH dep during the migration (unpublished beyond the 0.0.0 reservation); real crates.io publish waits until vsf/spirix publish.
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
-# The no_std core (fleet fold/verify, fan-out crypto, protocol codec) is what the WASM worker and every client share.
-# `client` adds the std HTTP oracle (fetch-then-sign, announce, publish) that only real clients need — the worker never enables it.
+# The core (fleet fold/verify, fan-out crypto, protocol codec) is what the WASM worker and every client share — always compiled.
+# `fanout` adds the per-member fan-out + roster codec + pairing words (extra crypto deps); a wasm signer can enable it without `client`.
+# `client` adds the std HTTP oracle (fetch-then-sign, announce, publish) that only real clients need — the worker never enables it. It implies `fanout`.
 default = ["client"]
-client = []
+fanout = []
+client = ["fanout"]
 
 [dependencies]
+# vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.
+vsf = { path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
+blake3 = { version = "1", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }

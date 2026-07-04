@@ -10,28 +10,31 @@
 //! The modules below are **stubs**; code migrates in from `photon/src/network/fgtw/` per `MIGRATION.md`.
 //! Nothing here is load-bearing yet — photon and the worker still run their own copies until each module is moved and re-pointed, keeping both green at every step.
 //!
-//! ## The split: `core` (no_std) vs `client` (std)
+//! ## The split: `core` vs `client` (feature)
 //!
 //! - **core** — fleet fold/verify, fan-out crypto, protocol codec.
 //!   Compiles to WASM; the worker and every client share it.
-//!   This is where the current client/worker duplication (photon `fleet.rs` ↔ worker `fleet.rs`, "kept in lockstep via a known-answer test") collapses into one source of truth.
+//!   This is where the old client/worker duplication (photon `fleet.rs` ↔ worker `fleet.rs`, kept in lockstep by hand via a known-answer test) collapses into one source of truth.
 //! - **client** (feature) — the std HTTP oracle: fetch-then-sign, announce, publish.
 //!   Only real clients enable it; the worker never does.
 //!
+//! The crate is `std` for now: its only consumers (photon and the FGTW worker, a wasm32 cdylib) are both `std`, and the `vsf` codec it rides pulls `std` transitively (via `crypto`/`inspect`).
+//! A `#![no_std]` core is a later step, once a genuinely `no_std` consumer (an embedded signer) exists and `vsf`'s crypto/clock surface is factored for it — until then it would be `alloc::` friction with no `no_std` binary to show for it.
+//!
 //! ## What lives here (generic) vs stays in photon (messaging)
 //!
-//! **Here:** identity/device-key derivation, attestation/announce, the fleet membership chain, the fan-out of scoped-key bundles (see [`fanout`]), fleet-shared state ([`fstate`]), avatar/blob storage, and the FGTW wire protocol ([`protocol`]).
+//! **Here:** identity/device-key derivation ([`keys`]), attestation/announce, the fleet membership chain ([`fleet`]), the fan-out of scoped-key bundles (see [`fanout`]), fleet-shared state ([`fstate`]), avatar/blob storage, and the FGTW wire protocol ([`protocol`]).
 //!
 //! **NOT here — stays in photon:** CLUTCH (friendship key exchange), Photon Transfer / the braid, presence ping/pong, contacts/conversations.
 //! That's *messaging*, not *identity* — the calendar doesn't want it.
 
-#![cfg_attr(not(feature = "client"), no_std)]
+/// Device identity keypair — the deterministic Ed25519 signing key (`Keypair`) fleet ops and attestations are signed with.
+pub mod keys;
 
-/// Fleet membership chain — `FleetOp` / `MembershipBlob` / `fold` / `extends` / `is_member`.
+/// Fleet membership chain — `FleetOp` / `MembershipBlob` / `fold` / `extends` / `is_member`, plus the VSF op codec and the device-signed builders.
 /// The authority: valid signature + hash-chain link + signer-was-a-prior-member.
-/// no_std core, shared by the worker (verify) and clients (fetch-then-sign).
-/// ⏳ migrate from photon `fleet.rs`.
-pub mod fleet {}
+/// The one source of truth shared by the worker (verify) and clients (fetch-then-sign).
+pub mod fleet;
 
 /// Per-member fan-out — sealing a per-device **bundle of scoped keys** and opening your own.
 /// Full / scoped / route-only / loaner / revoked are all just different bundles.
