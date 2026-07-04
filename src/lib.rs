@@ -8,7 +8,7 @@
 //! ## Status: 0.0.0 scaffold
 //!
 //! Name reservation + architecture map. The modules below are **stubs**; code migrates in from
-//! `photon/src/network/fgtw/` per `docs/fgtw-crate-migration.md`. Nothing here is load-bearing
+//! `photon/src/network/fgtw/` per `MIGRATION.md`. Nothing here is load-bearing
 //! yet — photon and the worker still run their own copies until each module is moved and
 //! re-pointed, keeping both green at every step.
 //!
