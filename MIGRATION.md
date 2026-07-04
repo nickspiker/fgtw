@@ -37,13 +37,19 @@ The current client/worker duplication — photon `fleet.rs` fold ↔ `fgtw-boots
    The whole fetch-then-sign oracle (fetch/publish/ensure_member/bind/unbind/current_members, pairing post/fetch/matched/poll, fan-out post/fetch/rotate/recover, roster push/pull) — transport-agnostic via the `FgtwTransport` (post bytes → {status, body}) + `FleetSealer` (roster AEAD) traits.
    The crate owns ALL protocol logic (404/409/epoch/freshness/sig checks) and stays reqwest-free; photon supplies `PhotonTransport` (pooled reqwest + short errors) + `PhotonSealer` (kete) and keeps same-signature wrappers so call sites are unchanged.
    The wire format is unchanged. photon + worker green.
-5. **`fgtw::protocol`.**
+5. **`fgtw::protocol`. — DEFERRED (2026-07-04 decision).**
    SPLIT `protocol.rs` — generic codec here, photon msgs stay.
-   This is the fiddliest; do it after the fleet/fanout/fstate types it references have moved.
-6. **`fgtw::blob`** + DHT (`node`/`peer_store`/`relay`) + finish `fingerprint` (reconcile with `tohu`).
-   Re-point.
+   Held back deliberately: `FgtwMessage` is one enum mixing DHT + generic-FGTW + photon-messaging variants (chat/status/avatar), so splitting it is an architecture choice (two enums + tag dispatch / whole-enum-to-crate / generic variants + opaque `App(bytes)`) that sits ON the messaging boundary. Do it AS PART of the messaging rework, once that structure is decided — splitting the enum before then risks redoing it.
+6. **`fgtw::blob`** + DHT (`node`/`peer_store`/`relay`) + finish `fingerprint` (reconcile with `tohu`). **— DEFERRED until a consumer needs them.**
+   Clean generic moves (no messaging decision), but nothing depends on them cross-app yet; move when the calendar (or another app) actually needs the DHT/blob.
 7. **Worker depends on `fgtw`; photon depends on `fgtw`.**
    Photon's `network/fgtw/` shrinks to the messaging layer + thin re-exports.
+
+## Status: paused after M3 (2026-07-04)
+
+Steps 0–4 above are **DONE** — the whole non-messaging substrate (device keys, the fleet membership chain, fan-out crypto, roster codec, pairing words, and the fetch-then-sign client oracle) is in the crate, shared by photon + the worker, wire format unchanged.
+That was the goal: extract the substrate so the messaging rework lands on a clean boundary.
+Steps 5–6 are deferred per the reasons above — 5 rides with the messaging rework, 6 waits for a real consumer.
 
 ## Invariants during the move
 
