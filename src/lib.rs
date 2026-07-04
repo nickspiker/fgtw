@@ -62,8 +62,8 @@ pub mod protocol {}
 /// ⏳ migrate from photon `blob.rs`.
 pub mod blob {}
 
-/// The std HTTP oracle: fetch-then-sign, announce, publish — the client's reach to the web.
+/// The FGTW client oracle: fetch-then-sign, publish, pairing, fan-out + roster transport, epoch rotation.
+/// Transport- and AEAD-agnostic via the [`client::FgtwTransport`] + [`client::FleetSealer`] traits — the app injects its own HTTP + roster crypto, so this crate stays reqwest-free.
 /// Gated behind the `client` feature; the worker never compiles it.
-/// ⏳ migrate from photon `bootstrap.rs` + the client halves of `fleet.rs`.
 #[cfg(feature = "client")]
-pub mod client {}
+pub mod client;

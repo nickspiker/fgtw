@@ -33,9 +33,10 @@ The current client/worker duplication — photon `fleet.rs` fold ↔ `fgtw-boots
    Deps (x25519 / chacha20poly1305 / rand / voca / num-bigint) are optional, pulled only by `fanout`, so the worker's base surface is untouched.
    `client` implies `fanout`; the pure tests moved with their code; photon re-exports and keeps the HTTP transport. photon + worker green.
    (The BTreeMap/sorted-Vec no_std refactors are deferred with the std decision — moved verbatim.)
-4. **`fgtw::client` (behind the `client` feature).**
-   The std HTTP oracle (fetch/publish/pairing/fan-out transport/roster push-pull/rotate/recover) via trait injection (photon supplies the reqwest transport + `kete` sealer).
-   Re-point.
+4. **[DONE] `fgtw::client` (behind the `client` feature).**
+   The whole fetch-then-sign oracle (fetch/publish/ensure_member/bind/unbind/current_members, pairing post/fetch/matched/poll, fan-out post/fetch/rotate/recover, roster push/pull) — transport-agnostic via the `FgtwTransport` (post bytes → {status, body}) + `FleetSealer` (roster AEAD) traits.
+   The crate owns ALL protocol logic (404/409/epoch/freshness/sig checks) and stays reqwest-free; photon supplies `PhotonTransport` (pooled reqwest + short errors) + `PhotonSealer` (kete) and keeps same-signature wrappers so call sites are unchanged.
+   The wire format is unchanged. photon + worker green.
 5. **`fgtw::protocol`.**
    SPLIT `protocol.rs` — generic codec here, photon msgs stay.
    This is the fiddliest; do it after the fleet/fanout/fstate types it references have moved.
