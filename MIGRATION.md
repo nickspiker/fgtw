@@ -28,12 +28,13 @@ The current client/worker duplication — photon `fleet.rs` fold ↔ `fgtw-boots
    Moved `Keypair` (`fgtw::keys`) and the fleet core (`FleetOp`, `MembershipBlob`, `fold`, `extends`, `is_member`, the VSF op codec, the device-signed builders) into the crate.
    Re-pointed photon `fleet.rs` (thin re-export + the client half) and the worker (`pub use fgtw::fleet::*`, mirror deleted); the known-answer test moved into `fgtw::fleet`.
    Highest value (dedup) + self-contained. photon + worker green.
-3. **`fgtw::fanout` (behind the `fanout` feature).**
-   Seal/open + roster codec + pairing words + the scoped-key bundle model (`docs/fleet-vault-security.md` in photon).
-   Two no_std-friendly refactors (BTreeMap roster merge, sorted-Vec word index) so a wasm signer can enable `fanout` without `client`.
-   Re-point.
-4. **`fgtw::client` (behind the `client` feature) + `fgtw::fstate`.**
-   The std HTTP oracle (fetch/publish/pairing/fan-out transport/roster push-pull) via trait injection (photon supplies the reqwest transport + `kete` sealer).
+3. **[DONE] `fgtw::fanout` + `fgtw::fstate` + `fgtw::pair` (behind the `fanout` feature).**
+   Moved the fan-out crypto (`fanout_seal`/`open`/`FanoutWrap` + codec + `new_fleet_key`), the roster codec (`RosterEntry` + serialize + `merge_rosters`), and the pairing word codec (`pair_words`/`words_to_pair_pubkey`/spell-check/`PairRequest`/`*_signing_bytes`).
+   Deps (x25519 / chacha20poly1305 / rand / voca / num-bigint) are optional, pulled only by `fanout`, so the worker's base surface is untouched.
+   `client` implies `fanout`; the pure tests moved with their code; photon re-exports and keeps the HTTP transport. photon + worker green.
+   (The BTreeMap/sorted-Vec no_std refactors are deferred with the std decision — moved verbatim.)
+4. **`fgtw::client` (behind the `client` feature).**
+   The std HTTP oracle (fetch/publish/pairing/fan-out transport/roster push-pull/rotate/recover) via trait injection (photon supplies the reqwest transport + `kete` sealer).
    Re-point.
 5. **`fgtw::protocol`.**
    SPLIT `protocol.rs` — generic codec here, photon msgs stay.

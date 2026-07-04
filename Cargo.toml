@@ -22,7 +22,8 @@ crate-type = ["rlib"]
 # `fanout` adds the per-member fan-out + roster codec + pairing words (extra crypto deps); a wasm signer can enable it without `client`.
 # `client` adds the std HTTP oracle (fetch-then-sign, announce, publish) that only real clients need — the worker never enables it. It implies `fanout`.
 default = ["client"]
-fanout = []
+# `fanout` pulls the fan-out crypto + roster codec + pairing words and their deps; a wasm signer can enable it without `client`. The worker enables neither (base = fleet fold/verify only), so none of these deps reach its wasm surface.
+fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand", "dep:voca", "dep:num-bigint"]
 client = ["fanout"]
 
 [dependencies]
@@ -30,3 +31,10 @@ client = ["fanout"]
 vsf = { path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
 blake3 = { version = "1", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+
+# fanout-only. Versions match photon's so the feature union shares one crate copy (not a second).
+x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
+chacha20poly1305 = { version = "0.11.0-rc.2", optional = true }
+rand = { version = "0.8", optional = true }
+voca = { version = "0.0.0", optional = true }
+num-bigint = { version = "0.4", optional = true }

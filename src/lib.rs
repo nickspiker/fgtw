@@ -36,16 +36,20 @@ pub mod keys;
 /// The one source of truth shared by the worker (verify) and clients (fetch-then-sign).
 pub mod fleet;
 
-/// Per-member fan-out — sealing a per-device **bundle of scoped keys** and opening your own.
-/// Full / scoped / route-only / loaner / revoked are all just different bundles.
-/// The KEK/DEK hierarchy (rotate keys, not data) lives here.
-/// ⏳ migrate the fan-out half of photon `fleet.rs`. See `docs/fleet-vault-security.md`.
-pub mod fanout {}
+/// Per-member fan-out — sealing the fleet key to each current member's device key, and opening your own.
+/// A device recovers the current key by trial-decrypting its own wrap; a removed device just isn't a wrap target next epoch.
+/// The scoped-key-bundle / KEK-DEK generalisation (rotate keys, not data) grows from here — see `docs/fleet-vault-security.md` in photon.
+#[cfg(feature = "fanout")]
+pub mod fanout;
 
-/// Fleet-shared encrypted state — the sealed slot each app writes its shared state into (photon: the contact roster; calendar: events).
-/// Membership-gated write, sealed read.
-/// ⏳ migrate the fstate half of photon `fleet.rs` + the worker's `fstate_put/get`.
-pub mod fstate {}
+/// Fleet-shared encrypted state — the codec for the slot each app writes its shared state into (photon: the contact roster; calendar: events).
+/// Data model + serialize + CRDT merge; the seal-and-push transport is the client's.
+#[cfg(feature = "fanout")]
+pub mod fstate;
+
+/// Pairing v1 — the device-ADD ceremony word codec (voca words ↔ pairing pubkey), spell-check, and the request/matched signing-bytes the relay transport signs.
+#[cfg(feature = "fanout")]
+pub mod pair;
 
 /// The FGTW wire protocol — the GENERIC messages: announce/challenge, fleet ops, avatar, blob.
 /// The photon-specific messages (chat, CLUTCH, PT) stay in photon; `protocol.rs` gets SPLIT.
