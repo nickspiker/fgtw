@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="fgtw.webp" alt="FGTW — Fractal Gradient Trust Web" width="360" />
+</p>
+
 # fgtw — Fractal Gradient Trust Web
 
 The client substrate for **TOKEN identity**: one identity, many apps.
