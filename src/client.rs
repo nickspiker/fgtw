@@ -1,7 +1,7 @@
 //! The FGTW client oracle — fetch-then-sign over an injected transport.
 //!
 //! The device is a blind, stateless signing oracle: it fetches a blob from FGTW, finds its own pubkey, signs, and posts.
-//! ALL the protocol logic lives here (request framing, the 404/409/epoch rules, freshness + signature checks) — the app supplies only the raw HTTP and the roster AEAD, via [`FgtwTransport`] and [`FleetSealer`].
+//! ALL the protocol logic lives here (request framing, the `error`-frame reason rules, freshness + signature checks) — the app supplies only the raw HTTP and the roster AEAD, via [`FgtwTransport`] and [`FleetSealer`].
 //! So photon rides its warm-TLS connection pool and its own error-message UX, the calendar can use a different HTTP client, and this crate stays reqwest-free.
 
 use crate::fanout::{fanout_from_bytes, fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
@@ -13,7 +13,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use vsf::VsfType;
 
 /// One HTTP response from FGTW: the status code and the body bytes.
-/// The transport returns this for ANY status it managed to receive; it returns `Err` only when it couldn't reach FGTW at all — so the client here owns the 404/409/success interpretation.
+/// The transport returns this for ANY status it managed to receive; it returns `Err` only when it couldn't reach FGTW at all. The worker now answers every failure with a VSF `error` frame at HTTP 200, so the client branches on the frame's `reason` label; `status` is kept only as an infra-error fallback (a CloudFlare 5xx that never reached the worker).
 pub struct FgtwResponse {
     pub status: u16,
     pub body: Vec<u8>,
@@ -52,32 +52,64 @@ fn parse_section(bytes: &[u8]) -> Result<vsf::VsfSection, String> {
     vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("fgtw section: {e}"))
 }
 
+/// If `body` is an FGTW `error` frame, return its `(reason, detail)`. The worker answers every
+/// failure with one of these at HTTP 200 — VSF is the wire — so callers branch on the stable
+/// `reason` label (`not_found`, `stale`, `bad_signature`, …), never an HTTP status. Both the signed
+/// and unsigned error frames parse here (the signature rides in section metadata, not the name).
+pub fn error_frame(body: &[u8]) -> Option<(String, String)> {
+    let section = parse_section(body).ok()?;
+    if section.name != "error" {
+        return None;
+    }
+    let text = |n: &str| {
+        section
+            .get_field(n)
+            .and_then(|f| f.values.first())
+            .and_then(|v| match v {
+                VsfType::a(s) | VsfType::x(s) => Some(s.clone()),
+                _ => None,
+            })
+    };
+    Some((text("reason")?, text("detail").unwrap_or_default()))
+}
+
+/// True if `body` is an FGTW `error` frame carrying exactly `reason`.
+pub fn is_error(body: &[u8], reason: &str) -> bool {
+    error_frame(body).map_or(false, |(r, _)| r == reason)
+}
+
 // ── Fleet chain oracle ──
 
-/// Fetch the identity's stored fleet chain, or `None` if none exists yet (404). Parsed but NOT trusted until [`MembershipBlob::fold`].
+/// Fetch the identity's stored fleet chain, or `None` if none exists yet (`not_found`). Parsed but NOT trusted until [`MembershipBlob::fold`].
 pub fn fetch<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<MembershipBlob>, String> {
     let mut section = vsf::VsfSection::new("fleet_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if resp.status == 404 {
+    if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fleet_get {reason}: {detail}"));
+    }
     if !(200..300).contains(&resp.status) {
-        return Err("FGTW rejected the lookup".to_string());
+        return Err(format!("FGTW transport {}", resp.status));
     }
     Ok(Some(MembershipBlob::from_vsf_bytes(&resp.body)?))
 }
 
-/// Publish a new (or extended) chain. The worker accepts it only as a forward extension of what it holds; a stale post gets 409, surfaced as `"fleet: 409"` so the retry loop can match on it.
+/// Publish a new (or extended) chain. The worker accepts it only as a forward extension of what it holds; a stale post gets the `stale` reason frame, surfaced as `"fleet: stale"` so the retry loop can match on it.
 pub fn publish<T: FgtwTransport>(t: &T, blob: &MembershipBlob) -> Result<(), String> {
     let resp = t.post(blob.to_vsf_bytes()?)?;
-    if (200..300).contains(&resp.status) {
-        Ok(())
-    } else if resp.status == 409 {
-        Err("fleet: 409".to_string())
-    } else {
-        Err("FGTW rejected the fleet update".to_string())
+    if is_error(&resp.body, "stale") {
+        return Err("fleet: stale".to_string());
     }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fleet_put {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
 }
 
 /// Ensure this device is a CURRENT member before an authorised write.
@@ -139,7 +171,7 @@ pub fn bind_device<T: FgtwTransport>(
         blob.add(member_key, new_pubkey, vsf::eagle_time_oscillations());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
-            Err(e) if e.contains("409") => continue, // someone else extended; re-fetch + retry
+            Err(e) if e.contains("stale") => continue, // someone else extended; re-fetch + retry
             Err(e) => return Err(e),
         }
     }
@@ -166,7 +198,7 @@ pub fn unbind_device<T: FgtwTransport>(
         blob.remove(member_key, target_pubkey, vsf::eagle_time_oscillations());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
-            Err(e) if e.contains("409") => continue,
+            Err(e) if e.contains("stale") => continue,
             Err(e) => return Err(e),
         }
     }
@@ -202,11 +234,13 @@ pub fn post_pairing_request<T: FgtwTransport>(
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
     section.add_field("sig", VsfType::ge(sig.to_bytes().to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if (200..300).contains(&resp.status) {
-        Ok(())
-    } else {
-        Err(format!("pair_put http {}", resp.status))
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw pair_put {reason}: {detail}"));
     }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
 }
 
 /// EXISTING device: fetch the pending pairing request, validating freshness and the pairing key's ownership signature. `None` when there's no fresh valid request.
@@ -217,11 +251,14 @@ pub fn fetch_pairing_request<T: FgtwTransport>(
     let mut section = vsf::VsfSection::new("pair_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if resp.status == 404 {
+    if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw pair_get {reason}: {detail}"));
+    }
     if !(200..300).contains(&resp.status) {
-        return Err(format!("pair_get http {}", resp.status));
+        return Err(format!("FGTW transport {}", resp.status));
     }
     let stored = parse_section(&resp.body)?;
     let (Some(device_pubkey), Some(pairing_pubkey)) = (field32(&stored, "dk"), field32(&stored, "pp"))
@@ -264,11 +301,13 @@ pub fn post_pair_matched<T: FgtwTransport>(
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
     section.add_field("sig", VsfType::ge(sig.to_bytes().to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if (200..300).contains(&resp.status) {
-        Ok(())
-    } else {
-        Err(format!("pack_put http {}", resp.status))
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw pack_put {reason}: {detail}"));
     }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
 }
 
 /// NEW device: has an existing member matched OUR words? True only for a fresh flag naming OUR pairing pubkey, signed by a device in `members` — so a stranger can't flip the ready light.
@@ -281,11 +320,14 @@ pub fn poll_pair_matched<T: FgtwTransport>(
     let mut section = vsf::VsfSection::new("pack_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if resp.status == 404 {
+    if is_error(&resp.body, "not_found") {
         return Ok(false);
     }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw pack_get {reason}: {detail}"));
+    }
     if !(200..300).contains(&resp.status) {
-        return Err(format!("pack_get http {}", resp.status));
+        return Err(format!("FGTW transport {}", resp.status));
     }
     let stored = parse_section(&resp.body)?;
     let (Some(pp), Some(dk)) = (field32(&stored, "pp"), field32(&stored, "dk")) else {
@@ -333,11 +375,13 @@ pub fn post_fanout<T: FgtwTransport>(
     let signed = vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
         .map_err(|e| format!("fanout_put sign: {e}"))?;
     let resp = t.post(signed)?;
-    if (200..300).contains(&resp.status) {
-        Ok(())
-    } else {
-        Err(format!("fanout_put http {}", resp.status))
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fanout_put {reason}: {detail}"));
     }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
 }
 
 /// Fetch the current fan-out (epoch + wraps), or None if none published yet.
@@ -348,11 +392,14 @@ pub fn fetch_fanout<T: FgtwTransport>(
     let mut section = vsf::VsfSection::new("fanout_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if resp.status == 404 {
+    if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fanout_get {reason}: {detail}"));
+    }
     if !(200..300).contains(&resp.status) {
-        return Err(format!("fanout_get http {}", resp.status));
+        return Err(format!("FGTW transport {}", resp.status));
     }
     let stored = parse_section(&resp.body)?;
     match stored.get_field("bl").and_then(|f| f.values.first()) {
@@ -432,11 +479,13 @@ pub fn push_roster<T: FgtwTransport, S: FleetSealer>(
     let signed = vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
         .map_err(|e| format!("fstate_put sign: {e}"))?;
     let resp = t.post(signed)?;
-    if (200..300).contains(&resp.status) {
-        Ok(())
-    } else {
-        Err(format!("fstate_put http {}", resp.status))
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fstate_put {reason}: {detail}"));
     }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
 }
 
 /// Fetch + open the fleet roster (None if none published yet). The GET is unauthenticated — the payload is ciphertext only fleet members can open — so the pull just needs the fleet key.
@@ -449,11 +498,14 @@ pub fn pull_roster<T: FgtwTransport, S: FleetSealer>(
     let mut section = vsf::VsfSection::new("fstate_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(provenance_req(section)?)?;
-    if resp.status == 404 {
+    if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fstate_get {reason}: {detail}"));
+    }
     if !(200..300).contains(&resp.status) {
-        return Err(format!("fstate_get http {}", resp.status));
+        return Err(format!("FGTW transport {}", resp.status));
     }
     let stored = parse_section(&resp.body)?;
     let sealed = match stored.get_field("bl").and_then(|f| f.values.first()) {
