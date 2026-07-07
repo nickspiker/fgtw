@@ -123,7 +123,8 @@ pub fn first_bad_pair_word(s: &str) -> Option<String> {
 
 /// Parse a hub-pushed pairing event — section `pair_evt` {k: kind, hp} — into (kind, handle_proof). Returns `None` for every other frame: the hub also carries dashboard-capsule broadcasts, which subscribers skip cheaply on the header/section decode. Kinds today: "matched" (a member posted the matched flag) and "fleet" (the membership chain extended).
 pub fn parse_pair_event(bytes: &[u8]) -> Option<(String, [u8; 32])> {
-    let (_, header_end) = vsf::VsfHeader::decode(bytes).ok()?;
+    // Verified read (hp + hb | signature) — hub frames are worker-built and always carry an anchor; anything unverifiable is skipped, not parsed.
+    let (_, header_end) = vsf::verification::read_verified(bytes, None).ok()?;
     let mut ptr = header_end;
     let section = vsf::VsfSection::parse(bytes, &mut ptr).ok()?;
     if section.name != "pair_evt" {

@@ -37,17 +37,19 @@ const PAIR_FRESH_OSC: i64 = 300 * vsf::OSCILLATIONS_PER_SECOND as i64;
 
 // ── helpers ──
 
-fn provenance_req(section: vsf::VsfSection) -> Result<Vec<u8>, String> {
+fn unsigned_req(section: vsf::VsfSection) -> Result<Vec<u8>, String> {
+    // Default build carries hp + hb, so even unsigned requests are verifiable documents.
     vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
-        .provenance_only()
         .add_section_direct(section)
         .build()
         .map_err(|e| format!("fgtw request build: {e}"))
 }
 
 fn parse_section(bytes: &[u8]) -> Result<vsf::VsfSection, String> {
-    let (_, header_end) = vsf::VsfHeader::decode(bytes).map_err(|e| format!("fgtw header: {e}"))?;
+    // Verified read (hp + hb | signature) before the section is touched — every worker response carries an anchor, so an unverifiable body is noise or tampering, never data.
+    let (_, header_end) = vsf::verification::read_verified(bytes, None)
+        .map_err(|e| format!("fgtw response verification: {e}"))?;
     let mut ptr = header_end;
     vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("fgtw section: {e}"))
 }
@@ -84,7 +86,7 @@ pub fn is_error(body: &[u8], reason: &str) -> bool {
 pub fn fetch<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<MembershipBlob>, String> {
     let mut section = vsf::VsfSection::new("fleet_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
@@ -233,7 +235,7 @@ pub fn post_pairing_request<T: FgtwTransport>(
     section.add_field("pp", VsfType::ke(pairing.public.to_bytes().to_vec()));
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
     section.add_field("sig", VsfType::ge(sig.to_bytes().to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw pair_put {reason}: {detail}"));
     }
@@ -250,7 +252,7 @@ pub fn fetch_pairing_request<T: FgtwTransport>(
 ) -> Result<Option<PairRequest>, String> {
     let mut section = vsf::VsfSection::new("pair_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
@@ -300,7 +302,7 @@ pub fn post_pair_matched<T: FgtwTransport>(
     section.add_field("dk", VsfType::ke(member_key.public.to_bytes().to_vec()));
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
     section.add_field("sig", VsfType::ge(sig.to_bytes().to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw pack_put {reason}: {detail}"));
     }
@@ -319,7 +321,7 @@ pub fn poll_pair_matched<T: FgtwTransport>(
 ) -> Result<bool, String> {
     let mut section = vsf::VsfSection::new("pack_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if is_error(&resp.body, "not_found") {
         return Ok(false);
     }
@@ -391,7 +393,7 @@ pub fn fetch_fanout<T: FgtwTransport>(
 ) -> Result<Option<(u64, Vec<FanoutWrap>)>, String> {
     let mut section = vsf::VsfSection::new("fanout_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if is_error(&resp.body, "not_found") {
         return Ok(None);
     }
@@ -497,7 +499,7 @@ pub fn pull_roster<T: FgtwTransport, S: FleetSealer>(
 ) -> Result<Option<Vec<RosterEntry>>, String> {
     let mut section = vsf::VsfSection::new("fstate_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(provenance_req(section)?)?;
+    let resp = t.post(unsigned_req(section)?)?;
     if is_error(&resp.body, "not_found") {
         return Ok(None);
     }

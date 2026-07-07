@@ -355,19 +355,20 @@ impl MembershipBlob {
             }
             section.add_field_multi("op", values);
         }
+        // Default build carries hp + hb — a provenance-only doc is unverifiable under read_verified, and from_vsf_bytes below refuses to parse one.
         vsf::VsfBuilder::new()
             .creation_time_oscillations(vsf::eagle_time_oscillations())
-            .provenance_only()
             .add_section_direct(section)
             .build()
             .map_err(|e| format!("fleet to_vsf: {e}"))
     }
 
     /// Parse from a complete VSF file.
+    /// The document must verify (hp + hb | signature) before any op is read; op-level signatures are then validated by [`fold`].
     /// A malformed op aborts the whole parse (the chain is only meaningful intact); returns the blob for [`fold`] to then validate cryptographically.
     pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let (_, header_end) =
-            vsf::VsfHeader::decode(bytes).map_err(|e| format!("fleet header: {e}"))?;
+        let (_, header_end) = vsf::verification::read_verified(bytes, None)
+            .map_err(|e| format!("fleet chain verification: {e}"))?;
         // VsfSection::parse reads from the FULL buffer starting at the header's end offset.
         let mut ptr = header_end;
         let section =
