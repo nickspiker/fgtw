@@ -46,21 +46,29 @@ fn unsigned_req(section: vsf::VsfSection) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("fgtw request build: {e}"))
 }
 
-fn parse_section(bytes: &[u8]) -> Result<vsf::VsfSection, String> {
+fn parse_section(bytes: &[u8]) -> Result<(String, vsf::VsfSection), String> {
     // Verified read (hp + hb | signature) before the section is touched — every worker response carries an anchor, so an unverifiable body is noise or tampering, never data.
-    let (_, header_end) = vsf::verification::read_verified(bytes, None)
+    let (header, header_end) = vsf::verification::read_verified(bytes, None)
         .map_err(|e| format!("fgtw response verification: {e}"))?;
     let mut ptr = header_end;
-    vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("fgtw section: {e}"))
+    let section =
+        vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("fgtw section: {e}"))?;
+    // Near-form sections are ANONYMOUS on the wire — the name lives only in the header TOC, so section.name comes back empty and a name check against it always fails. Prefer the self-describing (far-form) name when present, else the TOC entry.
+    let name = if section.name.is_empty() {
+        header.fields.first().map(|f| f.name.clone()).unwrap_or_default()
+    } else {
+        section.name.clone()
+    };
+    Ok((name, section))
 }
 
 /// If `body` is an FGTW `error` frame, return its `(reason, detail)`. The worker answers every
 /// failure with one of these at HTTP 200 — VSF is the wire — so callers branch on the stable
-/// `reason` label (`not_found`, `stale`, `bad_signature`, …), never an HTTP status. Both the signed
-/// and unsigned error frames parse here (the signature rides in section metadata, not the name).
+/// `reason` label (`not_found`, `stale`, `bad_signature`, …), never an HTTP status. Both frame
+/// shapes parse here: plain (hp + hb) and FGTW-header-signed (ke/ge, canonical scheme).
 pub fn error_frame(body: &[u8]) -> Option<(String, String)> {
-    let section = parse_section(body).ok()?;
-    if section.name != "error" {
+    let (name, section) = parse_section(body).ok()?;
+    if name != "error" {
         return None;
     }
     let text = |n: &str| {
@@ -275,7 +283,7 @@ pub fn fetch_pairing_request<T: FgtwTransport>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    let stored = parse_section(&resp.body)?;
+    let (_, stored) = parse_section(&resp.body)?;
     let (Some(device_pubkey), Some(pairing_pubkey)) = (field32(&stored, "dk"), field32(&stored, "pp"))
     else {
         return Ok(None);
@@ -344,7 +352,7 @@ pub fn poll_pair_matched<T: FgtwTransport>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    let stored = parse_section(&resp.body)?;
+    let (_, stored) = parse_section(&resp.body)?;
     let (Some(pp), Some(dk)) = (field32(&stored, "pp"), field32(&stored, "dk")) else {
         return Ok(false);
     };
@@ -416,7 +424,7 @@ pub fn fetch_fanout<T: FgtwTransport>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    let stored = parse_section(&resp.body)?;
+    let (_, stored) = parse_section(&resp.body)?;
     match stored.get_field("bl").and_then(|f| f.values.first()) {
         Some(VsfType::ge(b)) => Ok(Some(fanout_from_bytes(b)?)),
         _ => Ok(None),
@@ -522,11 +530,42 @@ pub fn pull_roster<T: FgtwTransport, S: FleetSealer>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    let stored = parse_section(&resp.body)?;
+    let (_, stored) = parse_section(&resp.body)?;
     let sealed = match stored.get_field("bl").and_then(|f| f.values.first()) {
         Some(VsfType::ge(b)) => b.clone(),
         _ => return Ok(None),
     };
     let plaintext = s.open(&sealed, fleet_key)?;
     Ok(Some(roster_from_bytes(&plaintext)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Near-form sections are anonymous on the wire (name only in the header TOC) — error_frame must still recognize them. This was broken from the v9 near-form change until 2026-07-06: section.name came back empty, every error frame went unrecognized, and callers parsed error frames as data (the "chain unverifiable: Empty" class).
+    #[test]
+    fn error_frame_recognizes_anonymous_near_form() {
+        let body = vsf::VsfBuilder::new()
+            .add_section(
+                "error",
+                vec![
+                    ("reason".to_string(), VsfType::a("not_found".to_string())),
+                    ("detail".to_string(), VsfType::a("no fleet".to_string())),
+                ],
+            )
+            .build()
+            .unwrap();
+        let (reason, detail) = error_frame(&body).expect("frame must be recognized");
+        assert_eq!(reason, "not_found");
+        assert_eq!(detail, "no fleet");
+        assert!(is_error(&body, "not_found"));
+        assert!(!is_error(&body, "stale"));
+        // Non-error frames must NOT read as errors.
+        let data = vsf::VsfBuilder::new()
+            .add_section("fleet", vec![("x".to_string(), VsfType::u(1, false))])
+            .build()
+            .unwrap();
+        assert!(error_frame(&data).is_none());
+    }
 }
