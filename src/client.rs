@@ -123,8 +123,14 @@ pub fn ensure_member<T: FgtwTransport>(
     identity_seed: &[u8; 32],
 ) -> Result<(), String> {
     let me = device_key.public.to_bytes();
+    // A fold ERROR is indeterminate (corrupt/stale-format chain), NOT "not a member" — the two used to collapse into the same enroll-from-another-device message, hiding the real fault.
+    let member_of = |blob: &MembershipBlob| -> Result<bool, String> {
+        blob.fold()
+            .map(|m| m.contains(&me))
+            .map_err(|e| format!("stored fleet chain does not fold: {e:?}"))
+    };
     if let Some(blob) = fetch(t, handle_proof)? {
-        return if blob.fold().map(|m| m.contains(&me)).unwrap_or(false) {
+        return if member_of(&blob)? {
             Ok(())
         } else {
             Err("this device is not in the fleet — enroll it from an existing device first".into())
@@ -132,14 +138,21 @@ pub fn ensure_member<T: FgtwTransport>(
     }
     let blob =
         MembershipBlob::genesis(device_key, *handle_proof, identity_seed, vsf::eagle_time_oscillations());
-    let _ = publish(t, &blob);
+    // A rejected publish is NOT fatal by itself (a racing sibling may have won the slot), but it must not vanish either — the refetch below adjudicates, and the publish error rides along if that also comes up empty.
+    let publish_err = publish(t, &blob).err();
     // Trust the network, not ourselves: re-fetch the canonical chain and accept ONLY if it names this device. The fleet slot has no compare-and-set, so two devices racing a fresh handle's genesis both "publish" but the slot settles on ONE — the loser re-reads here, finds it isn't a member, and fails cleanly instead of announcing as a phantom founder.
     match fetch(t, handle_proof)? {
-        Some(b) if b.fold().map(|m| m.contains(&me)).unwrap_or(false) => Ok(()),
-        Some(_) => {
-            Err("this device is not in the fleet — enroll it from an existing device first".into())
+        Some(b) => {
+            if member_of(&b)? {
+                Ok(())
+            } else {
+                Err("this device is not in the fleet — enroll it from an existing device first".into())
+            }
         }
-        None => Err("failed to establish fleet membership for this device".into()),
+        None => Err(match publish_err {
+            Some(e) => format!("failed to establish fleet membership: {e}"),
+            None => "failed to establish fleet membership for this device".into(),
+        }),
     }
 }
 
