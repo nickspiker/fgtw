@@ -170,11 +170,11 @@ pub fn words_to_pair_pubkey(words: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Deterministic default device label: exactly TWO voca words derived one-way from the device secret. blake3 keeps the secret unrecoverable from the label; the fingerprint-deterministic secret makes the label survive a wipe-and-reinstall (the "same device, same name" resume story). Label space is 3177² ≈ 10.1 M, so even a 12-device fleet collides with p ≈ 7×10⁻⁶. camelCase per the voca display convention. The owner-edited override (devices page) supersedes this — it is only the shipped default.
-pub fn device_name_default(device_secret: &[u8; 32]) -> String {
+/// Deterministic default device label: exactly TWO voca words derived one-way from the device PUBLIC key. Keying on the pubkey (not the secret) is what makes the label FLEET-CONSISTENT — every device knows every other device's pubkey, so all devices compute the same name for a given device (a secret-keyed label could only be computed by the device itself, which is why the fleet list and the pairing screen used to disagree). The pubkey is fingerprint-deterministic just like the secret, so the label still survives a wipe-and-reinstall ("same device, same name"). Label space is 3177² ≈ 10.1 M, so even a 12-device fleet collides with p ≈ 7×10⁻⁶. camelCase per the voca display convention. The owner-edited override (devices page) supersedes this — it is only the shipped default.
+pub fn device_name_default(device_pubkey: &[u8; 32]) -> String {
     let mut input = Vec::with_capacity(24 + 32);
     input.extend_from_slice(b"PHOTON_DEVICE_NAME_v1");
-    input.extend_from_slice(device_secret);
+    input.extend_from_slice(device_pubkey);
     let digest = blake3::hash(&input);
     let mut n8 = [0u8; 8];
     n8.copy_from_slice(&digest.as_bytes()[..8]);

@@ -246,6 +246,13 @@ impl MembershipBlob {
         Ok(members)
     }
 
+    /// Fold to the current member set AND return the tip op's eagle time (the timestamp of the last applied op). `(members, tip_et)`. The freshness signal a consumer uses to never regress to a stale (pre-removal) view of someone's membership: a fold with an older tip than one already adopted is ignored. `tip_et` is 0 only for the impossible empty-but-Ok case (fold errors on empty).
+    pub fn fold_with_ts(&self) -> Result<(Vec<[u8; 32]>, i64), FoldError> {
+        let members = self.fold()?;
+        let tip = self.ops.last().map(|op| op.eagle_time).unwrap_or(0);
+        Ok((members, tip))
+    }
+
     /// Convenience: is `device_pubkey` a current member? (`fold` + membership test.)
     pub fn is_member(&self, device_pubkey: &[u8; 32]) -> bool {
         self.fold().map(|m| m.contains(device_pubkey)).unwrap_or(false)

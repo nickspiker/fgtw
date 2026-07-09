@@ -172,6 +172,17 @@ pub fn current_members<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Resu
     }
 }
 
+/// The current member set plus the chain-tip eagle time — a monotonic freshness guard. A consumer adopts a fold only when its tip is `>=` the last one adopted, so a stale (pre-removal) read served by R2 eventual consistency can't overwrite a fresh post-removal set. No fleet yet ⇒ `(empty, 0)`.
+pub fn current_members_with_ts<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+) -> Result<(Vec<[u8; 32]>, i64), String> {
+    match fetch(t, handle_proof)? {
+        Some(b) => b.fold_with_ts().map_err(|e| format!("stored fleet invalid: {e:?}")),
+        None => Ok((Vec::new(), 0)),
+    }
+}
+
 /// Existing-device side of device-ADD: add `new_pubkey`, signed by this (member) device.
 /// `new_pubkey` must have arrived over the proximity channel (NFC / words screen-to-screen), so the signature binds to the device in hand, not to anyone who knows the (public) handle.
 pub fn bind_device<T: FgtwTransport>(
