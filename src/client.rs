@@ -6,7 +6,7 @@
 
 use crate::fanout::{fanout_from_bytes, fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
 use crate::fleet::{et_to_osc, MembershipBlob};
-use crate::fstate::{roster_from_bytes, roster_to_bytes, RosterEntry};
+use crate::fstate::{fstate_from_bytes, fstate_to_bytes, FleetState};
 use crate::keys::Keypair;
 use crate::pair::{pair_matched_signing_bytes, pair_request_signing_bytes, PairRequest};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -488,18 +488,18 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     }
 }
 
-// ── Fleet roster transport ──
+// ── Fleet state transport ──
 
-/// Publish the fleet roster: seal it under the fleet key and PUT it to the membership-gated slot. The envelope is device-signed (ke/ge header) so FGTW checks the writer against the folded fleet chain — any fleet device may write.
-pub fn push_roster<T: FgtwTransport, S: FleetSealer>(
+/// Publish the fleet-shared state (roster + settings layers): seal it under the fleet key and PUT it to the membership-gated slot. The envelope is device-signed (ke/ge header) so FGTW checks the writer against the folded fleet chain — any fleet device may write.
+pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     t: &T,
     s: &S,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
     fleet_key: &[u8; 32],
-    entries: &[RosterEntry],
+    state: &FleetState,
 ) -> Result<(), String> {
-    let sealed = s.seal(&roster_to_bytes(entries), fleet_key)?;
+    let sealed = s.seal(&fstate_to_bytes(state), fleet_key)?;
     let mut section = vsf::VsfSection::new("fstate_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     section.add_field("bl", VsfType::ge(sealed));
@@ -522,13 +522,13 @@ pub fn push_roster<T: FgtwTransport, S: FleetSealer>(
     Ok(())
 }
 
-/// Fetch + open the fleet roster (None if none published yet). The GET is unauthenticated — the payload is ciphertext only fleet members can open — so the pull just needs the fleet key.
-pub fn pull_roster<T: FgtwTransport, S: FleetSealer>(
+/// Fetch + open the fleet-shared state (None if none published yet; an old roster-only blob reads as settings-empty). The GET is unauthenticated — the payload is ciphertext only fleet members can open — so the pull just needs the fleet key.
+pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
     t: &T,
     s: &S,
     handle_proof: &[u8; 32],
     fleet_key: &[u8; 32],
-) -> Result<Option<Vec<RosterEntry>>, String> {
+) -> Result<Option<FleetState>, String> {
     let mut section = vsf::VsfSection::new("fstate_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -547,7 +547,7 @@ pub fn pull_roster<T: FgtwTransport, S: FleetSealer>(
         _ => return Ok(None),
     };
     let plaintext = s.open(&sealed, fleet_key)?;
-    Ok(Some(roster_from_bytes(&plaintext)?))
+    Ok(Some(fstate_from_bytes(&plaintext)?))
 }
 
 #[cfg(test)]
