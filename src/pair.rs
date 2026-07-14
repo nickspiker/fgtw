@@ -226,13 +226,6 @@ pub fn device_name_default(device_pubkey: &[u8; 32], identity_seed: &[u8; 32]) -
 /// Truncated MAC length in the proof beacon: 96 bits guards proof-forgery-without-the-word; it cannot guard the ~11.6-bit word itself (offline-brutable from any aired proof by design), which is why the single-valid-proof abort rule exists.
 pub const WORD_MAC_LEN: usize = 12;
 
-/// The hp prefix carried in beacons: a scan filter so two fleets pairing in one room don't cross-pollinate. Public, carries no trust.
-pub fn hp_prefix(handle_proof: &[u8; 32]) -> [u8; 4] {
-    let mut p = [0u8; 4];
-    p.copy_from_slice(&handle_proof[..4]);
-    p
-}
-
 /// A fresh lock word for ONE ceremony, minted on the OLD device and typed into the new one. Fresh randomness each time, so holding the handle buys an attacker nothing; rerolled on every abort. Lowercase — the entry side lowercases anyway.
 pub fn lock_word() -> String {
     let base = voca::FULL.alphabet.len() as u64;
@@ -265,58 +258,57 @@ pub fn verify_word_mac(word: &str, handle_proof: &[u8; 32], device_pubkey: &[u8;
     proof.len() == WORD_MAC_LEN && word_mac(word, handle_proof, device_pubkey) == proof
 }
 
-/// A parsed pairing beacon: what a scanning old device heard.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Beacon {
-    /// Pre-word liveness: a candidate exists nearby. Label-only UX; trusted for nothing.
-    Announce { hp_prefix: [u8; 4], device_pubkey: [u8; 32] },
-    /// Post-word: the candidate claims knowledge of the lock word for this hp.
-    Proof { hp_prefix: [u8; 4], device_pubkey: [u8; 32], word_mac: [u8; WORD_MAC_LEN] },
+// ── Proximity beacon: one 128-bit BLE service UUID, `[ magic:4 ][ nonce:4 ][ tag:8 ]` ──
+//
+// The carrier is a *service UUID* (not manufacturer data) for one blunt reason: it's the only advertising payload Apple's CoreBluetooth lets an app emit, so it's the single format that works on Linux, Android, Windows AND macOS — one codec, every platform, no fork.
+// It carries no stable identifier. The 4-byte MAGIC only says "a photon pairing is happening nearby"; the nonce rolls the tag every ceremony; the tag is a keyed MAC only the fleet can compute. Roles: the NEW device advertises `beacon_uuid`; the SPONSOR reads the nonce off the air and `beacon_matches` it against each registry candidate to learn which are in proximity (the one thing a remote handle-holder can't fake — hence the only thing that earns a tap row).
+
+/// The fixed namespace tag every photon beacon starts with — lets a scanner pick our service UUIDs out of a room full of unrelated BLE devices (and lets Android set a hardware scan-filter mask on the prefix). Carries no secret and no identity: only "a photon pairing is nearby," never whose.
+pub const BEACON_MAGIC: [u8; 4] = [0xF0, 0x70, 0x0B, 0xEA];
+
+/// Total beacon bytes: exactly one 128-bit service UUID.
+pub const BEACON_UUID_LEN: usize = 16;
+
+/// Per-fleet beacon subkey: a domain-separated derivation of `handle_proof`, so the raw proof is never a MAC key directly. The new device (typed the handle) and every sponsor (fleet member) derive the same key; no one else can.
+fn beacon_key(handle_proof: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("photon ble beacon v1", handle_proof)
 }
 
-const BEACON_VER: u8 = 1;
-const BEACON_KIND_ANNOUNCE: u8 = 1;
-const BEACON_KIND_PROOF: u8 = 2;
-
-/// Announce frame: `[ver][kind=1][hp_prefix:4][device_pubkey:32]` = 38 bytes. Fits legacy BLE ADV+SCAN_RSP with room to spare.
-pub fn beacon_announce(handle_proof: &[u8; 32], device_pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(38);
-    v.push(BEACON_VER);
-    v.push(BEACON_KIND_ANNOUNCE);
-    v.extend_from_slice(&hp_prefix(handle_proof));
-    v.extend_from_slice(device_pubkey);
-    v
+/// Mint the beacon a NEW device advertises during its join ceremony. `nonce` is fresh per ceremony — it rolls the whole tag so the same device looks like a different beacon every pairing, defeating cross-ceremony tracking even by a fleet member. The 64-bit tag is a keyed MAC: only the fleet can compute or match it, no outsider can forge one.
+pub fn beacon_uuid(
+    handle_proof: &[u8; 32],
+    device_pubkey: &[u8; 32],
+    nonce: &[u8; 4],
+) -> [u8; BEACON_UUID_LEN] {
+    let mut material = [0u8; 36];
+    material[..32].copy_from_slice(device_pubkey);
+    material[32..].copy_from_slice(nonce);
+    let tag = blake3::keyed_hash(&beacon_key(handle_proof), &material);
+    let mut out = [0u8; BEACON_UUID_LEN];
+    out[..4].copy_from_slice(&BEACON_MAGIC);
+    out[4..8].copy_from_slice(nonce);
+    out[8..16].copy_from_slice(&tag.as_bytes()[..8]);
+    out
 }
 
-/// Proof frame: `[ver][kind=2][hp_prefix:4][device_pubkey:32][word_mac:12]` = 50 bytes — still inside the ~54 usable bytes of legacy ADV+SCAN_RSP, so no extended-advertising lottery and no connection.
-pub fn beacon_proof(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], proof: &[u8; WORD_MAC_LEN]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(50);
-    v.push(BEACON_VER);
-    v.push(BEACON_KIND_PROOF);
-    v.extend_from_slice(&hp_prefix(handle_proof));
-    v.extend_from_slice(device_pubkey);
-    v.extend_from_slice(proof);
-    v
+/// A scanner's cheap pre-filter: does this service UUID even belong to photon? No secret needed — everything failing the magic is room noise.
+pub fn beacon_is_ours(uuid: &[u8; BEACON_UUID_LEN]) -> bool {
+    uuid[..4] == BEACON_MAGIC
 }
 
-/// Parse a scanned beacon. `None` for anything that isn't a well-formed v2 pairing frame — scanners see every fitness tracker in the building, so unrecognised bytes are noise, never an error.
-pub fn parse_beacon(bytes: &[u8]) -> Option<Beacon> {
-    if bytes.len() < 38 || bytes[0] != BEACON_VER {
-        return None;
+/// SPONSOR-side match: is `device_pubkey` (a registry candidate) the one advertising this heard beacon right now? Reads the nonce straight off the UUID — no clock, no shared epoch — recomputes the keyed tag, compares. A wrong match is infeasible without the fleet key, and even a 64-bit fluke can't mis-BIND: the WAN registry re-verifies the full key + consent sig and the human green-confirm is the final gate, so the worst case is a mis-highlight among the few devices in tap range.
+pub fn beacon_matches(
+    uuid: &[u8; BEACON_UUID_LEN],
+    handle_proof: &[u8; 32],
+    device_pubkey: &[u8; 32],
+) -> bool {
+    if uuid[..4] != BEACON_MAGIC {
+        return false;
     }
-    let mut hp4 = [0u8; 4];
-    hp4.copy_from_slice(&bytes[2..6]);
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&bytes[6..38]);
-    match (bytes[1], bytes.len()) {
-        (BEACON_KIND_ANNOUNCE, 38) => Some(Beacon::Announce { hp_prefix: hp4, device_pubkey: pk }),
-        (BEACON_KIND_PROOF, n) if n == 38 + WORD_MAC_LEN => {
-            let mut proof = [0u8; WORD_MAC_LEN];
-            proof.copy_from_slice(&bytes[38..38 + WORD_MAC_LEN]);
-            Some(Beacon::Proof { hp_prefix: hp4, device_pubkey: pk, word_mac: proof })
-        }
-        _ => None,
-    }
+    let mut nonce = [0u8; 4];
+    nonce.copy_from_slice(&uuid[4..8]);
+    // magic + nonce agree by construction, so whole-UUID equality reduces to the 8-byte tag compare.
+    *uuid == beacon_uuid(handle_proof, device_pubkey, &nonce)
 }
 
 #[cfg(test)]
@@ -436,33 +428,28 @@ mod tests {
     }
 
     #[test]
-    fn beacon_frames_round_trip_and_reject_noise() {
+    fn beacon_uuid_matches_only_the_right_fleet_device() {
         let pk = [0x42u8; 32];
-        let ann = beacon_announce(&HP, &pk);
-        assert_eq!(ann.len(), 38);
-        assert_eq!(
-            parse_beacon(&ann),
-            Some(Beacon::Announce { hp_prefix: hp_prefix(&HP), device_pubkey: pk })
-        );
-        let proof = word_mac("apple", &HP, &pk);
-        let prf = beacon_proof(&HP, &pk, &proof);
-        assert_eq!(prf.len(), 38 + WORD_MAC_LEN);
-        assert_eq!(
-            parse_beacon(&prf),
-            Some(Beacon::Proof { hp_prefix: hp_prefix(&HP), device_pubkey: pk, word_mac: proof })
-        );
-        // Scanner noise: short frames, wrong version, wrong kind, wrong length for the kind.
-        assert_eq!(parse_beacon(&[]), None);
-        assert_eq!(parse_beacon(&ann[..37]), None);
-        let mut bad_ver = ann.clone();
-        bad_ver[0] = 99;
-        assert_eq!(parse_beacon(&bad_ver), None);
-        let mut bad_kind = ann.clone();
-        bad_kind[1] = 3;
-        assert_eq!(parse_beacon(&bad_kind), None);
-        let mut announce_with_tail = ann;
-        announce_with_tail.push(0);
-        assert_eq!(parse_beacon(&announce_with_tail), None);
+        let other_pk = [0x43u8; 32];
+        let nonce = [0x01, 0x02, 0x03, 0x04];
+        let uuid = beacon_uuid(&HP, &pk, &nonce);
+        assert_eq!(uuid.len(), BEACON_UUID_LEN);
+        assert_eq!(&uuid[..4], &BEACON_MAGIC);
+        assert_eq!(&uuid[4..8], &nonce);
+        assert!(beacon_is_ours(&uuid));
+        // The sponsor recovers proximity from the nonce alone — no clock, no shared epoch.
+        assert!(beacon_matches(&uuid, &HP, &pk));
+        // Wrong device, wrong fleet, and non-photon noise all fail closed.
+        assert!(!beacon_matches(&uuid, &HP, &other_pk));
+        let other_hp = [0xcd; 32];
+        assert!(!beacon_matches(&uuid, &other_hp, &pk));
+        let mut noise = uuid;
+        noise[0] ^= 0xFF;
+        assert!(!beacon_is_ours(&noise));
+        assert!(!beacon_matches(&noise, &HP, &pk));
+        // Fresh nonce ⇒ a different beacon for the same device (cross-ceremony unlinkability).
+        let nonce2 = [0x09, 0x0a, 0x0b, 0x0c];
+        assert_ne!(beacon_uuid(&HP, &pk, &nonce2), uuid);
     }
 
     #[test]
