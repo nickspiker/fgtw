@@ -181,6 +181,25 @@ pub fn words_to_pair_pubkey(words: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Two-word voca pseudonym for an arbitrary 32-byte public id — the rendering for any identity that hasn't granted you a name (docs/identity-profile.md): contact party ids pre-grant, unknown knockers, strangers in a future phonebook. Public-derivable by design (the id is public); it is a LABEL, never trust. camelCase per the voca display convention.
+pub fn keyed_pseudonym(id: &[u8; 32]) -> String {
+    let mut input = Vec::with_capacity(21 + 32);
+    input.extend_from_slice(b"PHOTON_PSEUDONYM_v1");
+    input.extend_from_slice(id);
+    let digest = blake3::hash(&input);
+    let mut n8 = [0u8; 8];
+    n8.copy_from_slice(&digest.as_bytes()[..8]);
+    let base = voca::FULL.alphabet.len() as u64;
+    let n = u64::from_le_bytes(n8) % (base * base);
+    let encoded = voca::encode(num_bigint::BigUint::from(n));
+    let mut s = String::new();
+    for _ in pair_word_tokens(&encoded)..2 {
+        s.push_str(&zero_word());
+    }
+    s.push_str(&encoded);
+    s
+}
+
 /// Deterministic default device label: exactly TWO voca words derived one-way from the device PUBLIC key AND the fleet's identity seed. Keying on the pubkey (not the secret) makes the label FLEET-CONSISTENT — every device knows every other device's pubkey, so all devices compute the same name for a given device (a secret-keyed label could only be computed by the device itself, which is why the fleet list and the pairing screen used to disagree). Folding in `identity_seed` makes the label FLEET-SCOPED — the same physical device gets a distinct name in each owner's fleet, so a handed-off device shows a fresh name to its new owner rather than inheriting the old one, and only that fleet (which shares the seed) can compute the name. Both the pubkey and the seed are stable per-(device, identity), so the label still survives a wipe-and-reinstall ("same device, same name"). Label space is 3177² ≈ 10.1 M, so even a 12-device fleet collides with p ≈ 7×10⁻⁶. camelCase per the voca display convention. The owner-edited override (devices page) supersedes this — it is only the shipped default.
 pub fn device_name_default(device_pubkey: &[u8; 32], identity_seed: &[u8; 32]) -> String {
     let mut input = Vec::with_capacity(24 + 64);

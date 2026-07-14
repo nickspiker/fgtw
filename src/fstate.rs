@@ -10,14 +10,18 @@
 //!
 //! This module is the data model + codec + merge; the seal-and-push / pull-and-open transport (which needs the fleet key and the network) is the client's job.
 
-/// One syncable friend. The minimal identity a device needs to reconstruct a contact and re-CLUTCH: who they are (handle + proof + hash) plus CRDT bookkeeping (`updated` for last-writer-wins, `tombstone` for removals that must stick across a merge).
+/// One syncable friend. The minimal identity a device needs to reconstruct a contact and re-CLUTCH: the PIN-SET (docs/identity-profile.md — party id, proof, avatar key, petname; NEVER the handle string, which derives the identity seed) plus CRDT bookkeeping (`updated` for last-writer-wins, `tombstone` for removals that must stick across a merge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterEntry {
     pub handle_proof: [u8; 32],
+    /// The contact's PARTY ID: their pinned identity PUBKEY — verification-only, no signing power. (The pre-pin-set roster carried the friend's identity SEED here; the PRST1 tag bump orphans those blobs.)
     pub handle_hash: [u8; 32],
     /// Last-known friend device pubkey (a hint; the joining device re-discovers current devices by handle_proof). Zero if unknown.
     pub public_identity: [u8; 32],
-    pub handle: String,
+    /// The local petname, synced across OUR OWN fleet under the fleet key — a label we chose, empty = render the keyed pseudonym.
+    pub name: String,
+    /// The pinned avatar-wall material, derived once at first-met and synced so every fleet device fetches + decrypts this friend's avatar without ever holding the handle: AES key (32) ‖ FGTW lookup hash (32). Zero = not pinned.
+    pub avatar_pin: [u8; 64],
     pub added: i64,
     /// Logical clock for this entry — the newest write across the fleet wins the merge.
     pub updated: i64,
@@ -25,7 +29,8 @@ pub struct RosterEntry {
     pub tombstone: bool,
 }
 
-const ROSTER_TAG: &[u8; 5] = b"PRST0";
+// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts.
+const ROSTER_TAG: &[u8; 5] = b"PRST1";
 
 /// Serialize the roster to the plaintext that gets sealed under the fleet key. Not VSF: this is opaque AEAD-payload bytes, so a compact fixed-layout encoding is simpler and just as forensic (the wire envelope around the ciphertext is VSF).
 pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -36,12 +41,13 @@ pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
         out.extend_from_slice(&e.handle_proof);
         out.extend_from_slice(&e.handle_hash);
         out.extend_from_slice(&e.public_identity);
+        out.extend_from_slice(&e.avatar_pin);
         out.extend_from_slice(&e.added.to_be_bytes());
         out.extend_from_slice(&e.updated.to_be_bytes());
         out.push(e.tombstone as u8);
-        let hb = e.handle.as_bytes();
-        out.extend_from_slice(&(hb.len() as u32).to_be_bytes());
-        out.extend_from_slice(hb);
+        let nb = e.name.as_bytes();
+        out.extend_from_slice(&(nb.len() as u32).to_be_bytes());
+        out.extend_from_slice(nb);
     }
     out
 }
@@ -66,17 +72,19 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
         let handle_proof: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
         let handle_hash: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
         let public_identity: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
+        let avatar_pin: [u8; 64] = take(&mut p, 64)?.try_into().unwrap();
         let added = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
         let updated = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
         let tombstone = take(&mut p, 1)?[0] != 0;
-        let hlen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-        let handle = String::from_utf8(take(&mut p, hlen)?.to_vec())
-            .map_err(|_| "roster: handle not utf8".to_string())?;
+        let nlen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+        let name = String::from_utf8(take(&mut p, nlen)?.to_vec())
+            .map_err(|_| "roster: name not utf8".to_string())?;
         out.push(RosterEntry {
             handle_proof,
             handle_hash,
             public_identity,
-            handle,
+            name,
+            avatar_pin,
             added,
             updated,
             tombstone,
@@ -345,7 +353,8 @@ mod tests {
             handle_proof: [hp; 32],
             handle_hash: [hp ^ 0xff; 32],
             public_identity: [hp.wrapping_add(1); 32],
-            handle: format!("friend{hp}"),
+            name: format!("friend{hp}"),
+            avatar_pin: [hp ^ 0x55; 64],
             added: 100,
             updated,
             tombstone,
