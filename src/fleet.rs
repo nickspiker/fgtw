@@ -23,6 +23,13 @@
 //! Each op carries a LIST of `(scheme, sig)` eggs and the rule is **every listed egg must verify**.
 //! v1 lists only Ed25519 (the device's existing identity key); adding Falcon-512 / SPHINCS+ later is appending an egg, gated by a credential-format version bump — not a reshape.
 //! A forger then has to break *every* family.
+//!
+//! ## Sovereign records (2026-07-13, docs/pairing-v2.md)
+//!
+//! The subject signs; others verify or withhold.
+//! - **Add is bilateral**: the sponsor's egg authorises, and the op carries the added device's own consent — its binding-request signature ([`bindreq_signing_bytes`]) as `consent_sig`. An op without valid consent does not fold, so conscription (and the virgin-pubkey ownership squat it enabled) is structurally impossible.
+//! - **Remove is self-signed departure ONLY**: `signer == device`, no exceptions. Nobody can be expelled; eviction is withholding (re-key around the device), never erasure.
+//! - Consent freshness: `|eagle_time − consent_t| ≤` [`CONSENT_WINDOW_OSC`], so a departed device's ancient consent can't be replayed to re-add it.
 
 use crate::keys::Keypair;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -74,25 +81,66 @@ pub struct FleetOp {
     pub device_pubkey: [u8; 32],
     /// Eagle-time the op was made (ordering / display; not load-bearing for auth).
     pub eagle_time: i64,
-    /// The device that SIGNED this op — must have been a member in the previous state (genesis: == device).
+    /// The device that SIGNED this op — must have been a member in the previous state (genesis: == device; remove: == device, self-departure only).
     pub signer_pubkey: [u8; 32],
     /// GENESIS ONLY: the identity public key `Ed25519(identity_seed)` — the key only the holder of the handle's secret seed can produce, co-signing the genesis so the fleet is provably founded by the identity owner (not just whoever scraped the public `handle_proof`).
     /// `[0; 32]` on add/remove ops.
     pub identity_pubkey: [u8; 32],
     /// GENESIS ONLY: signature over [`FleetOp::signing_bytes`] by `identity_pubkey`. Empty on add/remove ops.
     pub identity_sig: Vec<u8>,
+    /// ADD ONLY: the eagle-time stamp of the binding request whose signature rides `consent_sig`. 0 elsewhere.
+    pub consent_t: i64,
+    /// ADD ONLY: the added device's OWN signature over [`bindreq_signing_bytes`]`(handle_proof, device_pubkey, consent_t)` — the subject consenting to its membership (bilateral add; the sovereign-records rule). NOT a signature over this op's signing bytes, so it's data the sponsor's egg commits to, like the genesis identity binding. Empty on genesis/remove ops.
+    pub consent_sig: Vec<u8>,
     /// Signature eggs over [`FleetOp::signing_bytes`]; every listed egg must verify (the egg-list rule).
     pub sigs: Vec<Egg>,
 }
 
-/// Domain tag so a fleet-op signature can never be confused with any other signature in the system.
-const SIGNING_DOMAIN: &[u8] = b"PHOTON_FLEET_OP_v0";
+/// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove) — flag-day, v0 chains don't fold.
+const SIGNING_DOMAIN: &[u8] = b"PHOTON_FLEET_OP_v1";
+
+/// The exact bytes a binding request signs: the device attests "I consent to join fleet `handle_proof`" at time `t`. Signed TWICE at the registry (device key + `Ed25519(identity_seed)` — the write gate), and the device signature is re-verified forever after as the Add op's `consent_sig` (the fold gate). Lives here rather than `pair` because the worker folds chains without the `fanout` feature.
+pub fn bindreq_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], t: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(18 + 64 + 8);
+    v.extend_from_slice(b"PHOTON_BINDREQ_v1");
+    v.extend_from_slice(handle_proof);
+    v.extend_from_slice(device_pubkey);
+    v.extend_from_slice(&t.to_le_bytes());
+    v
+}
+
+/// How far an Add's `eagle_time` may sit from its consent stamp: 1 hour — generous for a live ceremony (the request re-posts every ~3.5 min anyway), fatal for replaying a departed device's ancient consent.
+pub const CONSENT_WINDOW_OSC: i64 = 3600 * vsf::OSCILLATIONS_PER_SECOND as i64;
+
+/// Binding requests older than this are lapsed (worker refuses at put, skips at list; clients skip too). The author refreshes at ~3.5 min while its ceremony screen is up; an abandoned ceremony self-cleans by expiry — the worker NEVER consumes a request (no third-party deletion, per the sovereign-records rule).
+pub const BINDREQ_FRESH_OSC: i64 = 300 * vsf::OSCILLATIONS_PER_SECOND as i64;
+
+/// A binding request: a device's signed, identity-co-signed ask to join a fleet — the registry entry the old device's matcher screens candidates from, and the source of the Add op's consent egg.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BindRequest {
+    pub device_pubkey: [u8; 32],
+    /// Eagle-time stamp — freshness at the registry, and the `consent_t` the Add op carries.
+    pub t: i64,
+    /// The device key's signature over [`bindreq_signing_bytes`] — the consent (becomes `consent_sig`).
+    pub device_sig: Vec<u8>,
+    /// `Ed25519(identity_seed)`'s signature over the same bytes — the registry write gate (only the handle's owner can enter the set). Checked against the chain's genesis identity pubkey; never enters the chain itself.
+    pub identity_sig: Vec<u8>,
+}
+
+impl BindRequest {
+    /// Verify both signatures against this fleet: the device's own consent, and the identity co-signature under `identity_pubkey` (the genesis key). The worker gates writes with this; the old device re-checks at list time.
+    pub fn verify(&self, handle_proof: &[u8; 32], identity_pubkey: &[u8; 32]) -> bool {
+        let msg = bindreq_signing_bytes(handle_proof, &self.device_pubkey, self.t);
+        verify_ed25519(&self.device_pubkey, &msg, &self.device_sig)
+            && verify_ed25519(identity_pubkey, &msg, &self.identity_sig)
+    }
+}
 
 impl FleetOp {
     /// The exact bytes every egg signs: domain + all content fields, fixed-width and deterministic.
-    /// Excludes the sigs themselves (you can't sign the signature).
+    /// Excludes the sigs themselves (you can't sign the signature) — but INCLUDES `consent_sig`, which is a signature over DIFFERENT bytes (the binding request), so the sponsor's egg commits to the exact consent it saw.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(SIGNING_DOMAIN.len() + 32 + 32 + 1 + 32 + 8 + 32);
+        let mut b = Vec::with_capacity(SIGNING_DOMAIN.len() + 32 + 32 + 1 + 32 + 8 + 32 + 32 + 8 + self.consent_sig.len());
         b.extend_from_slice(SIGNING_DOMAIN);
         b.extend_from_slice(&self.handle_proof);
         b.extend_from_slice(&self.prev_hash);
@@ -101,6 +149,8 @@ impl FleetOp {
         b.extend_from_slice(&self.eagle_time.to_le_bytes());
         b.extend_from_slice(&self.signer_pubkey);
         b.extend_from_slice(&self.identity_pubkey); // bound in so the device sig also commits to the identity key (it can't be swapped)
+        b.extend_from_slice(&self.consent_t.to_le_bytes());
+        b.extend_from_slice(&self.consent_sig); // bound in so the consent can't be swapped under the sponsor's egg
         b
     }
 
@@ -122,6 +172,16 @@ impl FleetOp {
         self.identity_pubkey != [0u8; 32]
             && self.identity_sig.len() == 64
             && verify_ed25519(&self.identity_pubkey, &self.signing_bytes(), &self.identity_sig)
+    }
+
+    /// Verify the ADD consent binding: `consent_sig` is the ADDED device's own signature over its binding request — the subject signing its own membership. Forging it requires the device's private key, which is what makes conscription (and the ownership squat) impossible.
+    fn verify_consent(&self) -> bool {
+        self.consent_sig.len() == 64
+            && verify_ed25519(
+                &self.device_pubkey,
+                &bindreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t),
+                &self.consent_sig,
+            )
     }
 
     /// Verify every signature egg against `signer_pubkey`.
@@ -166,6 +226,14 @@ pub enum FoldError {
     BadIdentityBinding,
     /// A non-genesis op carries identity-binding fields it has no business carrying.
     StrayIdentityBinding { index: usize },
+    /// An Add lacks a valid consent signature from the device being added (conscription attempt, or a forged/absent binding-request signature).
+    BadConsent { index: usize },
+    /// An Add's consent stamp sits outside [`CONSENT_WINDOW_OSC`] of the op — a replayed ancient consent.
+    ConsentStale { index: usize },
+    /// A non-Add op carries consent fields it has no business carrying.
+    StrayConsent { index: usize },
+    /// A Remove signed by anyone but the departing device itself — expulsion doesn't exist (self-signed departure only).
+    RemoveNotSelfSigned { index: usize },
     /// An op carries a different `handle_proof` than the genesis — a spliced/transplanted chain.
     InconsistentHandleProof { index: usize },
     BrokenChain { index: usize },
@@ -200,9 +268,12 @@ impl MembershipBlob {
             if op.prev_hash != expected_prev {
                 return Err(FoldError::BrokenChain { index: i });
             }
-            // Structural check before the sig check: only genesis carries an identity binding (and identity_pubkey is in signing_bytes, so a stray one would otherwise surface as a confusing BadSignature).
+            // Structural checks before the sig check: only genesis carries an identity binding, only Add carries consent (both are in signing_bytes, so a stray one would otherwise surface as a confusing BadSignature).
             if op.kind != OpKind::Genesis && (op.identity_pubkey != [0u8; 32] || !op.identity_sig.is_empty()) {
                 return Err(FoldError::StrayIdentityBinding { index: i });
+            }
+            if op.kind != OpKind::Add && (op.consent_t != 0 || !op.consent_sig.is_empty()) {
+                return Err(FoldError::StrayConsent { index: i });
             }
             if !op.verify_sigs() {
                 return Err(FoldError::BadSignature { index: i });
@@ -228,11 +299,23 @@ impl MembershipBlob {
                     if members.contains(&op.device_pubkey) {
                         return Err(FoldError::AddExistingMember { index: i });
                     }
+                    // Bilateral: the added device must have consented with its own key (the subject signs — sovereign records).
+                    if !op.verify_consent() {
+                        return Err(FoldError::BadConsent { index: i });
+                    }
+                    // The consent must be from THIS ceremony, not a departed device's replayed past.
+                    if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
+                        return Err(FoldError::ConsentStale { index: i });
+                    }
                     members.push(op.device_pubkey);
                 }
                 OpKind::Remove => {
                     if !members.contains(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
+                    }
+                    // Self-signed departure ONLY — expulsion is not a verb this chain has; eviction lives at the key/provision layer.
+                    if op.signer_pubkey != op.device_pubkey {
+                        return Err(FoldError::RemoveNotSelfSigned { index: i });
                     }
                     let before = members.len();
                     members.retain(|m| m != &op.device_pubkey);
@@ -280,9 +363,14 @@ impl MembershipBlob {
         self.ops.first().map(|op| op.identity_pubkey == expect).unwrap_or(false)
     }
 
+    /// The genesis identity pubkey (the key `identity_sig`s verify under) — what the worker checks a binding request's identity co-signature against.
+    pub fn genesis_identity_pubkey(&self) -> Option<[u8; 32]> {
+        self.ops.first().map(|op| op.identity_pubkey)
+    }
+
     // ── builders (sign with the local device key; the device is the only thing that can authorise) ──
 
-    /// Start a brand-new fleet: the founding device self-signs itself in, bound to `handle_proof`, and the identity key `Ed25519(identity_seed)` co-signs to prove the founder owns the handle.
+    /// Start a brand-new fleet: the founding device self-signs itself in, bound to `handle_proof`, and the identity key `Ed25519(identity_seed)` co-signs to prove the founder owns the handle. Both ownerships are already present, so genesis needs no separate consent.
     pub fn genesis(
         device_key: &Keypair,
         handle_proof: [u8; 32],
@@ -300,12 +388,13 @@ impl MembershipBlob {
             eagle_time,
             pk,
             Some(&identity_key),
+            None,
         );
         MembershipBlob { ops: vec![op] }
     }
 
-    /// Append an Add, signed by `device_key` (which must be a current member for the result to fold).
-    pub fn add(&mut self, device_key: &Keypair, new_device: [u8; 32], eagle_time: i64) {
+    /// Append an Add: the sponsor `device_key` (a current member) signs, carrying the added device's consent — `(consent_t, consent_sig)` straight off its binding request. Without valid consent the result won't fold.
+    pub fn add(&mut self, device_key: &Keypair, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent_sig: Vec<u8>) {
         let hp = self.handle_proof().unwrap_or([0u8; 32]);
         let op = sign_op(
             device_key,
@@ -316,29 +405,32 @@ impl MembershipBlob {
             eagle_time,
             device_key.public.to_bytes(),
             None,
+            Some((consent_t, consent_sig)),
         );
         self.ops.push(op);
     }
 
-    /// Append a Remove, signed by `device_key` (a current member). A device may remove itself or any other.
-    pub fn remove(&mut self, device_key: &Keypair, target_device: [u8; 32], eagle_time: i64) {
+    /// Append this device's own departure — the ONLY remove the fold accepts (`signer == device`). Expelling another device is not a chain verb; eviction is withholding at the key layer.
+    pub fn depart(&mut self, device_key: &Keypair, eagle_time: i64) {
         let hp = self.handle_proof().unwrap_or([0u8; 32]);
+        let pk = device_key.public.to_bytes();
         let op = sign_op(
             device_key,
             hp,
             self.head(),
             OpKind::Remove,
-            target_device,
+            pk,
             eagle_time,
-            device_key.public.to_bytes(),
+            pk,
+            None,
             None,
         );
         self.ops.push(op);
     }
 
     // ── VSF wire form: section "fleet" with one repeated "op" multi-value field per op (same shape as PhonebookResponse's "peer" fields, so the FGTW worker mirrors the parse with the existing pattern).
-    //    Positional op layout: hP(handle_proof) hb(prev) u(kind) ke(device) e6(time) ke(signer), then GENESIS-ONLY ke(identity_pubkey) ge(identity_sig), then (u scheme, ge sig) egg pairs to the end.
-    //    The identity pair is gated by kind (known at value index 2), so non-genesis ops carry no waste and the egg tail stays unambiguous. Appending a PQ egg = two more trailing values; nothing before them moves. ──
+    //    Positional op layout: hP(handle_proof) hb(prev) u(kind) ke(device) e6(time) ke(signer), then GENESIS-ONLY ke(identity_pubkey) ge(identity_sig), then ADD-ONLY e6(consent_t) ge(consent_sig), then (u scheme, ge sig) egg pairs to the end.
+    //    The identity/consent pairs are gated by kind (known at value index 2) and mutually exclusive, so no op carries waste and the egg tail stays unambiguous. Appending a PQ egg = two more trailing values; nothing before them moves. ──
 
     /// Encode to a complete VSF file (header + provenance + the "fleet" section). Network/disk transport.
     pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
@@ -355,6 +447,10 @@ impl MembershipBlob {
             if op.kind == OpKind::Genesis {
                 values.push(VsfType::ke(op.identity_pubkey.to_vec()));
                 values.push(VsfType::ge(op.identity_sig.clone()));
+            }
+            if op.kind == OpKind::Add {
+                values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
+                values.push(VsfType::ge(op.consent_sig.clone()));
             }
             for egg in &op.sigs {
                 values.push(VsfType::u(egg.scheme as usize, false));
@@ -374,12 +470,12 @@ impl MembershipBlob {
     /// The document must verify (hp + hb | signature) before any op is read; op-level signatures are then validated by [`fold`].
     /// A malformed op aborts the whole parse (the chain is only meaningful intact); returns the blob for [`fold`] to then validate cryptographically.
     pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let (_, header_end) = vsf::verification::read_verified(bytes, None)
+        let (header, header_end) = vsf::verification::read_verified(bytes, None)
             .map_err(|e| format!("fleet chain verification: {e}"))?;
-        // VsfSection::parse reads from the FULL buffer starting at the header's end offset.
-        let mut ptr = header_end;
-        let section =
-            vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("fleet section: {e}"))?;
+        // primary_section: name resolution + header-only tolerance live in the vsf crate (an empty chain would encode header-only; fold still rejects it as Empty).
+        let section = header
+            .primary_section(bytes, header_end)
+            .map_err(|e| format!("fleet section: {e}"))?;
 
         let mut ops = Vec::new();
         for field in section.get_fields("op") {
@@ -389,7 +485,7 @@ impl MembershipBlob {
     }
 }
 
-/// Build + sign one op. Each enabled scheme contributes an egg over the op's signing bytes; v1 = Ed25519.
+/// Build + sign one op. Each enabled scheme contributes an egg over the op's signing bytes; v1 = Ed25519. `consent` = the added device's `(t, binding-request signature)`, Add only.
 #[allow(clippy::too_many_arguments)]
 fn sign_op(
     device_key: &Keypair,
@@ -400,9 +496,11 @@ fn sign_op(
     eagle_time: i64,
     signer_pubkey: [u8; 32],
     identity: Option<&ed25519_dalek::SigningKey>,
+    consent: Option<(i64, Vec<u8>)>,
 ) -> FleetOp {
     use ed25519_dalek::Signer;
     let identity_pubkey = identity.map(|k| k.verifying_key().to_bytes()).unwrap_or([0u8; 32]);
+    let (consent_t, consent_sig) = consent.unwrap_or((0, Vec::new()));
     let mut op = FleetOp {
         handle_proof,
         prev_hash,
@@ -412,6 +510,8 @@ fn sign_op(
         signer_pubkey,
         identity_pubkey,
         identity_sig: Vec::new(),
+        consent_t,
+        consent_sig,
         sigs: Vec::new(),
     };
     let msg = op.signing_bytes();
@@ -447,15 +547,28 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
     };
     let signer_pubkey = take_ke32(&values[5], "signer")?;
 
-    // GENESIS carries the identity binding (ke pubkey, ge sig) before the egg pairs; other kinds don't.
+    // GENESIS carries the identity binding (ke pubkey, ge sig), ADD carries the consent (e6 t, ge sig), each before the egg pairs; the pairs are kind-gated and mutually exclusive.
     let mut i = 6;
     let mut identity_pubkey = [0u8; 32];
     let mut identity_sig = Vec::new();
+    let mut consent_t = 0i64;
+    let mut consent_sig = Vec::new();
     if kind == OpKind::Genesis {
         identity_pubkey = take_ke32(values.get(6).ok_or("fleet op: genesis missing identity pubkey")?, "identity")?;
         identity_sig = match values.get(7) {
             Some(VsfType::ge(s)) => s.clone(),
             _ => return Err("fleet op: genesis missing identity sig".into()),
+        };
+        i = 8;
+    }
+    if kind == OpKind::Add {
+        consent_t = match values.get(6) {
+            Some(VsfType::e(et)) => et_to_osc(et),
+            _ => return Err("fleet op: add missing consent time".into()),
+        };
+        consent_sig = match values.get(7) {
+            Some(VsfType::ge(s)) => s.clone(),
+            _ => return Err("fleet op: add missing consent sig".into()),
         };
         i = 8;
     }
@@ -486,6 +599,8 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
         signer_pubkey,
         identity_pubkey,
         identity_sig,
+        consent_t,
+        consent_sig,
         sigs,
     })
 }
@@ -533,9 +648,13 @@ mod tests {
     fn pk(k: &Keypair) -> [u8; 32] {
         k.public.to_bytes()
     }
+    /// The added device signs its own binding request — the consent every Add must carry.
+    fn consent_for(device: &Keypair, t: i64) -> (i64, Vec<u8>) {
+        (t, device.sign(&bindreq_signing_bytes(&HP, &device.public.to_bytes(), t)).to_bytes().to_vec())
+    }
 
     #[test]
-    fn genesis_then_adds_then_remove_folds_to_live_set() {
+    fn genesis_then_adds_then_departure_folds_to_live_set() {
         let a = key(1);
         let b = key(2);
         let c = key(3);
@@ -543,11 +662,13 @@ mod tests {
         assert_eq!(blob.fold().unwrap(), vec![pk(&a)]);
         assert_eq!(blob.handle_proof(), Some(HP));
 
-        blob.add(&a, pk(&b), 200); // a (a member) adds b
-        blob.add(&b, pk(&c), 300); // b (now a member) adds c
+        let (t1, s1) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t1, s1); // a sponsors b, b consents
+        let (t2, s2) = consent_for(&c, 290);
+        blob.add(&b, pk(&c), 300, t2, s2); // b (now a member) sponsors c
         assert_eq!(blob.fold().unwrap(), vec![pk(&a), pk(&b), pk(&c)]);
 
-        blob.remove(&c, pk(&a), 400); // c removes a (any member may remove any)
+        blob.depart(&a, 400); // a resigns — the only remove that exists
         assert_eq!(blob.fold().unwrap(), vec![pk(&b), pk(&c)]);
         assert!(!blob.is_member(&pk(&a)));
         assert!(blob.is_member(&pk(&c)));
@@ -559,9 +680,49 @@ mod tests {
         let stranger = key(9);
         let victim = key(5);
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        // A stranger (not in the fleet) tries to add a device — must fail at fold.
-        blob.add(&stranger, pk(&victim), 200);
+        // A stranger (not in the fleet) tries to sponsor an add — even WITH the victim's valid consent, the sponsor gate fails first.
+        let (t, s) = consent_for(&victim, 190);
+        blob.add(&stranger, pk(&victim), 200, t, s);
         assert_eq!(blob.fold(), Err(FoldError::SignerNotMember { index: 1 }));
+    }
+
+    #[test]
+    fn add_without_valid_consent_is_conscription_and_rejected() {
+        let a = key(1);
+        let victim = key(5);
+        // No consent at all.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.add(&a, pk(&victim), 200, 0, Vec::new());
+        assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 1 }));
+        // Consent signed by the WRONG key (the sponsor forging on the victim's behalf).
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let forged = a.sign(&bindreq_signing_bytes(&HP, &pk(&victim), 190)).to_bytes().to_vec();
+        blob.add(&a, pk(&victim), 200, 190, forged);
+        assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 1 }));
+    }
+
+    #[test]
+    fn replayed_ancient_consent_is_rejected() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        // b consented long ago (departed since, say); re-adding with the old consent must fail the window.
+        let (t, s) = consent_for(&b, 200);
+        blob.add(&a, pk(&b), 200 + CONSENT_WINDOW_OSC + 1, t, s);
+        assert_eq!(blob.fold(), Err(FoldError::ConsentStale { index: 1 }));
+    }
+
+    #[test]
+    fn remove_must_be_self_signed() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        // a tries to expel b — expulsion doesn't exist.
+        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), None, None);
+        blob.ops.push(expel);
+        assert_eq!(blob.fold(), Err(FoldError::RemoveNotSelfSigned { index: 2 }));
     }
 
     #[test]
@@ -569,7 +730,7 @@ mod tests {
         let a = key(1);
         let b = key(2);
         // A genesis whose signer != device is forged.
-        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), None);
+        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), None, None);
         let blob = MembershipBlob { ops: vec![forged] };
         assert_eq!(blob.fold(), Err(FoldError::GenesisNotSelfSigned));
     }
@@ -579,7 +740,8 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        blob.add(&a, pk(&b), 200);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
         assert!(blob.fold().is_ok());
 
         // Tamper with the add op's device pubkey AFTER signing → signature no longer covers it.
@@ -588,8 +750,18 @@ mod tests {
 
         // Re-sign the tampered op correctly but leave its prev_hash stale → chain breaks instead.
         let a2 = key(1);
-        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), None);
+        let (t7, s7) = consent_for(&key(7), 190);
+        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), None, Some((t7, s7)));
         assert_eq!(blob.fold(), Err(FoldError::BrokenChain { index: 1 }));
+
+        // Swap the consent under the sponsor's egg — consent is in signing_bytes, so the egg breaks.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        let (t2, s2) = consent_for(&b, 195);
+        blob.ops[1].consent_t = t2;
+        blob.ops[1].consent_sig = s2;
+        assert_eq!(blob.fold(), Err(FoldError::BadSignature { index: 1 }));
     }
 
     #[test]
@@ -598,7 +770,8 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        blob.add(&a, pk(&b), 200);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
         blob.ops[1].handle_proof = [0x11; 32];
         assert_eq!(blob.fold(), Err(FoldError::InconsistentHandleProof { index: 1 }));
     }
@@ -609,13 +782,15 @@ mod tests {
         let b = key(2);
         let base = MembershipBlob::genesis(&a, HP, &SEED, 100);
         let mut grown = base.clone();
-        grown.add(&a, pk(&b), 200);
+        let (t, s) = consent_for(&b, 190);
+        grown.add(&a, pk(&b), 200, t, s);
         assert!(grown.extends(&base)); // forward extension
         assert!(!base.extends(&grown)); // shorter can't extend longer
 
         // A divergent branch (different op at the same height) is NOT an extension.
         let mut fork = base.clone();
-        fork.add(&a, pk(&key(8)), 200);
+        let (t8, s8) = consent_for(&key(8), 190);
+        fork.add(&a, pk(&key(8)), 200, t8, s8);
         assert!(!fork.extends(&grown) && !grown.extends(&fork));
     }
 
@@ -624,11 +799,13 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        blob.add(&a, pk(&b), 200);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        blob.depart(&b, 300);
         let bytes = blob.to_vsf_bytes().unwrap();
         let parsed = MembershipBlob::from_vsf_bytes(&bytes).unwrap();
         assert_eq!(parsed, blob);
-        assert_eq!(parsed.fold().unwrap(), vec![pk(&a), pk(&b)]);
+        assert_eq!(parsed.fold().unwrap(), vec![pk(&a)]);
     }
 
     #[test]
@@ -646,7 +823,8 @@ mod tests {
         let a = key(1);
         let b = key(2);
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        blob.add(&a, pk(&b), 200);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
         let members = blob.fold().unwrap();
         assert_eq!(members, vec![pk(&a), pk(&b)]);
         // Re-parsing the wire form yields the identical member set (what the worker computes from the POST).
@@ -688,13 +866,44 @@ mod tests {
     }
 
     #[test]
-    fn add_op_carrying_identity_fields_is_rejected() {
+    fn stray_bindings_are_rejected() {
         let a = key(1);
         let b = key(2);
+        // Identity binding on an Add — only genesis may carry one.
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        blob.add(&a, pk(&b), 200);
-        // Stuff an identity binding onto the add op — only genesis may carry one.
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
         blob.ops[1].identity_pubkey = [0x77; 32];
         assert_eq!(blob.fold(), Err(FoldError::StrayIdentityBinding { index: 1 }));
+        // Consent fields on a Remove — only Add may carry them.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        blob.depart(&b, 300);
+        blob.ops[2].consent_t = 42;
+        assert_eq!(blob.fold(), Err(FoldError::StrayConsent { index: 2 }));
+    }
+
+    #[test]
+    fn bindreq_verifies_both_signatures() {
+        let device = key(6);
+        let identity_key = ed25519_dalek::SigningKey::from_bytes(&SEED);
+        let identity_pubkey = identity_key.verifying_key().to_bytes();
+        let t = 12345i64;
+        let msg = bindreq_signing_bytes(&HP, &pk(&device), t);
+        use ed25519_dalek::Signer;
+        let req = BindRequest {
+            device_pubkey: pk(&device),
+            t,
+            device_sig: device.sign(&msg).to_bytes().to_vec(),
+            identity_sig: identity_key.sign(&msg).to_bytes().to_vec(),
+        };
+        assert!(req.verify(&HP, &identity_pubkey));
+        // Wrong fleet, wrong identity key, tampered stamp — each leg fails.
+        assert!(!req.verify(&[0x11; 32], &identity_pubkey));
+        assert!(!req.verify(&HP, &pk(&key(9))));
+        let mut stale = req.clone();
+        stale.t += 1;
+        assert!(!stale.verify(&HP, &identity_pubkey));
     }
 }

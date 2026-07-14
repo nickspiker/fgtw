@@ -47,7 +47,7 @@ pub mod fanout;
 #[cfg(feature = "fanout")]
 pub mod fstate;
 
-/// Pairing v1 — the device-ADD ceremony word codec (voca words ↔ pairing pubkey), spell-check, and the request/matched signing-bytes the relay transport signs.
+/// Pairing — the device-ADD ceremony word codec (voca words, fleet-masked device pubkey), spell-check, and the BLE beacon/lock-word primitives for the later radio transport. The binding-request signing bytes live in [`fleet`] (the fold verifies consent there; the worker folds without this feature).
 #[cfg(feature = "fanout")]
 pub mod pair;
 

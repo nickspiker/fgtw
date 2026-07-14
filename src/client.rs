@@ -5,11 +5,9 @@
 //! So photon rides its warm-TLS connection pool and its own error-message UX, the calendar can use a different HTTP client, and this crate stays reqwest-free.
 
 use crate::fanout::{fanout_from_bytes, fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
-use crate::fleet::{et_to_osc, MembershipBlob};
+use crate::fleet::{bindreq_signing_bytes, et_to_osc, BindRequest, MembershipBlob, BINDREQ_FRESH_OSC};
 use crate::fstate::{fstate_from_bytes, fstate_to_bytes, FleetState};
 use crate::keys::Keypair;
-use crate::pair::{pair_matched_signing_bytes, pair_request_signing_bytes, PairRequest};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use vsf::VsfType;
 
 /// One HTTP response from FGTW: the status code and the body bytes.
@@ -32,9 +30,6 @@ pub trait FleetSealer {
     fn open(&self, sealed: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String>;
 }
 
-/// Pairing slots older than this are ignored (stale inbox). 5 minutes.
-const PAIR_FRESH_OSC: i64 = 300 * vsf::OSCILLATIONS_PER_SECOND as i64;
-
 // ── helpers ──
 
 fn unsigned_req(section: vsf::VsfSection) -> Result<Vec<u8>, String> {
@@ -50,16 +45,11 @@ fn parse_section(bytes: &[u8]) -> Result<(String, vsf::VsfSection), String> {
     // Verified read (hp + hb | signature) before the section is touched — every worker response carries an anchor, so an unverifiable body is noise or tampering, never data.
     let (header, header_end) = vsf::verification::read_verified(bytes, None)
         .map_err(|e| format!("fgtw response verification: {e}"))?;
-    let mut ptr = header_end;
-    let section =
-        vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("fgtw section: {e}"))?;
-    // Near-form sections are ANONYMOUS on the wire — the name lives only in the header TOC, so section.name comes back empty and a name check against it always fails. Prefer the self-describing (far-form) name when present, else the TOC entry.
-    let name = if section.name.is_empty() {
-        header.fields.first().map(|f| f.name.clone()).unwrap_or_default()
-    } else {
-        section.name.clone()
-    };
-    Ok((name, section))
+    // primary_section resolves the anonymous near-form name from the header TOC AND reads header-only sections (acks, empty registries) as zero-field sections — that knowledge lives in the vsf crate now, not here.
+    let section = header
+        .primary_section(bytes, header_end)
+        .map_err(|e| format!("fgtw section: {e}"))?;
+    Ok((section.name.clone(), section))
 }
 
 /// If `body` is an FGTW `error` frame, return its `(reason, detail)`. The worker answers every
@@ -137,12 +127,20 @@ pub fn ensure_member<T: FgtwTransport>(
             .map(|m| m.contains(&me))
             .map_err(|e| format!("stored fleet chain does not fold: {e:?}"))
     };
-    if let Some(blob) = fetch(t, handle_proof)? {
-        return if member_of(&blob)? {
-            Ok(())
-        } else {
-            Err("this device is not in the fleet — enroll it from an existing device first".into())
-        };
+    // FLAG-DAY (v0→v1, 2026-07-13): a stored chain that no longer parses or folds under current rules is dead-format state — fall thru to the genesis attempt below; the worker applies the same supersession rule and adjudicates. Scoped to THIS genesis path only (contact-chain consumers still surface the error). Remove once no v0 chain can plausibly remain.
+    let stored = match fetch(t, handle_proof) {
+        Ok(s) => s,
+        Err(e) if e.contains("fleet op:") || e.contains("fleet section:") || e.contains("fleet chain verification") => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(blob) = stored {
+        match member_of(&blob) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                return Err("this device is not in the fleet — enroll it from an existing device first".into())
+            }
+            Err(_) => {} // fold-dead v0 chain — flag-day supersession, genesis below
+        }
     }
     let blob =
         MembershipBlob::genesis(device_key, *handle_proof, identity_seed, vsf::eagle_time_oscillations());
@@ -172,6 +170,24 @@ pub fn current_members<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Resu
     }
 }
 
+/// The current device-pubkey member set for OUR OWN fleet, refusing any chain whose genesis is not co-signed by `Ed25519(identity_seed)`. `fold()` proves the chain is internally consistent; only this check pins it to OUR identity — without it, a relay that served the real chain once can swap in a structurally-valid foreign chain later (the probe-time-only TOCTOU). Every own-fleet fetch that feeds a trust decision (join loop, bind polling, fanout recovery) belongs here; `current_members` stays for CONTACT chains, where the peer-side genesis check lives in the caller.
+pub fn current_members_verified<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+    identity_seed: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, String> {
+    match fetch(t, handle_proof)? {
+        Some(b) => {
+            let members = b.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+            if !b.genesis_identity_matches(identity_seed) {
+                return Err("fleet chain is not rooted in this identity — refusing it".into());
+            }
+            Ok(members)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
 /// The current member set plus the chain-tip eagle time — a monotonic freshness guard. A consumer adopts a fold only when its tip is `>=` the last one adopted, so a stale (pre-removal) read served by R2 eventual consistency can't overwrite a fresh post-removal set. No fleet yet ⇒ `(empty, 0)`.
 pub fn current_members_with_ts<T: FgtwTransport>(
     t: &T,
@@ -183,13 +199,12 @@ pub fn current_members_with_ts<T: FgtwTransport>(
     }
 }
 
-/// Existing-device side of device-ADD: add `new_pubkey`, signed by this (member) device.
-/// `new_pubkey` must have arrived over the proximity channel (NFC / words screen-to-screen), so the signature binds to the device in hand, not to anyone who knows the (public) handle.
+/// Existing-device side of device-ADD: bind the device a verified binding request names, signed by this (member) device and carrying the request's device signature as the consent egg. `req` must have been screened by the matcher (full word match + `BindRequest::verify`) — the fold re-verifies the consent regardless, so a garbage request can't enter the chain even if a caller skips the screen.
 pub fn bind_device<T: FgtwTransport>(
     t: &T,
     member_key: &Keypair,
     handle_proof: &[u8; 32],
-    new_pubkey: [u8; 32],
+    req: &BindRequest,
 ) -> Result<(), String> {
     let me = member_key.public.to_bytes();
     for _attempt in 0..4 {
@@ -199,10 +214,10 @@ pub fn bind_device<T: FgtwTransport>(
         if !members.contains(&me) {
             return Err("this device isn't a fleet member, so it can't add another".into());
         }
-        if members.contains(&new_pubkey) {
+        if members.contains(&req.device_pubkey) {
             return Ok(()); // already in — idempotent
         }
-        blob.add(member_key, new_pubkey, vsf::eagle_time_oscillations());
+        blob.add(member_key, req.device_pubkey, vsf::eagle_time_oscillations(), req.t, req.device_sig.clone());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue, // someone else extended; re-fetch + retry
@@ -212,64 +227,65 @@ pub fn bind_device<T: FgtwTransport>(
     Err("fleet add: lost too many extension races".into())
 }
 
-/// Existing-device side of device removal: remove `target_pubkey`, signed by this (member) device.
-pub fn unbind_device<T: FgtwTransport>(
+/// This device's own departure — the ONLY chain remove that exists (self-signed; expelling another device is not a verb). Idempotent: already gone folds as success. Not yet wired to any UI; the self-retire flow arrives with the device-trust bundle.
+pub fn depart_device<T: FgtwTransport>(
     t: &T,
-    member_key: &Keypair,
+    device_key: &Keypair,
     handle_proof: &[u8; 32],
-    target_pubkey: [u8; 32],
 ) -> Result<(), String> {
-    let me = member_key.public.to_bytes();
+    let me = device_key.public.to_bytes();
     for _attempt in 0..4 {
-        let mut blob = fetch(t, handle_proof)?.ok_or("no fleet to modify")?;
+        let mut blob = fetch(t, handle_proof)?.ok_or("no fleet to depart from")?;
         let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
         if !members.contains(&me) {
-            return Err("this device isn't a fleet member, so it can't remove another".into());
+            return Ok(()); // already out — idempotent
         }
-        if !members.contains(&target_pubkey) {
-            return Ok(()); // already gone — idempotent
-        }
-        blob.remove(member_key, target_pubkey, vsf::eagle_time_oscillations());
+        blob.depart(device_key, vsf::eagle_time_oscillations());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
             Err(e) => return Err(e),
         }
     }
-    Err("fleet remove: lost too many extension races".into())
+    Err("fleet depart: lost too many extension races".into())
 }
 
-// ── Pairing transport (FGTW is a dumb relay; the pairing key's signature authenticates ownership, the member's signature authenticates the match). ──
+// ── Binding-request registry (docs/pairing-v2.md): keyed per (hp, device), dual-signed at write, member-gated at read, author-withdrawn or stamp-lapsed — the worker NEVER consumes an entry. ──
 
-fn field32(section: &vsf::VsfSection, name: &str) -> Option<[u8; 32]> {
-    match section.get_field(name).and_then(|f| f.values.first()) {
-        Some(VsfType::ke(b)) if b.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(b);
-            Some(a)
-        }
-        _ => None,
-    }
+/// Build + POST a device-signed envelope (ke/ge header, canonical scheme) around `section` — the shape the worker's signature-gated ops verify.
+fn signed_req<T: FgtwTransport>(t: &T, device_key: &Keypair, section: vsf::VsfSection, what: &str) -> Result<FgtwResponse, String> {
+    let unsigned = vsf::VsfBuilder::new()
+        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
+        .add_section_direct(section)
+        .build()
+        .map_err(|e| format!("{what} build: {e}"))?;
+    let signed = vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
+        .map_err(|e| format!("{what} sign: {e}"))?;
+    t.post(signed)
 }
 
-/// NEW device: post its pairing request — `{device_pubkey, pairing_pubkey, t, sig}` where `sig` is the PAIRING key signing the (identity, device, time) tuple.
-pub fn post_pairing_request<T: FgtwTransport>(
+/// NEW device: post (or refresh) its binding request — "I, `device_key`, consent to join fleet `handle_proof`" — signed by the device key AND co-signed by `Ed25519(identity_seed)` (the registry write gate; the worker checks it against the chain's genesis identity pubkey). Re-post at ~3.5 min while the words screen is up; the stamp lapses at 5.
+pub fn bindreq_put<T: FgtwTransport>(
     t: &T,
-    pairing: &Keypair,
-    new_device_pubkey: &[u8; 32],
+    device_key: &Keypair,
+    identity_seed: &[u8; 32],
     handle_proof: &[u8; 32],
 ) -> Result<(), String> {
+    use ed25519_dalek::Signer;
     let now = vsf::eagle_time_oscillations();
-    let sig = pairing.sign(&pair_request_signing_bytes(handle_proof, new_device_pubkey, now));
-    let mut section = vsf::VsfSection::new("pair_put");
+    let me = device_key.public.to_bytes();
+    let msg = bindreq_signing_bytes(handle_proof, &me, now);
+    let identity_key = ed25519_dalek::SigningKey::from_bytes(identity_seed);
+    let mut section = vsf::VsfSection::new("bindreq_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("dk", VsfType::ke(new_device_pubkey.to_vec()));
-    section.add_field("pp", VsfType::ke(pairing.public.to_bytes().to_vec()));
+    section.add_field("dk", VsfType::ke(me.to_vec()));
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
-    section.add_field("sig", VsfType::ge(sig.to_bytes().to_vec()));
+    section.add_field("ds", VsfType::ge(device_key.sign(&msg).to_bytes().to_vec()));
+    section.add_field("is", VsfType::ge(identity_key.sign(&msg).to_bytes().to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
-        return Err(format!("fgtw pair_put {reason}: {detail}"));
+        return Err(format!("fgtw bindreq_put {reason}: {detail}"));
     }
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
@@ -277,114 +293,70 @@ pub fn post_pairing_request<T: FgtwTransport>(
     Ok(())
 }
 
-/// EXISTING device: fetch the pending pairing request, validating freshness and the pairing key's ownership signature. `None` when there's no fresh valid request.
-pub fn fetch_pairing_request<T: FgtwTransport>(
+/// NEW device: withdraw its own request — the author's exit act (on green, or on ceremony cancel). Signed envelope: the worker deletes exactly the signer's own entry, nobody else's. Best-effort; an unreachable worker just means the stamp lapses instead.
+pub fn bindreq_withdraw<T: FgtwTransport>(
     t: &T,
+    device_key: &Keypair,
     handle_proof: &[u8; 32],
-) -> Result<Option<PairRequest>, String> {
-    let mut section = vsf::VsfSection::new("pair_get");
+) -> Result<(), String> {
+    let mut section = vsf::VsfSection::new("bindreq_withdraw");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(unsigned_req(section)?)?;
-    if is_error(&resp.body, "not_found") {
-        return Ok(None);
-    }
+    let resp = signed_req(t, device_key, section, "bindreq_withdraw")?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
-        return Err(format!("fgtw pair_get {reason}: {detail}"));
+        return Err(format!("fgtw bindreq_withdraw {reason}: {detail}"));
     }
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    let (_, stored) = parse_section(&resp.body)?;
-    let (Some(device_pubkey), Some(pairing_pubkey)) = (field32(&stored, "dk"), field32(&stored, "pp"))
-    else {
-        return Ok(None);
-    };
-    let ts = match stored.get_field("t").and_then(|f| f.values.first()) {
-        Some(VsfType::e(et)) => et_to_osc(et),
-        _ => return Ok(None),
-    };
-    let sig = match stored.get_field("sig").and_then(|f| f.values.first()) {
-        Some(VsfType::ge(s)) if s.len() == 64 => Signature::from_bytes(s.as_slice().try_into().unwrap()),
-        _ => return Ok(None),
-    };
-    if (vsf::eagle_time_oscillations() - ts) > PAIR_FRESH_OSC {
-        return Ok(None);
-    }
-    let Ok(vk) = VerifyingKey::from_bytes(&pairing_pubkey) else {
-        return Ok(None);
-    };
-    if vk.verify(&pair_request_signing_bytes(handle_proof, &device_pubkey, ts), &sig).is_err() {
-        return Ok(None);
-    }
-    Ok(Some(PairRequest { pairing_pubkey, device_pubkey }))
+    Ok(())
 }
 
-/// EXISTING device: after the typed words matched, post the signed "matched" flag so the new device's screen flips to ready. Signed by this (member) device.
-pub fn post_pair_matched<T: FgtwTransport>(
+/// EXISTING device: the pending binding requests for OUR fleet — the matcher's candidate set. Member-gated at the worker (signed envelope, signer must fold as a current member); every returned request is re-verified HERE too (freshness + both signatures against `Ed25519(identity_seed)`), so a compromised relay can inject nothing.
+pub fn bindreq_list<T: FgtwTransport>(
     t: &T,
     member_key: &Keypair,
     handle_proof: &[u8; 32],
-    pairing_pubkey: &[u8; 32],
-) -> Result<(), String> {
-    let now = vsf::eagle_time_oscillations();
-    let sig = member_key.sign(&pair_matched_signing_bytes(handle_proof, pairing_pubkey, now));
-    let mut section = vsf::VsfSection::new("pack_put");
+    identity_seed: &[u8; 32],
+) -> Result<Vec<BindRequest>, String> {
+    let identity_pubkey = ed25519_dalek::SigningKey::from_bytes(identity_seed).verifying_key().to_bytes();
+    let mut section = vsf::VsfSection::new("bindreq_list");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("pp", VsfType::ke(pairing_pubkey.to_vec()));
-    section.add_field("dk", VsfType::ke(member_key.public.to_bytes().to_vec()));
-    section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
-    section.add_field("sig", VsfType::ge(sig.to_bytes().to_vec()));
-    let resp = t.post(unsigned_req(section)?)?;
-    if let Some((reason, detail)) = error_frame(&resp.body) {
-        return Err(format!("fgtw pack_put {reason}: {detail}"));
-    }
-    if !(200..300).contains(&resp.status) {
-        return Err(format!("FGTW transport {}", resp.status));
-    }
-    Ok(())
-}
-
-/// NEW device: has an existing member matched OUR words? True only for a fresh flag naming OUR pairing pubkey, signed by a device in `members` — so a stranger can't flip the ready light.
-pub fn poll_pair_matched<T: FgtwTransport>(
-    t: &T,
-    handle_proof: &[u8; 32],
-    pairing_pubkey: &[u8; 32],
-    members: &[[u8; 32]],
-) -> Result<bool, String> {
-    let mut section = vsf::VsfSection::new("pack_get");
-    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    let resp = t.post(unsigned_req(section)?)?;
+    let resp = signed_req(t, member_key, section, "bindreq_list")?;
     if is_error(&resp.body, "not_found") {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     if let Some((reason, detail)) = error_frame(&resp.body) {
-        return Err(format!("fgtw pack_get {reason}: {detail}"));
+        return Err(format!("fgtw bindreq_list {reason}: {detail}"));
     }
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
     let (_, stored) = parse_section(&resp.body)?;
-    let (Some(pp), Some(dk)) = (field32(&stored, "pp"), field32(&stored, "dk")) else {
-        return Ok(false);
-    };
-    let ts = match stored.get_field("t").and_then(|f| f.values.first()) {
-        Some(VsfType::e(et)) => et_to_osc(et),
-        _ => return Ok(false),
-    };
-    let sig = match stored.get_field("sig").and_then(|f| f.values.first()) {
-        Some(VsfType::ge(s)) if s.len() == 64 => Signature::from_bytes(s.as_slice().try_into().unwrap()),
-        _ => return Ok(false),
-    };
-    if pp != *pairing_pubkey
-        || (vsf::eagle_time_oscillations() - ts) > PAIR_FRESH_OSC
-        || !members.contains(&dk)
-    {
-        return Ok(false);
+    let now = vsf::eagle_time_oscillations();
+    let mut out = Vec::new();
+    for field in stored.get_fields("req") {
+        // Positional: [ke device_pubkey, e6 t, ge device_sig, ge identity_sig] — mirror of the worker's build.
+        let v = &field.values;
+        let (Some(VsfType::ke(dk)), Some(VsfType::e(et)), Some(VsfType::ge(ds)), Some(VsfType::ge(is))) =
+            (v.first(), v.get(1), v.get(2), v.get(3))
+        else {
+            continue; // malformed entry — skip, never fail the healthy ones
+        };
+        if dk.len() != 32 {
+            continue;
+        }
+        let mut device_pubkey = [0u8; 32];
+        device_pubkey.copy_from_slice(dk);
+        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig: ds.clone(), identity_sig: is.clone() };
+        if (now - req.t).abs() > BINDREQ_FRESH_OSC {
+            continue; // lapsed — expiry is the only deletion pending records get
+        }
+        if !req.verify(handle_proof, &identity_pubkey) {
+            continue; // relay noise or forgery — invisible
+        }
+        out.push(req);
     }
-    let Ok(vk) = VerifyingKey::from_bytes(&dk) else {
-        return Ok(false);
-    };
-    Ok(vk.verify(&pair_matched_signing_bytes(handle_proof, &pp, ts), &sig).is_ok())
+    Ok(out)
 }
 
 // ── Fan-out transport + rotation ──
@@ -469,22 +441,25 @@ pub fn recover_fleet_key<T: FgtwTransport>(
     }
 }
 
-/// Recover the current fleet key, or ESTABLISH epoch 1 if no fan-out exists yet (the genesis founder). Handles the establish race: if another device published epoch 1 first, recover theirs instead.
+/// Recover the current fleet key, or ESTABLISH epoch 1 if NO fan-out exists yet (the genesis founder). Handles the establish race: if another device published epoch 1 first, recover theirs instead.
+/// A fan-out that EXISTS but holds no wrap for us is NOT an establish case — that's a freshly-bound device whose wrap arrives with the sponsor's green-confirm rotation, and self-rotating in here would hand it the key before the human confirmed (voiding the two-phase gate: any member may rotate, so the gate is only real if the joiner never rotates itself in). Wait: return None and let the next sync recover the confirmed epoch.
 pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
 ) -> Result<Option<[u8; 32]>, String> {
-    if let Some(k) = recover_fleet_key(t, handle_proof, device_key)? {
-        return Ok(Some(k));
-    }
-    let members = current_members(t, handle_proof)?;
-    if members.is_empty() {
-        return Ok(None);
-    }
-    match rotate_fleet_key(t, handle_proof, device_key, &members) {
-        Ok((_, k)) => Ok(Some(k)),
-        Err(_) => recover_fleet_key(t, handle_proof, device_key),
+    match fetch_fanout(t, handle_proof)? {
+        Some((epoch, wraps)) => Ok(fanout_open(handle_proof, epoch, &wraps, device_key)),
+        None => {
+            let members = current_members(t, handle_proof)?;
+            if members.is_empty() {
+                return Ok(None);
+            }
+            match rotate_fleet_key(t, handle_proof, device_key, &members) {
+                Ok((_, k)) => Ok(Some(k)),
+                Err(_) => recover_fleet_key(t, handle_proof, device_key),
+            }
+        }
     }
 }
 
