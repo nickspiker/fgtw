@@ -1,20 +1,31 @@
-//! Pairing v1 — device-ADD ceremony word logic.
+//! Pairing — device-ADD ceremony word logic (docs/pairing-v2.md, words-first redesign 2026-07-13).
 //!
-//! The NEW device generates a fresh 256-bit pairing keypair and DISPLAYS its public half as words; the user types them into an EXISTING device, which matches them against the posted request and binds.
-//! The words are a public key, not a bearer secret: the request is SIGNED by the pairing private key, so a shoulder-surfer who reads the words can find the request but can never forge a rival one for their own device — stealing the invite requires stealing the new device itself.
-//! 256-bit because the value is matched on the network: birthday-bounded to 128-bit security, per the count that matters.
+//! The NEW device DISPLAYS its device pubkey as 23 voca words, MASKED to its fleet ([`masked_device_words`]); the user types them into an EXISTING device, whose matcher screens them against the binding-request registry live, keystroke by keystroke.
+//! The words carry a public value headed for the public chain anyway — disclosure is inert: nothing can be bound without a request signed by that device's own key (`fleet::bindreq_signing_bytes`), and the mask makes the words meaningless outside the fleet they were minted for.
+//! 256 bits because the words ARE the selector: a full exact match against a verified request is the bind decision, no shorter code to grind against.
 //!
-//! This module is the word codec + spell-check + signing-bytes; the FGTW relay transport (post/fetch the request, post/poll the matched flag) is the client's job — it signs with the bytes defined here.
+//! This module is the word codec + spell-check + the mask; the request signing-bytes live in `fleet` (the fold verifies consent there, and the worker folds without this module's feature).
+//!
+//! The BLE transport (lock word + proximity beacon, below) delivers candidates by radio instead of by eyes — same ceremony, different selector; it ships later.
 
-use crate::keys::Keypair;
 use vsf::VsfType;
 
-/// Fixed word count for a 256-bit pairing key: voca's FULL base is 3177 (~11.63 bits/word), and 22 words is 255.94 bits — just short — so 23 covers every key. Fixed-width (leading-zero-padded) so the typing side always knows when the entry is complete.
+/// Fixed word count for a 256-bit value: voca's FULL base is 3177 (~11.63 bits/word), and 22 words is 255.94 bits — just short — so 23 covers every key. Fixed-width (leading-zero-padded) so the typing side always knows when the entry is complete. The ~11 spare bits in the 23rd word stay spare (future versioning); no checksum — the live matcher subsumes typo detection.
 pub const PAIR_WORD_COUNT: usize = 23;
 
-/// Fresh pairing identity for one add attempt (the seed IS the 256-bit value the words carry — the keypair is derived from it).
-pub fn new_pairing_id() -> Keypair {
-    Keypair::from_seed(&rand::random::<[u8; 32]>())
+/// The handle-scoped word mask: a key derived from the identity seed, XORed over the device pubkey before word-encoding. Both ends compute it (new device: from the typed handle; old device: from its session), so the same physical words resolve ONLY inside this fleet — two families pairing in one room can't cross-pollinate, and a transcribed word list is noise everywhere else. Against an attacker who holds the handle the mask is decoration (they can derive it); the security is the request's signatures.
+pub fn word_mask(identity_seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("photon pair words v1", identity_seed)
+}
+
+/// The 23 words a NEW device displays: its device pubkey, masked to this fleet. The OLD device computes the same string per registry candidate and prefix-matches the typed entry against them — no decode, no comparison for a human to lazy-glance.
+pub fn masked_device_words(device_pubkey: &[u8; 32], identity_seed: &[u8; 32]) -> String {
+    let mask = word_mask(identity_seed);
+    let mut masked = *device_pubkey;
+    for (b, m) in masked.iter_mut().zip(mask.iter()) {
+        *b ^= m;
+    }
+    pair_words(&masked)
 }
 
 /// The zero word (digit 0), capitalised to match voca's camelCase encode — the left-pad for keys with leading zeros, so the word count never shrinks and the completeness check stays exact.
@@ -121,12 +132,12 @@ pub fn first_bad_pair_word(s: &str) -> Option<String> {
     None
 }
 
-/// Parse a hub-pushed pairing event — section `pair_evt` {k: kind, hp} — into (kind, handle_proof). Returns `None` for every other frame: the hub also carries dashboard-capsule broadcasts, which subscribers skip cheaply on the header/section decode. Kinds today: "matched" (a member posted the matched flag) and "fleet" (the membership chain extended).
+/// Parse a hub-pushed pairing event — section `pair_evt` {k: kind, hp} — into (kind, handle_proof). Returns `None` for every other frame: the hub also carries dashboard-capsule broadcasts, which subscribers skip cheaply on the header/section decode. Kinds today: "request" (a binding request was posted or withdrawn — the matcher refetches) and "fleet" (the membership chain extended — the joining device re-checks its lamp).
 pub fn parse_pair_event(bytes: &[u8]) -> Option<(String, [u8; 32])> {
     // Verified read (hp + hb | signature) — hub frames are worker-built and always carry an anchor; anything unverifiable is skipped, not parsed.
-    let (_, header_end) = vsf::verification::read_verified(bytes, None).ok()?;
-    let mut ptr = header_end;
-    let section = vsf::VsfSection::parse(bytes, &mut ptr).ok()?;
+    let (header, header_end) = vsf::verification::read_verified(bytes, None).ok()?;
+    // primary_section resolves the near-form name from the header TOC. The old bare VsfSection::parse left `name` EMPTY for near-form frames, so the check below rejected EVERY real pair_evt — the hub push accelerator never fired and the poll cadence silently carried the whole ceremony (the observed "bind landed but the device sat minutes on the old timeout").
+    let section = header.primary_section(bytes, header_end).ok()?;
     if section.name != "pair_evt" {
         return None;
     }
@@ -191,46 +202,109 @@ pub fn device_name_default(device_pubkey: &[u8; 32], identity_seed: &[u8; 32]) -
     s
 }
 
-/// A pairing request the existing device matched against the typed words: the device to bind, proven owned by the pairing key the words name.
+// ── Pairing v2 — lock word + beacon (photon docs/pairing-v2.md). The candidate device pubkey travels by proximity beacon ONLY (never the relay); one fresh voca word typed old→new authenticates the candidate; a second valid proof at any moment is proof of attack and aborts the ceremony. v1 above retires at phase 3. ──
+
+/// Truncated MAC length in the proof beacon: 96 bits guards proof-forgery-without-the-word; it cannot guard the ~11.6-bit word itself (offline-brutable from any aired proof by design), which is why the single-valid-proof abort rule exists.
+pub const WORD_MAC_LEN: usize = 12;
+
+/// The hp prefix carried in beacons: a scan filter so two fleets pairing in one room don't cross-pollinate. Public, carries no trust.
+pub fn hp_prefix(handle_proof: &[u8; 32]) -> [u8; 4] {
+    let mut p = [0u8; 4];
+    p.copy_from_slice(&handle_proof[..4]);
+    p
+}
+
+/// A fresh lock word for ONE ceremony, minted on the OLD device and typed into the new one. Fresh randomness each time, so holding the handle buys an attacker nothing; rerolled on every abort. Lowercase — the entry side lowercases anyway.
+pub fn lock_word() -> String {
+    let base = voca::FULL.alphabet.len() as u64;
+    // u64 modulo bias over a 3177-word base is ~1e-16 — noise against an 11.6-bit secret.
+    let idx = (rand::random::<u64>() % base) as usize;
+    String::from_utf8_lossy(voca::FULL.alphabet[idx]).into_owned()
+}
+
+/// Exact-member spell check for the lock word entry (case/whitespace tolerant), reusing the pairing word index.
+pub fn is_lock_word(s: &str) -> bool {
+    let w = s.trim().to_ascii_lowercase();
+    !w.is_empty() && word_index().0.contains(w.as_bytes())
+}
+
+/// The proof the NEW device beacons once the user typed the lock word: a keyed MAC over its device pubkey under a key derived from (word, handle_proof). The word is canonicalised (trim + lowercase) so display case and stray whitespace never break the ceremony. Word freshness is the replay guard — an old ceremony's proof verifies against nothing.
+pub fn word_mac(word: &str, handle_proof: &[u8; 32], device_pubkey: &[u8; 32]) -> [u8; WORD_MAC_LEN] {
+    let w = word.trim().to_ascii_lowercase();
+    let mut material = Vec::with_capacity(w.len() + 32);
+    material.extend_from_slice(w.as_bytes());
+    material.extend_from_slice(handle_proof);
+    let key = blake3::derive_key("fgtw pair v2 lock word", &material);
+    let mac = blake3::keyed_hash(&key, device_pubkey);
+    let mut out = [0u8; WORD_MAC_LEN];
+    out.copy_from_slice(&mac.as_bytes()[..WORD_MAC_LEN]);
+    out
+}
+
+/// OLD-device check of an aired proof against the word it displayed. Timing-safe comparison is pointless here — the word is offline-brutable from the proof by design; the abort-on-second-valid-proof rule is the actual defence.
+pub fn verify_word_mac(word: &str, handle_proof: &[u8; 32], device_pubkey: &[u8; 32], proof: &[u8]) -> bool {
+    proof.len() == WORD_MAC_LEN && word_mac(word, handle_proof, device_pubkey) == proof
+}
+
+/// A parsed pairing beacon: what a scanning old device heard.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PairRequest {
-    pub pairing_pubkey: [u8; 32],
-    pub device_pubkey: [u8; 32],
+pub enum Beacon {
+    /// Pre-word liveness: a candidate exists nearby. Label-only UX; trusted for nothing.
+    Announce { hp_prefix: [u8; 4], device_pubkey: [u8; 32] },
+    /// Post-word: the candidate claims knowledge of the lock word for this hp.
+    Proof { hp_prefix: [u8; 4], device_pubkey: [u8; 32], word_mac: [u8; WORD_MAC_LEN] },
 }
 
-/// The exact bytes a pairing request signs: the pairing key attests it owns `device_pubkey` for `handle_proof` at time `t`. The client transport signs these with the pairing key and verifies them under the request's own pairing pubkey.
-pub fn pair_request_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], t: i64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(24 + 64 + 8);
-    v.extend_from_slice(b"PHOTON_PAIR_REQ_v1");
-    v.extend_from_slice(handle_proof);
+const BEACON_VER: u8 = 1;
+const BEACON_KIND_ANNOUNCE: u8 = 1;
+const BEACON_KIND_PROOF: u8 = 2;
+
+/// Announce frame: `[ver][kind=1][hp_prefix:4][device_pubkey:32]` = 38 bytes. Fits legacy BLE ADV+SCAN_RSP with room to spare.
+pub fn beacon_announce(handle_proof: &[u8; 32], device_pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(38);
+    v.push(BEACON_VER);
+    v.push(BEACON_KIND_ANNOUNCE);
+    v.extend_from_slice(&hp_prefix(handle_proof));
     v.extend_from_slice(device_pubkey);
-    v.extend_from_slice(&t.to_le_bytes());
     v
 }
 
-/// The exact bytes a "matched" flag signs: a member device attests it matched `pairing_pubkey` for `handle_proof` at time `t`. Signed by the member device, verified by the new device against the current member set.
-pub fn pair_matched_signing_bytes(handle_proof: &[u8; 32], pairing_pubkey: &[u8; 32], t: i64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(28 + 64 + 8);
-    v.extend_from_slice(b"PHOTON_PAIR_MATCHED_v1");
-    v.extend_from_slice(handle_proof);
-    v.extend_from_slice(pairing_pubkey);
-    v.extend_from_slice(&t.to_le_bytes());
+/// Proof frame: `[ver][kind=2][hp_prefix:4][device_pubkey:32][word_mac:12]` = 50 bytes — still inside the ~54 usable bytes of legacy ADV+SCAN_RSP, so no extended-advertising lottery and no connection.
+pub fn beacon_proof(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], proof: &[u8; WORD_MAC_LEN]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(50);
+    v.push(BEACON_VER);
+    v.push(BEACON_KIND_PROOF);
+    v.extend_from_slice(&hp_prefix(handle_proof));
+    v.extend_from_slice(device_pubkey);
+    v.extend_from_slice(proof);
     v
+}
+
+/// Parse a scanned beacon. `None` for anything that isn't a well-formed v2 pairing frame — scanners see every fitness tracker in the building, so unrecognised bytes are noise, never an error.
+pub fn parse_beacon(bytes: &[u8]) -> Option<Beacon> {
+    if bytes.len() < 38 || bytes[0] != BEACON_VER {
+        return None;
+    }
+    let mut hp4 = [0u8; 4];
+    hp4.copy_from_slice(&bytes[2..6]);
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&bytes[6..38]);
+    match (bytes[1], bytes.len()) {
+        (BEACON_KIND_ANNOUNCE, 38) => Some(Beacon::Announce { hp_prefix: hp4, device_pubkey: pk }),
+        (BEACON_KIND_PROOF, n) if n == 38 + WORD_MAC_LEN => {
+            let mut proof = [0u8; WORD_MAC_LEN];
+            proof.copy_from_slice(&bytes[38..38 + WORD_MAC_LEN]);
+            Some(Beacon::Proof { hp_prefix: hp4, device_pubkey: pk, word_mac: proof })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::VerifyingKey;
 
     const HP: [u8; 32] = [0xab; 32];
-
-    fn key(seed: u8) -> Keypair {
-        Keypair::from_seed(&[seed; 32])
-    }
-    fn pk(k: &Keypair) -> [u8; 32] {
-        k.public.to_bytes()
-    }
 
     #[test]
     fn live_word_check_flags_typos_but_tolerates_prefixes() {
@@ -311,23 +385,81 @@ mod tests {
     }
 
     #[test]
-    fn pair_request_and_matched_signatures_verify_and_bind() {
-        use ed25519_dalek::Verifier;
-        let pairing = new_pairing_id();
-        let member = key(4);
-        let dk = pk(&key(5));
-        let t = 12345i64;
-        // Ownership proof: verifies under the pairing pubkey, breaks under a different device or identity.
-        let sig = pairing.sign(&pair_request_signing_bytes(&HP, &dk, t));
-        let vk = VerifyingKey::from_bytes(&pairing.public.to_bytes()).unwrap();
-        assert!(vk.verify(&pair_request_signing_bytes(&HP, &dk, t), &sig).is_ok());
-        assert!(vk.verify(&pair_request_signing_bytes(&HP, &pk(&key(6)), t), &sig).is_err());
-        assert!(vk.verify(&pair_request_signing_bytes(&[9u8; 32], &dk, t), &sig).is_err());
-        // Matched flag: verifies under the member's device key, breaks for a different pairing pubkey.
-        let pp = pairing.public.to_bytes();
-        let msig = member.sign(&pair_matched_signing_bytes(&HP, &pp, t));
-        let mvk = VerifyingKey::from_bytes(&pk(&member)).unwrap();
-        assert!(mvk.verify(&pair_matched_signing_bytes(&HP, &pp, t), &msig).is_ok());
-        assert!(mvk.verify(&pair_matched_signing_bytes(&HP, &[8u8; 32], t), &msig).is_err());
+    fn lock_word_is_a_list_member() {
+        for _ in 0..8 {
+            let w = lock_word();
+            assert!(is_lock_word(&w), "minted word must spell-check: {w}");
+            assert_eq!(w, w.to_ascii_lowercase(), "minted lowercase: {w}");
+        }
+        // Case/whitespace tolerance, on a word actually in the list.
+        let real = std::str::from_utf8(voca::FULL.alphabet[100]).unwrap();
+        let mut dressed = String::from(" ");
+        dressed.push(real.chars().next().unwrap().to_ascii_uppercase());
+        dressed.push_str(&real[1..]);
+        dressed.push(' ');
+        assert!(is_lock_word(&dressed), "entry check is case/whitespace tolerant: {dressed:?}");
+        assert!(!is_lock_word("zzzqx"));
+        assert!(!is_lock_word(""));
+    }
+
+    #[test]
+    fn word_mac_binds_word_identity_and_device() {
+        let pk_a = [7u8; 32];
+        let proof = word_mac("apple", &HP, &pk_a);
+        // Verifies for the exact (word, hp, pubkey) triple, tolerant of display case and stray whitespace.
+        assert!(verify_word_mac("apple", &HP, &pk_a, &proof));
+        assert!(verify_word_mac(" Apple ", &HP, &pk_a, &proof));
+        // Any changed leg fails: wrong word, wrong identity, wrong device, truncated proof.
+        assert!(!verify_word_mac("orange", &HP, &pk_a, &proof));
+        assert!(!verify_word_mac("apple", &[9u8; 32], &pk_a, &proof));
+        assert!(!verify_word_mac("apple", &HP, &[8u8; 32], &proof));
+        assert!(!verify_word_mac("apple", &HP, &pk_a, &proof[..WORD_MAC_LEN - 1]));
+    }
+
+    #[test]
+    fn beacon_frames_round_trip_and_reject_noise() {
+        let pk = [0x42u8; 32];
+        let ann = beacon_announce(&HP, &pk);
+        assert_eq!(ann.len(), 38);
+        assert_eq!(
+            parse_beacon(&ann),
+            Some(Beacon::Announce { hp_prefix: hp_prefix(&HP), device_pubkey: pk })
+        );
+        let proof = word_mac("apple", &HP, &pk);
+        let prf = beacon_proof(&HP, &pk, &proof);
+        assert_eq!(prf.len(), 38 + WORD_MAC_LEN);
+        assert_eq!(
+            parse_beacon(&prf),
+            Some(Beacon::Proof { hp_prefix: hp_prefix(&HP), device_pubkey: pk, word_mac: proof })
+        );
+        // Scanner noise: short frames, wrong version, wrong kind, wrong length for the kind.
+        assert_eq!(parse_beacon(&[]), None);
+        assert_eq!(parse_beacon(&ann[..37]), None);
+        let mut bad_ver = ann.clone();
+        bad_ver[0] = 99;
+        assert_eq!(parse_beacon(&bad_ver), None);
+        let mut bad_kind = ann.clone();
+        bad_kind[1] = 3;
+        assert_eq!(parse_beacon(&bad_kind), None);
+        let mut announce_with_tail = ann;
+        announce_with_tail.push(0);
+        assert_eq!(parse_beacon(&announce_with_tail), None);
+    }
+
+    #[test]
+    fn masked_words_are_fleet_scoped_and_deterministic() {
+        let device = [0x42u8; 32];
+        let seed_a = [1u8; 32];
+        let seed_b = [2u8; 32];
+        let words_a = masked_device_words(&device, &seed_a);
+        // Deterministic, fixed width, and the mask round-trips thru the word codec.
+        assert_eq!(words_a, masked_device_words(&device, &seed_a));
+        assert_eq!(pair_word_tokens(&words_a), PAIR_WORD_COUNT);
+        let decoded = words_to_pair_pubkey(&words_a).unwrap();
+        let mask = word_mask(&seed_a);
+        let unmasked: Vec<u8> = decoded.iter().zip(mask.iter()).map(|(b, m)| b ^ m).collect();
+        assert_eq!(unmasked.as_slice(), &device);
+        // A different fleet's mask yields entirely different words — the same device is unrecognisable across fleets.
+        assert_ne!(words_a, masked_device_words(&device, &seed_b));
     }
 }
