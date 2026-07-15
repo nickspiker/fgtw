@@ -266,12 +266,13 @@ fn signed_req<T: FgtwTransport>(t: &T, device_key: &Keypair, section: vsf::VsfSe
 }
 
 /// NEW device: post (or refresh) its binding request — "I, `device_key`, consent to join fleet `handle_proof`" — signed by the device key AND co-signed by `Ed25519(identity_seed)` (the registry write gate; the worker checks it against the chain's genesis identity pubkey). Re-post at ~3.5 min while the words screen is up; the stamp lapses at 5.
+/// Returns the `eagle_time` (oscillations) this call stamped and published — the SAME value the sponsor reads back in [`bindreq_list`], so the caller can derive the proximity beacon ([`beacon_id`]) from the exact published offer state.
 pub fn bindreq_put<T: FgtwTransport>(
     t: &T,
     device_key: &Keypair,
     identity_seed: &[u8; 32],
     handle_proof: &[u8; 32],
-) -> Result<(), String> {
+) -> Result<i64, String> {
     use ed25519_dalek::Signer;
     let now = vsf::eagle_time_oscillations();
     let me = device_key.public.to_bytes();
@@ -290,7 +291,7 @@ pub fn bindreq_put<T: FgtwTransport>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    Ok(())
+    Ok(now)
 }
 
 /// NEW device: withdraw its own request — the author's exit act (on green, or on ceremony cancel). Signed envelope: the worker deletes exactly the signer's own entry, nobody else's. Best-effort; an unreachable worker just means the stamp lapses instead.
