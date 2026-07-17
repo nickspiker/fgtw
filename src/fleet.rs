@@ -125,6 +125,8 @@ pub struct BindRequest {
     pub device_sig: Vec<u8>,
     /// `Ed25519(identity_seed)`'s signature over the same bytes — the registry write gate (only the handle's owner can enter the set). Checked against the chain's genesis identity pubkey; never enters the chain itself.
     pub identity_sig: Vec<u8>,
+    /// NFC instant-add commitment: `pair::nfc_secret_hash(S, device_pubkey, t)` where `S` is the 32-byte random secret the joiner serves over the NFC tap. All-zero = no NFC offered. DELIBERATELY OUTSIDE `bindreq_signing_bytes` — those bytes are the chain's consent verification forever (every future fold re-checks consent_sig against them), so a new field there is a protocol-wide flag-day; the binding lives inside the keyed hash instead (recomputed per candidate with ITS pubkey+t), so a tampered/transplanted hash simply never matches — fail-closed, never wrong-device.
+    pub nfc_hash: [u8; 32],
 }
 
 impl BindRequest {
@@ -902,6 +904,7 @@ mod tests {
             t,
             device_sig: device.sign(&msg).to_bytes().to_vec(),
             identity_sig: identity_key.sign(&msg).to_bytes().to_vec(),
+            nfc_hash: [0u8; 32],
         };
         assert!(req.verify(&HP, &identity_pubkey));
         // Wrong fleet, wrong identity key, tampered stamp — each leg fails.

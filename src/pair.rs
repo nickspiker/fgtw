@@ -10,6 +10,15 @@
 
 use vsf::VsfType;
 
+/// NFC instant-add commitment: the keyed hash the PUBLIC binding request carries so the sponsor can verify the 32-byte secret `S` served over the tap. Bound to (device_pubkey, t) INSIDE the hash — a relay can't transplant it onto another candidate, because the sponsor recomputes with each candidate's own pubkey+stamp. `S` must be 32 random bytes: the hash is public, so a small preimage space would be brute-forceable offline and void the proximity gate.
+pub fn nfc_secret_hash(secret: &[u8; 32], device_pubkey: &[u8; 32], t: i64) -> [u8; 32] {
+    let key = blake3::derive_key("photon nfc pair v0", secret);
+    let mut h = blake3::Hasher::new_keyed(&key);
+    h.update(device_pubkey);
+    h.update(&t.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// Fixed word count for a 256-bit value: voca's FULL base is 3177 (~11.63 bits/word), and 22 words is 255.94 bits — just short — so 23 covers every key. Fixed-width (leading-zero-padded) so the typing side always knows when the entry is complete. The ~11 spare bits in the 23rd word stay spare (future versioning); no checksum — the live matcher subsumes typo detection.
 pub const PAIR_WORD_COUNT: usize = 23;
 
