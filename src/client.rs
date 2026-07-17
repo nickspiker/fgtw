@@ -341,6 +341,26 @@ pub fn bindreq_withdraw<T: FgtwTransport>(
     Ok(())
 }
 
+/// OWNER frees a retired device's hardware brand — the second signature of the two-signature retire (the first was the device's own departure). `member_key` must be a CURRENT fleet member; the worker refuses a release of a device still in the fold (membership only ever ends by the device's own hand) and a brand held by a different identity. Idempotent: already-free acks.
+pub fn device_release<T: FgtwTransport>(
+    t: &T,
+    member_key: &Keypair,
+    handle_proof: &[u8; 32],
+    released_pubkey: &[u8; 32],
+) -> Result<(), String> {
+    let mut section = vsf::VsfSection::new("device_release");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("rd", VsfType::ke(released_pubkey.to_vec()));
+    let resp = signed_req(t, member_key, section, "device_release")?;
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw device_release {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
+}
+
 /// EXISTING device: the pending binding requests for OUR fleet — the matcher's candidate set. Member-gated at the worker (signed envelope, signer must fold as a current member); every returned request is re-verified HERE too (freshness + both signatures against `Ed25519(identity_seed)`), so a compromised relay can inject nothing.
 pub fn bindreq_list<T: FgtwTransport>(
     t: &T,
