@@ -199,6 +199,20 @@ pub fn current_members_with_ts<T: FgtwTransport>(
     }
 }
 
+/// The full fold read for a contact refresh: member set + chain-tip eagle time + the GENERATION id (the genesis hash — the pin that renders a re-claimant of a freed name as a stranger; photon docs/lifecycle.md) + whether a chain existed at all. Absent chain ⇒ `(empty, 0, zero, false)` — the CALLER distinguishes "ended" from "never existed" by whether it ever adopted a fold.
+pub fn current_members_full<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+) -> Result<(Vec<[u8; 32]>, i64, [u8; 32], bool), String> {
+    match fetch(t, handle_proof)? {
+        Some(b) => {
+            let (m, ts) = b.fold_with_ts().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+            Ok((m, ts, b.genesis_hash().unwrap_or([0u8; 32]), true))
+        }
+        None => Ok((Vec::new(), 0, [0u8; 32], false)),
+    }
+}
+
 /// Existing-device side of device-ADD: bind the device a verified binding request names, signed by this (member) device and carrying the request's device signature as the consent egg. `req` must have been screened by the matcher (full word match + `BindRequest::verify`) — the fold re-verifies the consent regardless, so a garbage request can't enter the chain even if a caller skips the screen.
 pub fn bind_device<T: FgtwTransport>(
     t: &T,
