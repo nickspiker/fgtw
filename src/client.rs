@@ -156,6 +156,8 @@ pub fn ensure_member<T: FgtwTransport>(
             }
         }
         None => Err(match publish_err {
+            // The one-owner gate: say what actually blocked the claim, not plumbing (the bare wrap read as noise on a live device, 2026-07-17).
+            Some(e) if e.contains("device_owned") => "this device is still enrolled in another identity's fleet \u{2014} wipe it (Settings \u{2192} Security), or remove it from that fleet, before claiming a new name".into(),
             Some(e) => format!("failed to establish fleet membership: {e}"),
             None => "failed to establish fleet membership for this device".into(),
         }),
@@ -299,6 +301,10 @@ pub fn bindreq_put<T: FgtwTransport>(
     section.add_field("ds", VsfType::ge(device_key.sign(&msg).to_bytes().to_vec()));
     section.add_field("is", VsfType::ge(identity_key.sign(&msg).to_bytes().to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
+    if is_error(&resp.body, "device_owned") {
+        // The one-owner gate at the request door (2026-07-17): the joiner learns the truth NOW instead of a sponsor-side bind bouncing forever.
+        return Err("this device is still enrolled in another identity's fleet \u{2014} wipe it (Settings \u{2192} Security), or remove it from that fleet, before joining a different one".to_string());
+    }
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw bindreq_put {reason}: {detail}"));
     }
