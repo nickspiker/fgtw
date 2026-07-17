@@ -288,10 +288,17 @@ pub fn bindreq_put<T: FgtwTransport>(
     device_key: &Keypair,
     identity_seed: &[u8; 32],
     handle_proof: &[u8; 32],
+    nfc_secret: &[u8; 32],
 ) -> Result<i64, String> {
     use ed25519_dalek::Signer;
     let now = vsf::eagle_time_oscillations();
     let me = device_key.public.to_bytes();
+    // NFC commitment computed HERE because it binds the stamp this call mints (all-zero secret = no NFC offered → zero hash).
+    let nfc_hash = if *nfc_secret == [0u8; 32] {
+        [0u8; 32]
+    } else {
+        crate::pair::nfc_secret_hash(nfc_secret, &me, now)
+    };
     let msg = bindreq_signing_bytes(handle_proof, &me, now);
     let identity_key = ed25519_dalek::SigningKey::from_bytes(identity_seed);
     let mut section = vsf::VsfSection::new("bindreq_put");
@@ -300,6 +307,8 @@ pub fn bindreq_put<T: FgtwTransport>(
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
     section.add_field("ds", VsfType::ge(device_key.sign(&msg).to_bytes().to_vec()));
     section.add_field("is", VsfType::ge(identity_key.sign(&msg).to_bytes().to_vec()));
+    // NFC commitment (all-zero = none) — outside the signing bytes by design (see BindRequest::nfc_hash).
+    section.add_field("nh", VsfType::hb(nfc_hash.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
     if is_error(&resp.body, "device_owned") {
         // The one-owner gate at the request door (2026-07-17): the joiner learns the truth NOW instead of a sponsor-side bind bouncing forever.
@@ -368,7 +377,12 @@ pub fn bindreq_list<T: FgtwTransport>(
         }
         let mut device_pubkey = [0u8; 32];
         device_pubkey.copy_from_slice(dk);
-        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig: ds.clone(), identity_sig: is.clone() };
+        // Optional 5th value: the NFC commitment (older/absent rows read as zero = no NFC).
+        let nfc_hash: [u8; 32] = match v.get(4) {
+            Some(VsfType::hb(h)) if h.len() == 32 => h.as_slice().try_into().unwrap(),
+            _ => [0u8; 32],
+        };
+        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig: ds.clone(), identity_sig: is.clone(), nfc_hash };
         if (now - req.t).abs() > BINDREQ_FRESH_OSC {
             continue; // lapsed — expiry is the only deletion pending records get
         }
