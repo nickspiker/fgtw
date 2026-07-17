@@ -250,6 +250,11 @@ pub struct MembershipBlob {
 }
 
 impl MembershipBlob {
+    /// The GENERATION ID: the genesis op's chain-hash — a blake3 over the signed genesis content INCLUDING its signatures and eagle time, so it is unique per claim and unforgeable by a later claimant of the same (freed) handle. Friends pin this at first-met; a chain whose genesis hash differs from the pin is a SUCCESSOR holding a re-claimed name — a stranger — never the pinned identity. `None` only on an empty blob. (Callers wanting a VERIFIED generation id fold first; this accessor is cheap and does no validation itself.)
+    pub fn genesis_hash(&self) -> Option<[u8; 32]> {
+        self.ops.first().map(|op| op.chain_hash())
+    }
+
     /// Fold the chain to the CURRENT member set, validating every rule along the way.
     /// This is the heart of the design and the part FGTW must mirror exactly: each op must (1) link to the prior op by hash, (2) carry valid signature(s), and (3) be signed by a device that was a member *before* this op (genesis excepted — it's self-signed into an empty set).
     /// Returns the live device pubkeys in insertion order, or the first rule it violated.
