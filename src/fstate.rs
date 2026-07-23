@@ -27,10 +27,14 @@ pub struct RosterEntry {
     pub updated: i64,
     /// A removed contact stays as a tombstone so a stale device re-adding it can't resurrect it.
     pub tombstone: bool,
+    /// The ONE fleet device running this friendship's CLUTCH (fleet-sync.md §4.2: exactly one device completes the ceremony) — the adding device claims at add time; siblings park their own rounds while the owner is present; presence-loss enables takeover (another LWW write). Zero = unclaimed (legacy entry / pre-claim).
+    pub ceremony_owner: [u8; 32],
+    /// The owner's ceremony completed (chain woven). Display truth for parked siblings — "secured on <device>" — NEVER a licence to unlock their own compose (that stays chain-gated until chain state travels, braid.md §14).
+    pub woven: bool,
 }
 
-// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts.
-const ROSTER_TAG: &[u8; 5] = b"PRST1";
+// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
+const ROSTER_TAG: &[u8; 5] = b"PRST2";
 
 /// Serialize the roster to the plaintext that gets sealed under the fleet key. Not VSF: this is opaque AEAD-payload bytes, so a compact fixed-layout encoding is simpler and just as forensic (the wire envelope around the ciphertext is VSF).
 pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -45,6 +49,8 @@ pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
         out.extend_from_slice(&e.added.to_be_bytes());
         out.extend_from_slice(&e.updated.to_be_bytes());
         out.push(e.tombstone as u8);
+        out.extend_from_slice(&e.ceremony_owner);
+        out.push(e.woven as u8);
         let nb = e.name.as_bytes();
         out.extend_from_slice(&(nb.len() as u32).to_be_bytes());
         out.extend_from_slice(nb);
@@ -76,6 +82,8 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
         let added = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
         let updated = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
         let tombstone = take(&mut p, 1)?[0] != 0;
+        let ceremony_owner: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
+        let woven = take(&mut p, 1)?[0] != 0;
         let nlen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
         let name = String::from_utf8(take(&mut p, nlen)?.to_vec())
             .map_err(|_| "roster: name not utf8".to_string())?;
@@ -88,6 +96,8 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
             added,
             updated,
             tombstone,
+            ceremony_owner,
+            woven,
         });
     }
     Ok(out)
@@ -358,6 +368,8 @@ mod tests {
             added: 100,
             updated,
             tombstone,
+            ceremony_owner: [hp.wrapping_add(2); 32],
+            woven: hp % 2 == 0,
         }
     }
 
