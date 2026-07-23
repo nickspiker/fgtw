@@ -170,6 +170,13 @@ pub fn fanout_from_bytes(bytes: &[u8]) -> Result<(u64, Vec<FanoutWrap>), String>
     Ok((epoch, wraps))
 }
 
+/// The removal-rotates trigger (braid.md §14.2): a fan-out wrapping MORE devices than the fold currently holds means a former member's wrap lingers — any surviving member should mint the next epoch.
+/// Strictly greater-than: `wraps < members` is the two-phase ADD window (a device bound but awaiting the sponsor's confirm rotation) and must NOT auto-rotate, or the key would reach the newcomer before the human's press.
+/// Wraps carry no plaintext target (recipients self-select by key-commitment), so count is the only enumerable signal; a simultaneous depart+bind can hide behind equal counts until the next shrink or confirm heals it (stated residue, braid.md §14.11 G7).
+pub fn fanout_needs_rotation(wrap_count: usize, member_count: usize) -> bool {
+    member_count > 0 && wrap_count > member_count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +186,24 @@ mod tests {
     }
     fn pk(k: &Keypair) -> [u8; 32] {
         k.public.to_bytes()
+    }
+
+    #[test]
+    fn rotation_predicate_fires_on_shrink_only() {
+        // Shrink: a departed member's wrap lingers → rotate.
+        assert!(fanout_needs_rotation(3, 2));
+        assert!(fanout_needs_rotation(2, 1));
+        // Steady state: counts match → nothing to heal.
+        assert!(!fanout_needs_rotation(3, 3));
+        // Grow (two-phase ADD, bound-not-confirmed): auto-rotating here would release the key before the sponsor's press.
+        assert!(!fanout_needs_rotation(2, 3));
+        // No fold / empty fleet: never rotate toward zero members (worker refuses zero-member folds anyway).
+        assert!(!fanout_needs_rotation(1, 0));
+        assert!(!fanout_needs_rotation(0, 0));
+        // No fan-out yet (genesis): establish, don't heal.
+        assert!(!fanout_needs_rotation(0, 1));
+        // Equal-counts residue, stated: simultaneous depart+bind is invisible to a count check.
+        assert!(!fanout_needs_rotation(2, 2));
     }
 
     #[test]
