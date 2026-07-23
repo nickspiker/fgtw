@@ -65,7 +65,7 @@ pub fn fanout_seal(
     fleet_key: &[u8; 32],
     members: &[[u8; 32]],
 ) -> Result<Vec<FanoutWrap>, String> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
     use x25519_dalek::{PublicKey as XPublic, StaticSecret};
     let mut wraps = Vec::with_capacity(members.len());
     for member_ed in members {
@@ -82,7 +82,7 @@ pub fn fanout_seal(
         let shared = ss.to_bytes();
         let (ak, commit) = fanout_keys(handle_proof, epoch, member_ed, &shared, &epk, &recipient_xpk);
         let ct = ChaCha20Poly1305::new((&ak).into())
-            .encrypt(Nonce::from_slice(&[0u8; 12]), fleet_key.as_slice())
+            .encrypt((&[0u8; 12]).into(), fleet_key.as_slice())
             .map_err(|_| "fanout: seal failed".to_string())?;
         wraps.push(FanoutWrap { epk, commit, ct });
     }
@@ -96,7 +96,7 @@ pub fn fanout_open(
     wraps: &[FanoutWrap],
     device_key: &Keypair,
 ) -> Option<[u8; 32]> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
     use x25519_dalek::{PublicKey as XPublic, StaticSecret};
     let my_xsk = StaticSecret::from(device_key.secret.to_scalar_bytes());
     let my_xpk = device_key.public.to_montgomery().to_bytes();
@@ -114,7 +114,7 @@ pub fn fanout_open(
             continue;
         }
         if let Ok(pt) = ChaCha20Poly1305::new((&ak).into())
-            .decrypt(Nonce::from_slice(&[0u8; 12]), w.ct.as_slice())
+            .decrypt((&[0u8; 12]).into(), w.ct.as_slice())
         {
             if let Ok(k) = <[u8; 32]>::try_from(pt.as_slice()) {
                 return Some(k);
