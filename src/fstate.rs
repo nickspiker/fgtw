@@ -31,10 +31,12 @@ pub struct RosterEntry {
     pub ceremony_owner: [u8; 32],
     /// The owner's ceremony completed (chain woven). Display truth for parked siblings — "secured on <device>" — NEVER a licence to unlock their own compose (that stays chain-gated until chain state travels, braid.md §14).
     pub woven: bool,
+    /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the same LWW clock as the petname: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before PRST3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
+    pub trust_level: u8,
 }
 
-// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
-const ROSTER_TAG: &[u8; 5] = b"PRST2";
+// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven, PRST3 adds trust_level (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
+const ROSTER_TAG: &[u8; 5] = b"PRST3";
 
 /// Serialize the roster to the plaintext that gets sealed under the fleet key. Not VSF: this is opaque AEAD-payload bytes, so a compact fixed-layout encoding is simpler and just as forensic (the wire envelope around the ciphertext is VSF).
 pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -51,6 +53,7 @@ pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
         out.push(e.tombstone as u8);
         out.extend_from_slice(&e.ceremony_owner);
         out.push(e.woven as u8);
+        out.push(e.trust_level);
         let nb = e.name.as_bytes();
         out.extend_from_slice(&(nb.len() as u32).to_be_bytes());
         out.extend_from_slice(nb);
@@ -84,6 +87,7 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
         let tombstone = take(&mut p, 1)?[0] != 0;
         let ceremony_owner: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
         let woven = take(&mut p, 1)?[0] != 0;
+        let trust_level = take(&mut p, 1)?[0];
         let nlen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
         let name = String::from_utf8(take(&mut p, nlen)?.to_vec())
             .map_err(|_| "roster: name not utf8".to_string())?;
@@ -98,6 +102,7 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
             tombstone,
             ceremony_owner,
             woven,
+            trust_level,
         });
     }
     Ok(out)
@@ -370,6 +375,7 @@ mod tests {
             tombstone,
             ceremony_owner: [hp.wrapping_add(2); 32],
             woven: hp % 2 == 0,
+            trust_level: hp % 4,
         }
     }
 
@@ -381,6 +387,32 @@ mod tests {
         // A truncated blob fails rather than panicking.
         assert!(roster_from_bytes(&bytes[..bytes.len() - 3]).is_err());
         assert!(roster_from_bytes(b"nope").is_err());
+    }
+
+    /// trust_level rides the same LWW clock as the petname: a trust decision belongs to the identity, not to the device it was typed on. Before PRST3 the roster carried no trust at all, so promoting a friend on one device left every sibling on the old level forever.
+    #[test]
+    fn trust_level_follows_last_writer_wins() {
+        let mut old = roster_entry(7, 100, false);
+        old.trust_level = 1; // Known
+        let mut newer = roster_entry(7, 200, false);
+        newer.trust_level = 3; // Inner — promoted on another device, later
+
+        for merged in [
+            merge_rosters(vec![old.clone()], vec![newer.clone()]),
+            merge_rosters(vec![newer.clone()], vec![old.clone()]),
+        ] {
+            assert_eq!(merged.len(), 1);
+            assert_eq!(
+                merged[0].trust_level, 3,
+                "the newer trust decision must win regardless of merge order"
+            );
+        }
+
+        // And a STALE write must not undo it — an older entry loses even though its trust differs.
+        let mut stale = roster_entry(7, 50, false);
+        stale.trust_level = 0;
+        let merged = merge_rosters(vec![newer.clone()], vec![stale]);
+        assert_eq!(merged[0].trust_level, 3, "an older entry must never downgrade trust");
     }
 
     #[test]
