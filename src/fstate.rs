@@ -299,7 +299,9 @@ pub fn fstate_from_bytes(bytes: &[u8]) -> Result<FleetState, String> {
         *p += n;
         Ok(s)
     };
-    let roster = roster_from_bytes(take_chunk(&mut p)?)?;
+    // A roster the reader can't parse is EMPTY, not fatal. The two layers share this envelope but are independent, and a roster tag bump is a documented flag-day whose cost is meant to be "one re-push of the roster" — NOT the settings going with it. Propagating the error here made the whole fstate unreadable, and because `push_roster` is pull-merge-push, the failed pull left an empty merge base and the next push DESTROYED the fleet's settings on FGTW (observed on the PRST2→PRST3 bump: "state pulled — 8 roster entries, 0 global settings, 0 device maps").
+    // Settings survive a roster bump; the roster re-syncs from live contacts, exactly as the tag-bump note promises.
+    let roster = roster_from_bytes(take_chunk(&mut p)?).unwrap_or_default();
     let (global_settings, device_settings) = settings_from_bytes(take_chunk(&mut p)?)?;
     Ok(FleetState { roster, global_settings, device_settings })
 }
@@ -413,6 +415,29 @@ mod tests {
         stale.trust_level = 0;
         let merged = merge_rosters(vec![newer.clone()], vec![stale]);
         assert_eq!(merged[0].trust_level, 3, "an older entry must never downgrade trust");
+    }
+
+    /// A roster the reader can't parse must not take the SETTINGS with it. The two layers share one envelope but are independent, and a roster tag bump is a documented flag-day whose cost is one roster re-push. Propagating the error made the whole fstate unreadable, and because push is pull-merge-push, the failed pull rebased on empty and the next push DESTROYED the fleet's settings on FGTW — observed live on PRST2→PRST3 ("8 roster entries, 0 global settings, 0 device maps").
+    #[test]
+    fn an_unparseable_roster_does_not_destroy_settings() {
+        // Hand-build an fstate whose roster chunk carries an UNKNOWN tag (a future/past PRST) but whose settings chunk is valid.
+        let settings = settings_to_bytes(
+            &[SettingEntry { key: "display.theme".into(), value: vec![7], updated: 42, tombstone: false }],
+            &[],
+        );
+        let bogus_roster = b"PRSTX\x00\x00\x00\x00".to_vec();
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(FSTATE_TAG);
+        blob.extend_from_slice(&(bogus_roster.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&bogus_roster);
+        blob.extend_from_slice(&(settings.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&settings);
+
+        let state = fstate_from_bytes(&blob).expect("an unreadable roster must not fail the whole fstate");
+        assert!(state.roster.is_empty(), "the unreadable roster reads as absent — it re-syncs from live contacts");
+        assert_eq!(state.global_settings.len(), 1, "the settings layer must survive intact");
+        assert_eq!(state.global_settings[0].key, "display.theme");
     }
 
     #[test]
