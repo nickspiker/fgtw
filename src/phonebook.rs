@@ -609,6 +609,144 @@ impl Slice {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// VERIFICATION
+//
+// Each check answers exactly one question, and the split matters: a signature proves WHO wrote
+// something, never that they were ENTITLED to. Membership is the caller's check, because only the
+// caller holds the registry state to answer it.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { return false }; // unknown key → fail closed
+    vk.verify(msg, &Signature::from_bytes(sig)).is_ok()
+}
+
+impl Record {
+    /// Self-verifying: the device signed its own address, and the key it signed with is in the
+    /// record. Proves "the holder of this device key claims this address under this identity".
+    ///
+    /// Does NOT prove the device belongs to that identity's fleet — a stranger can sign a row for
+    /// any `handle_proof` they scraped. That binding is the PRIMARY registry's job (a current
+    /// member placed a pointer to this device), and it is the gap the gossip path has today.
+    pub fn verify_address(&self) -> bool {
+        self.kind() == RecordKind::DeviceAddress
+            && verify_ed25519(&self.device_pubkey(), &self.address_signing_bytes(), &self.address_sig())
+    }
+
+    /// The placement was signed by the device that claims to have made it.
+    ///
+    /// The caller MUST separately confirm that `placer()` is a CURRENT member — a departed
+    /// member's signature is still cryptographically valid forever, and treating it as authority
+    /// would let a device removed months ago keep rearranging the registry.
+    pub fn verify_placement(&self) -> bool {
+        self.kind() == RecordKind::DevicePointer
+            && verify_ed25519(&self.placer(), &self.placement_signing_bytes(), &self.placement_sig())
+    }
+
+    /// The count was attested by the device that claims to have witnessed it. Same caveat: the
+    /// caller confirms the witness is current.
+    pub fn verify_count(&self) -> bool {
+        self.kind() == RecordKind::IdentityCount
+            && verify_ed25519(&self.witness(), &self.count_signing_bytes(), &self.witness_sig())
+    }
+
+    /// A removal is only consented if the DEPARTING device signed its own departure. No device
+    /// removes another, so this is required in addition to a current member's witness — and it is
+    /// the leaver's own key, which nobody else holds.
+    ///
+    /// `true` for an add (nothing departed). A removal missing this signature is NOT consent.
+    pub fn verify_departure(&self) -> bool {
+        if self.kind() != RecordKind::IdentityCount { return false; }
+        let Some((dev, sig)) = self.departing() else { return true };
+        let msg = Record::departure_signing_bytes(&self.handle_proof(), &dev, self.epoch());
+        verify_ed25519(&dev, &msg, &sig)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// TRANSPORT — a slice body inside a complete VSF document.
+//
+// COMPLETE FILES ONLY: the body ships with a header carrying its geometry (slice_bits, slice_id,
+// fill) and a BLAKE3 provenance hash, so a receiving host knows how to address what it was handed
+// and can reject a torn transfer. The body itself is an UNBOXED section — raw fixed-stride bytes,
+// byte-addressable, exactly what an mmap'd file holds — because wrapping a million records as
+// schema fields would defeat the entire point of the layout.
+//
+// The provenance hash covers a SNAPSHOT in transit. It is not maintained across in-place updates
+// (that would be 33 minutes of BLAKE3 per IP change at 10 TB); per-record signatures are the
+// durable integrity, and this hash only says "the bytes you received are the bytes that were sent".
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The unboxed section holding the fixed-stride body.
+pub const SLICE_SECTION: &str = "pb_slice";
+
+impl Slice {
+    /// Wrap this slice as a complete VSF document for transport.
+    pub fn to_document(&self) -> Result<Vec<u8>, String> {
+        use vsf::VsfType;
+        vsf::VsfBuilder::new()
+            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .provenance_only()
+            .add_inline_field("slice_bits", vec![VsfType::u3(self.slice_bits as u8)])
+            .add_inline_field("slice_id", vec![VsfType::u5(self.slice_id)])
+            .add_inline_field("fill", vec![VsfType::u5(self.fill as u32)])
+            .add_unboxed(SLICE_SECTION, self.buf.clone())
+            .build()
+    }
+
+    /// Read a slice back from a transport document. Verified: the header must decode and its
+    /// provenance hash must be self-consistent before a single record is trusted.
+    ///
+    /// Geometry comes from the document, not from the caller's assumption — a host serving width
+    /// `n` while the network moves to `n+1` must not silently reinterpret a body at the wrong width.
+    pub fn from_document(doc: &[u8]) -> Result<Self, String> {
+        let (header, _) = vsf::verification::read_verified(doc, None)
+            .map_err(|e| format!("phonebook slice failed verified read: {e}"))?;
+
+        let field = header
+            .fields
+            .iter()
+            .find(|f| f.name == SLICE_SECTION)
+            .ok_or_else(|| format!("no '{SLICE_SECTION}' section in document TOC"))?;
+        let start = field.offset_bytes;
+        let end = start
+            .checked_add(field.size_bytes)
+            .ok_or("slice byte range overflows")?;
+        if end > doc.len() {
+            return Err(format!("slice range {start}..{end} out of bounds ({} bytes)", doc.len()));
+        }
+
+        let read_num = |name: &str| -> Result<u64, String> {
+            header
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .and_then(|f| f.inline_values.first())
+                .and_then(vsf_u64)
+                .ok_or_else(|| format!("missing header field '{name}'"))
+        };
+        let slice_bits = read_num("slice_bits")? as u32;
+        let slice_id = read_num("slice_id")? as u32;
+
+        Slice::from_bytes(slice_bits, slice_id, doc[start..end].to_vec())
+            .ok_or_else(|| format!("body is {} bytes, expected {}", end - start, SLICE_SLOTS * STRIDE))
+    }
+}
+
+/// Unsigned VSF integers arrive at whatever width fits, so match every one rather than assuming.
+fn vsf_u64(v: &vsf::VsfType) -> Option<u64> {
+    use vsf::VsfType as T;
+    Some(match v {
+        T::u3(n) => *n as u64,
+        T::u4(n) => *n as u64,
+        T::u5(n) => *n as u64,
+        T::u6(n) => *n,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +1023,149 @@ mod tests {
             assert!(restored.lookup(&r.key().unwrap()).is_some());
         }
         assert!(Slice::from_bytes(TB, 0, vec![0u8; 10]).is_none(), "a short body is rejected");
+    }
+
+    // ── signatures ──
+
+    fn sk(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+    fn pk(k: &ed25519_dalek::SigningKey) -> [u8; 32] {
+        k.verifying_key().to_bytes()
+    }
+    fn sign(k: &ed25519_dalek::SigningKey, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        k.sign(msg).to_bytes()
+    }
+
+    /// A device signs its own address, and the record self-verifies against the key inside it.
+    /// Tampering with ANY covered field must break it — that is the whole integrity story, since
+    /// there is no whole-file hash maintained across updates.
+    #[test]
+    fn address_record_self_verifies_and_detects_tampering() {
+        let dev = sk(1);
+        let hp = [5u8; 32];
+        let mut r = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &[0u8; 64]);
+        let sig = sign(&dev, &r.address_signing_bytes());
+        r = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &sig);
+        assert!(r.verify_address(), "a correctly signed address must verify");
+
+        // Every covered field: flip it, the signature must fail.
+        let bad_ip = Record::new_device_address(&pk(&dev), &hp, &[9u8; 16], 7953, &[2u8; 16], 42, &sig);
+        assert!(!bad_ip.verify_address(), "a redirected IP must not verify");
+        let bad_port = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 1, &[2u8; 16], 42, &sig);
+        assert!(!bad_port.verify_address(), "a changed port must not verify");
+        let bad_ts = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 43, &sig);
+        assert!(!bad_ts.verify_address(), "a replayed timestamp must not verify");
+        let bad_hp = Record::new_device_address(&pk(&dev), &[6u8; 32], &[1u8; 16], 7953, &[2u8; 16], 42, &sig);
+        assert!(!bad_hp.verify_address(), "planting the device under another identity must not verify");
+
+        // Another device cannot sign this device's row.
+        let attacker = sk(2);
+        let forged = sign(&attacker, &r.address_signing_bytes());
+        let bad_key = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &forged);
+        assert!(!bad_key.verify_address(), "a signature by another key must not verify");
+    }
+
+    /// A placement verifies against the placer named in it — but that is only WHO, never WHETHER
+    /// they were entitled. A departed member's signature stays valid forever, so the caller must
+    /// check current membership separately; this test pins that the check is genuinely absent here.
+    #[test]
+    fn placement_verifies_signer_but_not_membership() {
+        let placer = sk(3);
+        let hp = [1u8; 32];
+        let base = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &[0u8; 64]);
+        let sig = sign(&placer, &base.placement_signing_bytes());
+        let r = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &sig);
+        assert!(r.verify_placement());
+
+        // Same signature, different index → different signing bytes → fails. This is target (b) of
+        // the shuffle attack, closed cryptographically rather than by convention.
+        let moved = Record::new_device_pointer(&hp, 3, &[7u8; 32], 10, &pk(&placer), &sig);
+        assert!(!moved.verify_placement(), "a placement cannot be replayed at another index");
+
+        // A stranger's placement verifies as THEIRS — proving the caller must gate on membership.
+        let stranger = sk(9);
+        let sbase = Record::new_device_pointer(&hp, 2, &[7u8; 32], 11, &pk(&stranger), &[0u8; 64]);
+        let ssig = sign(&stranger, &sbase.placement_signing_bytes());
+        let srec = Record::new_device_pointer(&hp, 2, &[7u8; 32], 11, &pk(&stranger), &ssig);
+        assert!(srec.verify_placement(), "signature is valid — membership is the CALLER's check");
+    }
+
+    /// Consent-only removal: the departing device's own signature is required, and an unsigned or
+    /// wrongly-signed departure is not consent. An add has nothing to prove.
+    #[test]
+    fn departure_requires_the_leavers_own_signature() {
+        let leaver = sk(4);
+        let witness = sk(5);
+        let hp = [1u8; 32];
+
+        let add = Record::new_identity_count(&hp, 3, 10, &pk(&witness), &[0u8; 64], None);
+        assert!(add.verify_departure(), "an add has no departure to prove");
+
+        let msg = Record::departure_signing_bytes(&hp, &pk(&leaver), 11);
+        let good = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &[0u8; 64], Some((&pk(&leaver), &sign(&leaver, &msg))));
+        assert!(good.verify_departure(), "the leaver's own signature is consent");
+
+        let forged = sign(&witness, &msg); // a member signing on the leaver's behalf
+        let bad = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &[0u8; 64], Some((&pk(&leaver), &forged)));
+        assert!(!bad.verify_departure(), "no device removes another — a member cannot sign for the leaver");
+
+        let wrong_epoch = Record::new_identity_count(&hp, 2, 12, &pk(&witness), &[0u8; 64], Some((&pk(&leaver), &sign(&leaver, &msg))));
+        assert!(!wrong_epoch.verify_departure(), "the departure is bound to its epoch");
+    }
+
+    /// The witness attests the count AND which device departed, so it cannot be replayed against a
+    /// different removal.
+    #[test]
+    fn count_witness_commits_to_the_departure() {
+        let witness = sk(6);
+        let hp = [1u8; 32];
+        let leaver = [7u8; 32];
+        let base = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &[0u8; 64], Some((&leaver, &[0u8; 64])));
+        let sig = sign(&witness, &base.count_signing_bytes());
+        let r = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &sig, Some((&leaver, &[0u8; 64])));
+        assert!(r.verify_count());
+
+        let other_leaver = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &sig, Some((&[8u8; 32], &[0u8; 64])));
+        assert!(!other_leaver.verify_count(), "the witness names WHICH device departed");
+        let other_count = Record::new_identity_count(&hp, 5, 11, &pk(&witness), &sig, Some((&leaver, &[0u8; 64])));
+        assert!(!other_count.verify_count(), "the witness attests a specific count");
+    }
+
+    // ── transport ──
+
+    /// A slice ships as a COMPLETE VSF file: header, provenance hash, geometry, and the raw
+    /// fixed-stride body as an unboxed section. Round-trip must preserve every record and both
+    /// invariants, and the geometry must come from the document rather than the caller.
+    #[test]
+    fn slice_round_trips_through_a_vsf_document() {
+        let (s, made) = populate(1500);
+        let doc = s.to_document().expect("build document");
+        assert!(doc.starts_with(b"R\xc3\x85<"), "must carry the R\u{c5}< magic");
+        let (header, _) = vsf::verification::read_verified(&doc, None).expect("verified read");
+        assert!(matches!(header.provenance_hash, vsf::VsfType::hp(ref h) if h.len() == 32),
+            "a slice in transit carries a provenance hash so a torn transfer is detectable");
+
+        let back = Slice::from_document(&doc).expect("read back");
+        assert_eq!(back.slice_bits(), s.slice_bits(), "geometry comes from the document");
+        assert_eq!(back.slice_id(), s.slice_id());
+        assert_eq!(back.fill(), made.len());
+        back.check_invariants().expect("invariants survive transport");
+        for r in &made {
+            assert!(back.lookup(&r.key().unwrap()).is_some());
+        }
+    }
+
+    /// A corrupted document must be refused before any record is trusted.
+    #[test]
+    fn corrupt_document_is_rejected() {
+        let (s, _) = populate(200);
+        let mut doc = s.to_document().expect("build");
+        let n = doc.len();
+        doc[n / 2] ^= 0xFF;
+        assert!(Slice::from_document(&doc).is_err(), "a tampered body must not load");
+        assert!(Slice::from_document(b"not a vsf document").is_err());
     }
 
     /// Every layout must fit the stride with reserve left over — the reserve is the migration
