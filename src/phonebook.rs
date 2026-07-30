@@ -334,6 +334,29 @@ impl Record {
         b[DA_SIG..DA_SIG + 64].copy_from_slice(sig);
         Record(b)
     }
+    /// Mint a SIGNED address record in one step: build, sign the covered bytes, rebuild with the
+    /// signature in place.
+    ///
+    /// The two-step dance is easy to get subtly wrong at a call site (sign the wrong bytes, or sign
+    /// before a field is final and ship a record that cannot verify), and an address record that
+    /// fails verification is silently dropped by every reader — so the mistake is invisible until
+    /// nobody can be found. Doing it here once means a caller cannot express the broken version.
+    pub fn sign_device_address(
+        signing_key: &ed25519_dalek::SigningKey,
+        handle_proof: &[u8; 32],
+        ip: &[u8; 16],
+        port: u16,
+        local_ip: &[u8; 16],
+        timestamp: i64,
+    ) -> Self {
+        use ed25519_dalek::Signer;
+        let device_pubkey = signing_key.verifying_key().to_bytes();
+        let unsigned =
+            Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &[0u8; 64]);
+        let sig = signing_key.sign(&unsigned.address_signing_bytes()).to_bytes();
+        Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &sig)
+    }
+
     pub fn handle_proof(&self) -> [u8; 32] {
         match self.kind() {
             RecordKind::DeviceAddress => rd32(&self.0, DA_HANDLE),
@@ -1036,6 +1059,49 @@ mod tests {
     fn sign(k: &ed25519_dalek::SigningKey, msg: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer;
         k.sign(msg).to_bytes()
+    }
+
+    /// The one-step mint must produce exactly what the hand-rolled two-step produces, and must
+    /// verify. This is the helper the client publishes through, so a regression here is an
+    /// unfindable device rather than a visible error.
+    #[test]
+    fn sign_device_address_mints_a_verifying_record() {
+        let dev = sk(3);
+        let hp = [8u8; 32];
+        let minted = Record::sign_device_address(&dev, &hp, &[4u8; 16], 4383, &[5u8; 16], 99);
+        assert!(minted.verify_address(), "a minted record must verify");
+
+        let unsigned = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 99, &[0u8; 64]);
+        let expected = Record::new_device_address(
+            &pk(&dev),
+            &hp,
+            &[4u8; 16],
+            4383,
+            &[5u8; 16],
+            99,
+            &sign(&dev, &unsigned.address_signing_bytes()),
+        );
+        assert_eq!(minted.0, expected.0, "the one-step mint must equal the two-step");
+        assert_eq!(minted.key(), Some(key_address(&pk(&dev))), "keyed by device pubkey alone");
+    }
+
+    /// The record crosses the wire to the seed as its raw 256 bytes and is reconstructed there
+    /// before `verify_address` runs. A stride change or a lossy copy would break publication
+    /// silently, so pin the exact byte-for-byte round trip the worker's `pb_put` performs.
+    #[test]
+    fn address_record_survives_a_raw_stride_round_trip() {
+        let dev = sk(4);
+        let r = Record::sign_device_address(&dev, &[2u8; 32], &[7u8; 16], 4383, &[6u8; 16], 1234);
+
+        let wire: Vec<u8> = r.0.to_vec();
+        assert_eq!(wire.len(), STRIDE, "the wire form is exactly one stride");
+
+        let mut back = [0u8; STRIDE];
+        back.copy_from_slice(&wire);
+        let restored = Record(back);
+        assert!(restored.verify_address(), "a round-tripped record still verifies");
+        assert_eq!(restored.key(), r.key());
+        assert_eq!(restored.epoch(), 1234, "the monotonic guard reads the same epoch back");
     }
 
     /// A device signs its own address, and the record self-verifies against the key inside it.
