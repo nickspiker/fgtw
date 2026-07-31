@@ -452,7 +452,14 @@ pub fn fstate_to_bytes(state: &FleetState) -> Vec<u8> {
 
 /// Parse a fleet-state document. A roster-only document reads as roster + empty settings — no version fork.
 pub fn fstate_from_bytes(bytes: &[u8]) -> Result<FleetState, String> {
-    // The document itself must verify — a non-document (any pre-v6 blob) fails here, which IS the flag-day.
+    // A KNOWN legacy layout (the pre-v6 hand-rolled tags) is the documented flag-day: it reads as ABSENT — roster re-seeds from live contacts, settings re-push. It must NOT read as an error: push is pull-merge-push and a pull error rightly aborts the push (the PRST2→PRST3 lesson), so error-ing on the old blob would deadlock the slot on its old bytes forever — no v6 device could ever complete the push that re-seeds it.
+    if bytes.len() >= 4 {
+        let tag = &bytes[..4];
+        if tag == b"PRST" || tag == b"PFST" || tag == b"PSET" {
+            return Ok(FleetState::default());
+        }
+    }
+    // Anything else non-document is corruption or an unknown future format — a real error, which the push path treats as untouchable.
     vsf::verification::read_verified(bytes, None).map_err(|e| format!("fstate: {e:?}"))?;
     // A roster the reader can't parse is EMPTY, not fatal. The layers share one document but are independent, and a roster version bump is a documented flag-day whose cost is meant to be "one re-push of the roster" — NOT the settings going with it. Propagating the error here made the whole fstate unreadable, and because `push_roster` is pull-merge-push, the failed pull left an empty merge base and the next push DESTROYED the fleet's settings on FGTW (observed on the v2→v3 bump: "state pulled — 8 roster entries, 0 global settings, 0 device maps").
     let roster = match parse_section(roster_schema(), bytes) {
@@ -576,6 +583,16 @@ mod tests {
             woven: hp % 2 == 0,
             trust_level: hp % 4,
         }
+    }
+
+    /// The pre-v6 blobs still sitting in live slots must read as ABSENT, not as an error — an error aborts pull-merge-push and no v6 device could ever re-seed the slot.
+    #[test]
+    fn legacy_tagged_blobs_read_as_absent_fstate() {
+        for legacy in [&b"PRST5\x00\x00\x00\x01junk"[..], b"PFST1junk", b"PSET0junk"] {
+            let state = fstate_from_bytes(legacy).expect("legacy tags are the flag-day, not corruption");
+            assert!(state.roster.is_empty() && state.global_settings.is_empty());
+        }
+        assert!(fstate_from_bytes(b"XYZWjunk").is_err(), "unknown bytes stay an error");
     }
 
     #[test]
