@@ -33,10 +33,12 @@ pub struct RosterEntry {
     pub woven: bool,
     /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the same LWW clock as the petname: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before PRST3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
     pub trust_level: u8,
+    /// The friend's own chosen display name, adopted from their pong. Synced like the avatar pin so a fresh sibling shows real names instantly instead of pseudonyms until each friend happens to come online. Zero trust — the pinned key carries the trust; petname still wins at render.
+    pub published_name: String,
 }
 
-// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven, PRST3 adds trust_level (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
-const ROSTER_TAG: &[u8; 5] = b"PRST3";
+// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven, PRST3 adds trust_level, PRST4 adds published_name (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
+const ROSTER_TAG: &[u8; 5] = b"PRST4";
 
 /// Serialize the roster to the plaintext that gets sealed under the fleet key. Not VSF: this is opaque AEAD-payload bytes, so a compact fixed-layout encoding is simpler and just as forensic (the wire envelope around the ciphertext is VSF).
 pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -57,6 +59,9 @@ pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
         let nb = e.name.as_bytes();
         out.extend_from_slice(&(nb.len() as u32).to_be_bytes());
         out.extend_from_slice(nb);
+        let pb = e.published_name.as_bytes();
+        out.extend_from_slice(&(pb.len() as u32).to_be_bytes());
+        out.extend_from_slice(pb);
     }
     out
 }
@@ -91,11 +96,15 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
         let nlen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
         let name = String::from_utf8(take(&mut p, nlen)?.to_vec())
             .map_err(|_| "roster: name not utf8".to_string())?;
+        let plen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+        let published_name = String::from_utf8(take(&mut p, plen)?.to_vec())
+            .map_err(|_| "roster: published name not utf8".to_string())?;
         out.push(RosterEntry {
             handle_proof,
             handle_hash,
             public_identity,
             name,
+            published_name,
             avatar_pin,
             added,
             updated,
@@ -371,6 +380,7 @@ mod tests {
             handle_hash: [hp ^ 0xff; 32],
             public_identity: [hp.wrapping_add(1); 32],
             name: format!("friend{hp}"),
+            published_name: format!("Chosen{hp}"),
             avatar_pin: [hp ^ 0x55; 64],
             added: 100,
             updated,
