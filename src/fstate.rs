@@ -18,8 +18,6 @@ pub struct RosterEntry {
     pub handle_hash: [u8; 32],
     /// Last-known friend device pubkey (a hint; the joining device re-discovers current devices by handle_proof). Zero if unknown.
     pub public_identity: [u8; 32],
-    /// The local petname, synced across OUR OWN fleet under the fleet key — a label we chose, empty = render the keyed pseudonym.
-    pub name: String,
     /// The pinned avatar-wall material, derived once at first-met and synced so every fleet device fetches + decrypts this friend's avatar without ever holding the handle: AES key (32) ‖ FGTW lookup hash (32). Zero = not pinned.
     pub avatar_pin: [u8; 64],
     pub added: i64,
@@ -31,14 +29,14 @@ pub struct RosterEntry {
     pub ceremony_owner: [u8; 32],
     /// The owner's ceremony completed (chain woven). Display truth for parked siblings — "secured on <device>" — NEVER a licence to unlock their own compose (that stays chain-gated until chain state travels, braid.md §14).
     pub woven: bool,
-    /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the same LWW clock as the petname: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before PRST3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
+    /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the entry's LWW clock: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before PRST3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
     pub trust_level: u8,
     /// The friend's own chosen display name, adopted from their pong. Synced like the avatar pin so a fresh sibling shows real names instantly instead of pseudonyms until each friend happens to come online. Zero trust — the pinned key carries the trust; petname still wins at render.
     pub published_name: String,
 }
 
-// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven, PRST3 adds trust_level, PRST4 adds published_name (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
-const ROSTER_TAG: &[u8; 5] = b"PRST4";
+// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven, PRST3 adds trust_level, PRST4 adds published_name, PRST5 drops the never-used petname slot (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
+const ROSTER_TAG: &[u8; 5] = b"PRST5";
 
 /// Serialize the roster to the plaintext that gets sealed under the fleet key. Not VSF: this is opaque AEAD-payload bytes, so a compact fixed-layout encoding is simpler and just as forensic (the wire envelope around the ciphertext is VSF).
 pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -56,9 +54,6 @@ pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
         out.extend_from_slice(&e.ceremony_owner);
         out.push(e.woven as u8);
         out.push(e.trust_level);
-        let nb = e.name.as_bytes();
-        out.extend_from_slice(&(nb.len() as u32).to_be_bytes());
-        out.extend_from_slice(nb);
         let pb = e.published_name.as_bytes();
         out.extend_from_slice(&(pb.len() as u32).to_be_bytes());
         out.extend_from_slice(pb);
@@ -93,9 +88,6 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
         let ceremony_owner: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
         let woven = take(&mut p, 1)?[0] != 0;
         let trust_level = take(&mut p, 1)?[0];
-        let nlen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-        let name = String::from_utf8(take(&mut p, nlen)?.to_vec())
-            .map_err(|_| "roster: name not utf8".to_string())?;
         let plen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
         let published_name = String::from_utf8(take(&mut p, plen)?.to_vec())
             .map_err(|_| "roster: published name not utf8".to_string())?;
@@ -103,7 +95,6 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
             handle_proof,
             handle_hash,
             public_identity,
-            name,
             published_name,
             avatar_pin,
             added,
@@ -379,7 +370,6 @@ mod tests {
             handle_proof: [hp; 32],
             handle_hash: [hp ^ 0xff; 32],
             public_identity: [hp.wrapping_add(1); 32],
-            name: format!("friend{hp}"),
             published_name: format!("Chosen{hp}"),
             avatar_pin: [hp ^ 0x55; 64],
             added: 100,
