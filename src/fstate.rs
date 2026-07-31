@@ -10,7 +10,7 @@
 //!
 //! This module is the data model + codec + merge; the seal-and-push / pull-and-open transport (which needs the fleet key and the network) is the client's job.
 
-/// One syncable friend. The minimal identity a device needs to reconstruct a contact and re-CLUTCH: the PIN-SET (docs/identity-profile.md — party id, proof, avatar key, petname; NEVER the handle string, which derives the identity seed) plus CRDT bookkeeping (`updated` for last-writer-wins, `tombstone` for removals that must stick across a merge).
+/// One syncable friend. The minimal identity a device needs to reconstruct a contact and re-CLUTCH: the PIN-SET (docs/identity-profile.md — party id, proof, avatar key; NEVER the handle string, which derives the identity seed) plus CRDT bookkeeping (`updated` for last-writer-wins, `tombstone` for removals that must stick across a merge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterEntry {
     pub handle_proof: [u8; 32],
@@ -31,7 +31,7 @@ pub struct RosterEntry {
     pub woven: bool,
     /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the entry's LWW clock: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before PRST3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
     pub trust_level: u8,
-    /// The friend's own chosen display name, adopted from their pong. Synced like the avatar pin so a fresh sibling shows real names instantly instead of pseudonyms until each friend happens to come online. Zero trust — the pinned key carries the trust; petname still wins at render.
+    /// The friend's own chosen display name, adopted from their pong. Synced like the avatar pin so a fresh sibling shows real names instantly instead of pseudonyms until each friend happens to come online. Zero trust — the pinned key carries the trust; empty renders the keyed pseudonym.
     pub published_name: String,
 }
 
@@ -391,7 +391,7 @@ mod tests {
         assert!(roster_from_bytes(b"nope").is_err());
     }
 
-    /// trust_level rides the same LWW clock as the petname: a trust decision belongs to the identity, not to the device it was typed on. Before PRST3 the roster carried no trust at all, so promoting a friend on one device left every sibling on the old level forever.
+    /// trust_level rides the entry's LWW clock: a trust decision belongs to the identity, not to the device it was typed on. Before PRST3 the roster carried no trust at all, so promoting a friend on one device left every sibling on the old level forever.
     #[test]
     fn trust_level_follows_last_writer_wins() {
         let mut old = roster_entry(7, 100, false);
