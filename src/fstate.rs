@@ -9,12 +9,17 @@
 //! Each device is the single writer of its own map, so the only true CRDT surface is the global layer; device maps merge by newest-copy-wins.
 //!
 //! This module is the data model + codec + merge; the seal-and-push / pull-and-open transport (which needs the fleet key and the network) is the client's job.
+//! The sealed plaintext is a COMPLETE VSF document (header, provenance hash, schema'd sections) — not a hand-rolled layout; see photon AGENT.md "VSF Transport Rule".
+
+use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
+use vsf::types::EtType;
+use vsf::VsfType;
 
 /// One syncable friend. The minimal identity a device needs to reconstruct a contact and re-CLUTCH: the PIN-SET (docs/identity-profile.md — party id, proof, avatar key; NEVER the handle string, which derives the identity seed) plus CRDT bookkeeping (`updated` for last-writer-wins, `tombstone` for removals that must stick across a merge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterEntry {
     pub handle_proof: [u8; 32],
-    /// The contact's PARTY ID: their pinned identity PUBKEY — verification-only, no signing power. (The pre-pin-set roster carried the friend's identity SEED here; the PRST1 tag bump orphans those blobs.)
+    /// The contact's PARTY ID: their pinned identity PUBKEY — verification-only, no signing power. (The pre-pin-set roster carried the friend's identity SEED here; the v1 version bump orphans those blobs.)
     pub handle_hash: [u8; 32],
     /// Last-known friend device pubkey (a hint; the joining device re-discovers current devices by handle_proof). Zero if unknown.
     pub public_identity: [u8; 32],
@@ -29,104 +34,245 @@ pub struct RosterEntry {
     pub ceremony_owner: [u8; 32],
     /// The owner's ceremony completed (chain woven). Display truth for parked siblings — "secured on <device>" — NEVER a licence to unlock their own compose (that stays chain-gated until chain state travels, braid.md §14).
     pub woven: bool,
-    /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the entry's LWW clock: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before PRST3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
+    /// How far this friend is trusted (0 Stranger .. 3 Inner). Rides the entry's LWW clock: a trust decision made on one device is a decision for the identity, not for the hardware it was typed on. Before v3 this was the ONLY field the (device-bound, unreadable-by-siblings) cloud contacts blob carried and the roster did not, so trust silently failed to sync at all.
     pub trust_level: u8,
     /// The friend's own chosen display name, adopted from their pong. Synced like the avatar pin so a fresh sibling shows real names instantly instead of pseudonyms until each friend happens to come online. Zero trust — the pinned key carries the trust; empty renders the keyed pseudonym.
     pub published_name: String,
 }
 
-// PRST0 carried handle strings (and seeds in handle_hash) — the tag bump is the flag-day: old blobs read as absent and the roster re-syncs from live contacts. PRST2 adds ceremony_owner + woven, PRST3 adds trust_level, PRST4 adds published_name, PRST5 drops the never-used petname slot (same flag-day rule; the roster is a resyncable cache, so a bump costs one re-push).
-const ROSTER_TAG: &[u8; 5] = b"PRST5";
+// Version history (the bump is the flag-day: an old blob fails the read, the roster re-syncs from live contacts and the settings re-push — both are resyncable caches, so a bump costs one re-push).
+// v0 carried handle strings (and seeds in handle_hash); v2 added ceremony_owner + woven; v3 trust_level; v4 published_name; v5 dropped the never-used petname slot.
+// v6 retired the hand-rolled "PRST5"/"PSET0"/"PFST1" byte layouts: the plaintext is now a real VSF document and the version rides the spec's `z` type — no more ASCII digit welded into a magic tag (which also changed the tag's LENGTH at revision ten).
+const FSTATE_VERSION: usize = 6;
 
-/// Serialize the roster to the plaintext that gets sealed under the fleet key. Not VSF: this is opaque AEAD-payload bytes, so a compact fixed-layout encoding is simpler and just as forensic (the wire envelope around the ciphertext is VSF).
-pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(ROSTER_TAG);
-    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-    for e in entries {
-        out.extend_from_slice(&e.handle_proof);
-        out.extend_from_slice(&e.handle_hash);
-        out.extend_from_slice(&e.public_identity);
-        out.extend_from_slice(&e.avatar_pin);
-        out.extend_from_slice(&e.added.to_be_bytes());
-        out.extend_from_slice(&e.updated.to_be_bytes());
-        out.push(e.tombstone as u8);
-        out.extend_from_slice(&e.ceremony_owner);
-        out.push(e.woven as u8);
-        out.push(e.trust_level);
-        let pb = e.published_name.as_bytes();
-        out.extend_from_slice(&(pb.len() as u32).to_be_bytes());
-        out.extend_from_slice(pb);
-    }
-    out
+const ROSTER_SECTION: &str = "fleet_roster";
+const GLOBALS_SECTION: &str = "fleet_globals";
+const DEVICES_SECTION: &str = "fleet_devices";
+
+fn roster_schema() -> SectionSchema {
+    SectionSchema::new(ROSTER_SECTION)
+        .field("version", TypeConstraint::Any)
+        .field("entry", TypeConstraint::Any) // Mixed types per row — values are matched by marker, not position
 }
 
-/// Parse the roster plaintext back. Bounds-checked throughout — a truncated or corrupt blob fails rather than panicking.
-pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
-    let mut p = 0usize;
-    let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
-        if *p + n > bytes.len() {
-            return Err("roster: truncated".into());
-        }
-        let s = &bytes[*p..*p + n];
-        *p += n;
-        Ok(s)
-    };
-    if take(&mut p, 5)? != ROSTER_TAG {
-        return Err("roster: bad tag".into());
+fn globals_schema() -> SectionSchema {
+    SectionSchema::new(GLOBALS_SECTION)
+        .field("version", TypeConstraint::Any)
+        .field("setting", TypeConstraint::Any)
+}
+
+fn devices_schema() -> SectionSchema {
+    SectionSchema::new(DEVICES_SECTION)
+        .field("version", TypeConstraint::Any)
+        .field("row", TypeConstraint::Any)
+}
+
+/// True when the section's `z` version is exactly ours. A mismatch reads as "not this format" — the flag-day rule, applied per section.
+fn version_matches(section: &SectionBuilder) -> bool {
+    section
+        .get_fields("version")
+        .first()
+        .and_then(|f| f.values.first())
+        .map(|v| matches!(v, VsfType::z(n) if *n == FSTATE_VERSION))
+        .unwrap_or(false)
+}
+
+/// Wrap section bodies into one complete VSF document (magic, creation time, provenance hash) — the only form that reaches the seal.
+fn document(sections: Vec<(&'static str, Vec<u8>)>) -> Vec<u8> {
+    let mut b = vsf::VsfBuilder::new()
+        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .provenance_only();
+    for (name, bytes) in sections {
+        b = b.add_unboxed(name, bytes);
     }
-    let count = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(count.min(4096));
-    for _ in 0..count {
-        let handle_proof: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
-        let handle_hash: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
-        let public_identity: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
-        let avatar_pin: [u8; 64] = take(&mut p, 64)?.try_into().unwrap();
-        let added = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
-        let updated = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
-        let tombstone = take(&mut p, 1)?[0] != 0;
-        let ceremony_owner: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
-        let woven = take(&mut p, 1)?[0] != 0;
-        let trust_level = take(&mut p, 1)?[0];
-        let plen = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-        let published_name = String::from_utf8(take(&mut p, plen)?.to_vec())
-            .map_err(|_| "roster: published name not utf8".to_string())?;
+    b.build().expect("fstate document build")
+}
+
+/// Parse one named section out of a document. `Ok(None)` = the section is absent (a roster-only push); a present-but-corrupt section or an unverifiable document is `Err`.
+fn parse_section(schema: SectionSchema, doc: &[u8]) -> Result<Option<SectionBuilder>, String> {
+    match SectionBuilder::parse_document(schema, doc, None) {
+        Ok(sec) => Ok(Some(sec)),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if msg.contains("not found in document TOC") {
+                Ok(None)
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+/// A row datum's label — the TIFF-tag model: every value is preceded by its `d` name, so decode is a label lookup, never a position or an arrival-order count.
+fn label(name: &str) -> VsfType {
+    VsfType::d(name.to_string())
+}
+
+/// Walk a row's values as (label, datum) pairs into a lookup map. A trailing label with no datum is dropped; unlabeled values are ignored (forward compatibility: a future writer can add labeled data an old reader skips by name).
+fn labeled_values(values: &[VsfType]) -> std::collections::HashMap<&str, &VsfType> {
+    let mut map = std::collections::HashMap::new();
+    let mut it = values.iter();
+    while let Some(v) = it.next() {
+        if let VsfType::d(name) = v {
+            if let Some(datum) = it.next() {
+                map.insert(name.as_str(), datum);
+            }
+        }
+    }
+    map
+}
+
+fn get_k32(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<[u8; 32]> {
+    match m.get(name)? {
+        VsfType::hP(b) | VsfType::ke(b) if b.len() == 32 => b.as_slice().try_into().ok(),
+        _ => None,
+    }
+}
+
+fn get_k64(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<[u8; 64]> {
+    match m.get(name)? {
+        VsfType::ge(b) if b.len() == 64 => b.as_slice().try_into().ok(),
+        _ => None,
+    }
+}
+
+fn get_e6(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<i64> {
+    match m.get(name)? {
+        VsfType::e(EtType::e6(o)) => Some(*o),
+        _ => None,
+    }
+}
+
+fn get_u3(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<u8> {
+    match m.get(name)? {
+        VsfType::u3(t) => Some(*t),
+        _ => None,
+    }
+}
+
+fn get_text(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<String> {
+    match m.get(name)? {
+        VsfType::x(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn get_key(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<String> {
+    match m.get(name)? {
+        VsfType::d(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn get_raw(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<Vec<u8>> {
+    match m.get(name)? {
+        VsfType::v(marker, b) if *marker == b'r' => Some(b.clone()),
+        _ => None,
+    }
+}
+
+fn roster_section_bytes(entries: &[RosterEntry]) -> Vec<u8> {
+    let mut b = roster_schema()
+        .build()
+        .set("version", VsfType::z(FSTATE_VERSION))
+        .expect("roster version");
+    for e in entries {
+        b = b
+            .append_multi(
+                "entry",
+                vec![
+                    label("proof"),
+                    VsfType::hP(e.handle_proof.to_vec()),
+                    label("party"),
+                    VsfType::ke(e.handle_hash.to_vec()),
+                    label("device"),
+                    VsfType::ke(e.public_identity.to_vec()),
+                    label("owner"),
+                    VsfType::ke(e.ceremony_owner.to_vec()),
+                    label("pin"),
+                    VsfType::ge(e.avatar_pin.to_vec()),
+                    label("added"),
+                    VsfType::e(EtType::e6(e.added)),
+                    label("updated"),
+                    VsfType::e(EtType::e6(e.updated)),
+                    label("tombstone"),
+                    VsfType::u3(e.tombstone as u8),
+                    label("woven"),
+                    VsfType::u3(e.woven as u8),
+                    label("trust"),
+                    VsfType::u3(e.trust_level),
+                    label("name"),
+                    VsfType::x(e.published_name.clone()),
+                ],
+            )
+            .expect("roster row");
+    }
+    b.encode().expect("roster section encode")
+}
+
+fn decode_roster_section(sec: &SectionBuilder) -> Vec<RosterEntry> {
+    let mut out = Vec::new();
+    for row in sec.get_fields("entry") {
+        let m = labeled_values(&row.values);
+        // A row is only an entry if every part is present under its label — a malformed row drops rather than poisoning the parse.
+        let (
+            Some(handle_proof),
+            Some(handle_hash),
+            Some(public_identity),
+            Some(ceremony_owner),
+            Some(avatar_pin),
+            Some(added),
+            Some(updated),
+            Some(tombstone),
+            Some(woven),
+            Some(trust_level),
+            Some(published_name),
+        ) = (
+            get_k32(&m, "proof"),
+            get_k32(&m, "party"),
+            get_k32(&m, "device"),
+            get_k32(&m, "owner"),
+            get_k64(&m, "pin"),
+            get_e6(&m, "added"),
+            get_e6(&m, "updated"),
+            get_u3(&m, "tombstone"),
+            get_u3(&m, "woven"),
+            get_u3(&m, "trust"),
+            get_text(&m, "name"),
+        )
+        else {
+            continue;
+        };
         out.push(RosterEntry {
             handle_proof,
             handle_hash,
             public_identity,
-            published_name,
+            ceremony_owner,
             avatar_pin,
             added,
             updated,
-            tombstone,
-            ceremony_owner,
-            woven,
+            tombstone: tombstone != 0,
+            woven: woven != 0,
             trust_level,
+            published_name,
         });
     }
-    Ok(out)
+    out
 }
 
-/// CRDT merge: union by handle_proof, per-entry last-writer-wins on `updated`. Deterministic and order-independent (commutative/idempotent). A tombstone wins an `updated` tie so a concurrent remove beats a concurrent re-add — deletes are conservative.
-pub fn merge_rosters(a: Vec<RosterEntry>, b: Vec<RosterEntry>) -> Vec<RosterEntry> {
-    use std::collections::HashMap;
-    let mut by: HashMap<[u8; 32], RosterEntry> = HashMap::new();
-    for e in a.into_iter().chain(b.into_iter()) {
-        let replace = match by.get(&e.handle_proof) {
-            None => true,
-            Some(cur) => {
-                e.updated > cur.updated
-                    || (e.updated == cur.updated && e.tombstone && !cur.tombstone)
-            }
-        };
-        if replace {
-            by.insert(e.handle_proof, e);
-        }
+/// Serialize the roster alone — the plaintext a roster-only push seals under the fleet key.
+pub fn roster_to_bytes(entries: &[RosterEntry]) -> Vec<u8> {
+    document(vec![(ROSTER_SECTION, roster_section_bytes(entries))])
+}
+
+/// Parse a roster document back. Verified read + version gate — a truncated, tampered, or old-format blob fails rather than parsing on faith.
+pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
+    let sec = SectionBuilder::parse_document(roster_schema(), bytes, None)
+        .map_err(|e| format!("roster: {e:?}"))?;
+    if !version_matches(&sec) {
+        return Err("roster: version mismatch".into());
     }
-    let mut out: Vec<RosterEntry> = by.into_values().collect();
-    out.sort_by(|x, y| x.handle_proof.cmp(&y.handle_proof));
-    out
+    Ok(decode_roster_section(&sec))
 }
 
 /// One fleet-GLOBAL setting: the value every linked device follows. `value` is a flattened VSF value (opaque to this codec — the app types it at the edges), so any spec type can ride without the codec knowing.
@@ -166,144 +312,186 @@ pub struct FleetState {
     pub device_settings: Vec<DeviceSettings>,
 }
 
-const SETTINGS_TAG: &[u8; 5] = b"PSET0";
-const FSTATE_TAG: &[u8; 5] = b"PFST1";
-
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
-    out.extend_from_slice(b);
-}
-
-/// Serialize the settings layers (global + per-device maps) to sealed-payload bytes. Same doctrine as the roster: compact fixed layout, not VSF — the wire envelope around the ciphertext is VSF.
-pub fn settings_to_bytes(global: &[SettingEntry], devices: &[DeviceSettings]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(SETTINGS_TAG);
-    out.extend_from_slice(&(global.len() as u32).to_be_bytes());
+fn globals_section_bytes(global: &[SettingEntry]) -> Vec<u8> {
+    let mut b = globals_schema()
+        .build()
+        .set("version", VsfType::z(FSTATE_VERSION))
+        .expect("globals version");
     for e in global {
-        put_bytes(&mut out, e.key.as_bytes());
-        put_bytes(&mut out, &e.value);
-        out.extend_from_slice(&e.updated.to_be_bytes());
-        out.push(e.tombstone as u8);
+        b = b
+            .append_multi(
+                "setting",
+                vec![
+                    // The setting key is itself an internal label, so its VALUE is `d` too — labeled like everything else, so decode never leans on adjacency beyond one label-datum pair.
+                    label("key"),
+                    VsfType::d(e.key.clone()),
+                    label("value"),
+                    VsfType::v(b'r', e.value.clone()),
+                    label("updated"),
+                    VsfType::e(EtType::e6(e.updated)),
+                    label("tombstone"),
+                    VsfType::u3(e.tombstone as u8),
+                ],
+            )
+            .expect("globals row");
     }
-    out.extend_from_slice(&(devices.len() as u32).to_be_bytes());
-    for d in devices {
-        out.extend_from_slice(&d.device_pubkey);
-        out.extend_from_slice(&d.updated.to_be_bytes());
-        out.extend_from_slice(&(d.entries.len() as u32).to_be_bytes());
-        for e in &d.entries {
-            put_bytes(&mut out, e.key.as_bytes());
-            put_bytes(&mut out, &e.value);
-            out.extend_from_slice(&e.updated.to_be_bytes());
-            out.push(e.linked as u8);
-        }
-    }
-    out
+    b.encode().expect("globals section encode")
 }
 
-/// Parse the settings payload back. Bounds-checked throughout — truncated/corrupt fails, never panics.
-pub fn settings_from_bytes(bytes: &[u8]) -> Result<(Vec<SettingEntry>, Vec<DeviceSettings>), String> {
-    let mut p = 0usize;
-    let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
-        if *p + n > bytes.len() {
-            return Err("settings: truncated".into());
-        }
-        let s = &bytes[*p..*p + n];
-        *p += n;
-        Ok(s)
-    };
-    let take_str = |p: &mut usize| -> Result<String, String> {
-        let n = u32::from_be_bytes(
-            if *p + 4 > bytes.len() { return Err("settings: truncated".into()) } else { let s = &bytes[*p..*p + 4]; *p += 4; s }
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        if *p + n > bytes.len() {
-            return Err("settings: truncated".into());
-        }
-        let s = String::from_utf8(bytes[*p..*p + n].to_vec()).map_err(|_| "settings: key not utf8".to_string())?;
-        *p += n;
-        Ok(s)
-    };
-    let take_val = |p: &mut usize| -> Result<Vec<u8>, String> {
-        let n = u32::from_be_bytes(
-            if *p + 4 > bytes.len() { return Err("settings: truncated".into()) } else { let s = &bytes[*p..*p + 4]; *p += 4; s }
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        if *p + n > bytes.len() {
-            return Err("settings: truncated".into());
-        }
-        let v = bytes[*p..*p + n].to_vec();
-        *p += n;
-        Ok(v)
-    };
-    if take(&mut p, 5)? != SETTINGS_TAG {
-        return Err("settings: bad tag".into());
-    }
-    let gcount = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-    let mut global = Vec::with_capacity(gcount.min(4096));
-    for _ in 0..gcount {
-        let key = take_str(&mut p)?;
-        let value = take_val(&mut p)?;
-        let updated = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
-        let tombstone = take(&mut p, 1)?[0] != 0;
-        global.push(SettingEntry { key, value, updated, tombstone });
-    }
-    let dcount = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-    let mut devices = Vec::with_capacity(dcount.min(4096));
-    for _ in 0..dcount {
-        let device_pubkey: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
-        let updated = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
-        let ecount = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-        let mut entries = Vec::with_capacity(ecount.min(4096));
-        for _ in 0..ecount {
-            let key = take_str(&mut p)?;
-            let value = take_val(&mut p)?;
-            let updated = i64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
-            let linked = take(&mut p, 1)?[0] != 0;
-            entries.push(DeviceSetting { key, value, updated, linked });
-        }
-        devices.push(DeviceSettings { device_pubkey, updated, entries });
-    }
-    Ok((global, devices))
-}
-
-/// Serialize the FULL fleet state (roster + settings) — the one blob that rides the fstate slot. The roster and settings payloads nest verbatim, so their codecs stay the single source of truth.
-pub fn fstate_to_bytes(state: &FleetState) -> Vec<u8> {
+fn decode_globals_section(sec: &SectionBuilder) -> Vec<SettingEntry> {
     let mut out = Vec::new();
-    out.extend_from_slice(FSTATE_TAG);
-    put_bytes(&mut out, &roster_to_bytes(&state.roster));
-    put_bytes(&mut out, &settings_to_bytes(&state.global_settings, &state.device_settings));
+    for row in sec.get_fields("setting") {
+        let m = labeled_values(&row.values);
+        let (Some(key), Some(value), Some(updated)) =
+            (get_key(&m, "key"), get_raw(&m, "value"), get_e6(&m, "updated"))
+        else {
+            continue;
+        };
+        let tombstone = get_u3(&m, "tombstone").unwrap_or(0) != 0;
+        out.push(SettingEntry { key, value, updated, tombstone });
+    }
     out
 }
 
-/// Parse a fleet-state blob. Accepts BOTH the combined `PFST1` layout AND a bare pre-settings roster blob (`PRST0`) — an old blob simply reads as roster-only with empty settings, so the transition needs no version fork.
+fn devices_section_bytes(devices: &[DeviceSettings]) -> Vec<u8> {
+    let mut b = devices_schema()
+        .build()
+        .set("version", VsfType::z(FSTATE_VERSION))
+        .expect("devices version");
+    for d in devices {
+        // Denormalized: one row per (device, entry), every value labeled. An EMPTY map still needs its clock for newest-copy-wins, so it emits one entry-less row.
+        if d.entries.is_empty() {
+            b = b
+                .append_multi(
+                    "row",
+                    vec![
+                        label("device"),
+                        VsfType::ke(d.device_pubkey.to_vec()),
+                        label("map_updated"),
+                        VsfType::e(EtType::e6(d.updated)),
+                    ],
+                )
+                .expect("device bare row");
+        }
+        for e in &d.entries {
+            b = b
+                .append_multi(
+                    "row",
+                    vec![
+                        label("device"),
+                        VsfType::ke(d.device_pubkey.to_vec()),
+                        label("map_updated"),
+                        VsfType::e(EtType::e6(d.updated)),
+                        label("key"),
+                        VsfType::d(e.key.clone()),
+                        label("value"),
+                        VsfType::v(b'r', e.value.clone()),
+                        label("entry_updated"),
+                        VsfType::e(EtType::e6(e.updated)),
+                        label("linked"),
+                        VsfType::u3(e.linked as u8),
+                    ],
+                )
+                .expect("device entry row");
+        }
+    }
+    b.encode().expect("devices section encode")
+}
+
+fn decode_devices_section(sec: &SectionBuilder) -> Vec<DeviceSettings> {
+    let mut out: Vec<DeviceSettings> = Vec::new();
+    for row in sec.get_fields("row") {
+        let m = labeled_values(&row.values);
+        let (Some(pk), Some(map_updated)) = (get_k32(&m, "device"), get_e6(&m, "map_updated")) else {
+            continue;
+        };
+        let slot = match out.iter_mut().find(|d| d.device_pubkey == pk) {
+            Some(d) => d,
+            None => {
+                out.push(DeviceSettings { device_pubkey: pk, updated: map_updated, entries: Vec::new() });
+                out.last_mut().unwrap()
+            }
+        };
+        slot.updated = slot.updated.max(map_updated);
+        if let (Some(key), Some(value), Some(entry_updated)) =
+            (get_key(&m, "key"), get_raw(&m, "value"), get_e6(&m, "entry_updated"))
+        {
+            let linked = get_u3(&m, "linked").unwrap_or(0) != 0;
+            slot.entries.push(DeviceSetting { key, value, updated: entry_updated, linked });
+        }
+    }
+    out
+}
+
+/// Serialize the settings layers (global + per-device maps) to sealed-payload bytes — a document with the two settings sections.
+pub fn settings_to_bytes(global: &[SettingEntry], devices: &[DeviceSettings]) -> Vec<u8> {
+    document(vec![
+        (GLOBALS_SECTION, globals_section_bytes(global)),
+        (DEVICES_SECTION, devices_section_bytes(devices)),
+    ])
+}
+
+/// Parse the settings layers back. Verified read + version gate per section.
+pub fn settings_from_bytes(bytes: &[u8]) -> Result<(Vec<SettingEntry>, Vec<DeviceSettings>), String> {
+    let g = parse_section(globals_schema(), bytes)?.ok_or("settings: globals section missing")?;
+    let d = parse_section(devices_schema(), bytes)?.ok_or("settings: devices section missing")?;
+    if !version_matches(&g) || !version_matches(&d) {
+        return Err("settings: version mismatch".into());
+    }
+    Ok((decode_globals_section(&g), decode_devices_section(&d)))
+}
+
+/// Serialize the FULL fleet state (roster + settings) — the one document that rides the fstate slot.
+pub fn fstate_to_bytes(state: &FleetState) -> Vec<u8> {
+    document(vec![
+        (ROSTER_SECTION, roster_section_bytes(&state.roster)),
+        (GLOBALS_SECTION, globals_section_bytes(&state.global_settings)),
+        (DEVICES_SECTION, devices_section_bytes(&state.device_settings)),
+    ])
+}
+
+/// Parse a fleet-state document. A roster-only document reads as roster + empty settings — no version fork.
 pub fn fstate_from_bytes(bytes: &[u8]) -> Result<FleetState, String> {
-    if bytes.len() >= 5 && &bytes[..5] == ROSTER_TAG {
-        return Ok(FleetState { roster: roster_from_bytes(bytes)?, ..Default::default() });
-    }
-    if bytes.len() < 5 || &bytes[..5] != FSTATE_TAG {
-        return Err("fstate: bad tag".into());
-    }
-    let mut p = 5usize;
-    let take_chunk = |p: &mut usize| -> Result<&[u8], String> {
-        if *p + 4 > bytes.len() {
-            return Err("fstate: truncated".into());
-        }
-        let n = u32::from_be_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
-        *p += 4;
-        if *p + n > bytes.len() {
-            return Err("fstate: truncated".into());
-        }
-        let s = &bytes[*p..*p + n];
-        *p += n;
-        Ok(s)
+    // The document itself must verify — a non-document (any pre-v6 blob) fails here, which IS the flag-day.
+    vsf::verification::read_verified(bytes, None).map_err(|e| format!("fstate: {e:?}"))?;
+    // A roster the reader can't parse is EMPTY, not fatal. The layers share one document but are independent, and a roster version bump is a documented flag-day whose cost is meant to be "one re-push of the roster" — NOT the settings going with it. Propagating the error here made the whole fstate unreadable, and because `push_roster` is pull-merge-push, the failed pull left an empty merge base and the next push DESTROYED the fleet's settings on FGTW (observed on the v2→v3 bump: "state pulled — 8 roster entries, 0 global settings, 0 device maps").
+    let roster = match parse_section(roster_schema(), bytes) {
+        Ok(Some(sec)) if version_matches(&sec) => decode_roster_section(&sec),
+        _ => Vec::new(),
     };
-    // A roster the reader can't parse is EMPTY, not fatal. The two layers share this envelope but are independent, and a roster tag bump is a documented flag-day whose cost is meant to be "one re-push of the roster" — NOT the settings going with it. Propagating the error here made the whole fstate unreadable, and because `push_roster` is pull-merge-push, the failed pull left an empty merge base and the next push DESTROYED the fleet's settings on FGTW (observed on the PRST2→PRST3 bump: "state pulled — 8 roster entries, 0 global settings, 0 device maps").
-    // Settings survive a roster bump; the roster re-syncs from live contacts, exactly as the tag-bump note promises.
-    let roster = roster_from_bytes(take_chunk(&mut p)?).unwrap_or_default();
-    let (global_settings, device_settings) = settings_from_bytes(take_chunk(&mut p)?)?;
+    // Settings stay strict the other way: an ABSENT section is a roster-only push, but a CORRUPT or wrong-version one must fail the pull — defaulting it to empty would hand pull-merge-push an empty base and destroy the fleet's settings on the next push.
+    let global_settings = match parse_section(globals_schema(), bytes)? {
+        Some(sec) if version_matches(&sec) => decode_globals_section(&sec),
+        Some(_) => return Err("fstate: settings version mismatch".into()),
+        None => Vec::new(),
+    };
+    let device_settings = match parse_section(devices_schema(), bytes)? {
+        Some(sec) if version_matches(&sec) => decode_devices_section(&sec),
+        Some(_) => return Err("fstate: settings version mismatch".into()),
+        None => Vec::new(),
+    };
     Ok(FleetState { roster, global_settings, device_settings })
+}
+
+/// CRDT merge: union by handle_proof, per-entry last-writer-wins on `updated`. Deterministic and order-independent (commutative/idempotent). A tombstone wins an `updated` tie so a concurrent remove beats a concurrent re-add — deletes are conservative.
+pub fn merge_rosters(a: Vec<RosterEntry>, b: Vec<RosterEntry>) -> Vec<RosterEntry> {
+    use std::collections::HashMap;
+    let mut by: HashMap<[u8; 32], RosterEntry> = HashMap::new();
+    for e in a.into_iter().chain(b.into_iter()) {
+        let replace = match by.get(&e.handle_proof) {
+            None => true,
+            Some(cur) => {
+                e.updated > cur.updated
+                    || (e.updated == cur.updated && e.tombstone && !cur.tombstone)
+            }
+        };
+        if replace {
+            by.insert(e.handle_proof, e);
+        }
+    }
+    let mut out: Vec<RosterEntry> = by.into_values().collect();
+    out.sort_by(|x, y| x.handle_proof.cmp(&y.handle_proof));
+    out
 }
 
 /// CRDT merge for the GLOBAL settings layer: union by key, last-writer-wins on `updated`. On an exact-tie: a tombstone wins (deletes are conservative, mirroring the roster), then greater value bytes — a strictly deterministic total order, so the merge is commutative even for a same-instant write of different values.
@@ -329,7 +517,18 @@ pub fn merge_global_settings(a: Vec<SettingEntry>, b: Vec<SettingEntry>) -> Vec<
     out
 }
 
-/// Merge the per-device maps: union by device pubkey, whole-map newest-copy-wins on the map's `updated` (single-writer, so a tie means identical content in practice; greater serialized bytes breaks it deterministically anyway). A device absent from one side is kept — an offline device's map must survive every merge it isn't present for.
+/// Canonical ordering key for a device map — entries sorted by field, for the deterministic tie-break below. (This replaced a serialized-bytes comparison: the document codec stamps a creation time, so its bytes are no longer a stable order.)
+fn device_map_canon(d: &DeviceSettings) -> Vec<(&str, &[u8], i64, bool)> {
+    let mut rows: Vec<_> = d
+        .entries
+        .iter()
+        .map(|e| (e.key.as_str(), e.value.as_slice(), e.updated, e.linked))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Merge the per-device maps: union by device pubkey, whole-map newest-copy-wins on the map's `updated` (single-writer, so a tie means identical content in practice; the canonical entry ordering breaks it deterministically anyway). A device absent from one side is kept — an offline device's map must survive every merge it isn't present for.
 pub fn merge_device_settings(a: Vec<DeviceSettings>, b: Vec<DeviceSettings>) -> Vec<DeviceSettings> {
     use std::collections::HashMap;
     let mut by: HashMap<[u8; 32], DeviceSettings> = HashMap::new();
@@ -338,9 +537,7 @@ pub fn merge_device_settings(a: Vec<DeviceSettings>, b: Vec<DeviceSettings>) -> 
             None => true,
             Some(cur) => {
                 d.updated > cur.updated
-                    || (d.updated == cur.updated
-                        && settings_to_bytes(&[], std::slice::from_ref(&d))
-                            > settings_to_bytes(&[], std::slice::from_ref(cur)))
+                    || (d.updated == cur.updated && device_map_canon(&d) > device_map_canon(cur))
             }
         };
         if replace {
@@ -386,12 +583,27 @@ mod tests {
         let entries = vec![roster_entry(1, 200, false), roster_entry(2, 300, true)];
         let bytes = roster_to_bytes(&entries);
         assert_eq!(roster_from_bytes(&bytes).unwrap(), entries);
-        // A truncated blob fails rather than panicking.
+        // A truncated blob fails the verified read rather than panicking or parsing on faith.
         assert!(roster_from_bytes(&bytes[..bytes.len() - 3]).is_err());
         assert!(roster_from_bytes(b"nope").is_err());
     }
 
-    /// trust_level rides the entry's LWW clock: a trust decision belongs to the identity, not to the device it was typed on. Before PRST3 the roster carried no trust at all, so promoting a friend on one device left every sibling on the old level forever.
+    /// The version rides the document as a `z` field and gates the parse: a wrong version reads as absent, which upstream means "re-sync from live contacts" — the flag-day, without a length-changing ASCII tag.
+    #[test]
+    fn version_mismatch_reads_as_absent_roster() {
+        let sec = roster_schema()
+            .build()
+            .set("version", VsfType::z(FSTATE_VERSION - 1))
+            .unwrap()
+            .encode()
+            .unwrap();
+        let doc = document(vec![(ROSTER_SECTION, sec)]);
+        assert!(roster_from_bytes(&doc).is_err(), "an old-version roster must not parse");
+        let state = fstate_from_bytes(&doc).expect("the document itself is valid");
+        assert!(state.roster.is_empty(), "wrong-version roster reads as absent, not as an error");
+    }
+
+    /// trust_level rides the entry's LWW clock: a trust decision belongs to the identity, not to the device it was typed on. Before v3 the roster carried no trust at all, so promoting a friend on one device left every sibling on the old level forever.
     #[test]
     fn trust_level_follows_last_writer_wins() {
         let mut old = roster_entry(7, 100, false);
@@ -417,22 +629,23 @@ mod tests {
         assert_eq!(merged[0].trust_level, 3, "an older entry must never downgrade trust");
     }
 
-    /// A roster the reader can't parse must not take the SETTINGS with it. The two layers share one envelope but are independent, and a roster tag bump is a documented flag-day whose cost is one roster re-push. Propagating the error made the whole fstate unreadable, and because push is pull-merge-push, the failed pull rebased on empty and the next push DESTROYED the fleet's settings on FGTW — observed live on PRST2→PRST3 ("8 roster entries, 0 global settings, 0 device maps").
+    /// A roster the reader can't parse must not take the SETTINGS with it. The layers share one document but are independent, and a roster version bump is a documented flag-day whose cost is one roster re-push. Propagating the error made the whole fstate unreadable, and because push is pull-merge-push, the failed pull rebased on empty and the next push DESTROYED the fleet's settings on FGTW — observed live on the v2→v3 bump ("8 roster entries, 0 global settings, 0 device maps").
     #[test]
     fn an_unparseable_roster_does_not_destroy_settings() {
-        // Hand-build an fstate whose roster chunk carries an UNKNOWN tag (a future/past PRST) but whose settings chunk is valid.
-        let settings = settings_to_bytes(
-            &[SettingEntry { key: "display.theme".into(), value: vec![7], updated: 42, tombstone: false }],
-            &[],
-        );
-        let bogus_roster = b"PRSTX\x00\x00\x00\x00".to_vec();
-
-        let mut blob = Vec::new();
-        blob.extend_from_slice(FSTATE_TAG);
-        blob.extend_from_slice(&(bogus_roster.len() as u32).to_be_bytes());
-        blob.extend_from_slice(&bogus_roster);
-        blob.extend_from_slice(&(settings.len() as u32).to_be_bytes());
-        blob.extend_from_slice(&settings);
+        // Hand-build a document whose roster section is garbage bytes but whose settings sections are valid.
+        let blob = document(vec![
+            (ROSTER_SECTION, b"not a section".to_vec()),
+            (
+                GLOBALS_SECTION,
+                globals_section_bytes(&[SettingEntry {
+                    key: "display.theme".into(),
+                    value: vec![7],
+                    updated: 42,
+                    tombstone: false,
+                }]),
+            ),
+            (DEVICES_SECTION, devices_section_bytes(&[])),
+        ]);
 
         let state = fstate_from_bytes(&blob).expect("an unreadable roster must not fail the whole fstate");
         assert!(state.roster.is_empty(), "the unreadable roster reads as absent — it re-syncs from live contacts");
@@ -489,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn fstate_round_trips_and_reads_old_roster_only_blobs() {
+    fn fstate_round_trips_and_reads_roster_only_documents() {
         let state = FleetState {
             roster: vec![roster_entry(1, 200, false)],
             global_settings: vec![setting("updates.auto", &[1], 500, false)],
@@ -497,7 +710,7 @@ mod tests {
         };
         let bytes = fstate_to_bytes(&state);
         assert_eq!(fstate_from_bytes(&bytes).unwrap(), state);
-        // A pre-settings roster blob parses as roster-only with empty settings — no version fork.
+        // A roster-only document parses as roster + empty settings — no version fork.
         let old = roster_to_bytes(&state.roster);
         let parsed = fstate_from_bytes(&old).unwrap();
         assert_eq!(parsed.roster, state.roster);

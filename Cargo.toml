@@ -23,7 +23,8 @@ crate-type = ["rlib"]
 # `client` adds the std HTTP oracle (fetch-then-sign, announce, publish) that only real clients need — the worker never enables it. It implies `fanout`.
 default = ["client"]
 # `fanout` pulls the fan-out crypto + roster codec + pairing words and their deps; a wasm signer can enable it without `client`. The worker enables neither (base = fleet fold/verify only), so none of these deps reach its wasm surface.
-fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand", "dep:voca", "dep:num-bigint"]
+# vsf/text-encode is here for the fstate codec's published_name (`x` is Huffman text; the tables are ~9 MB, so this must never ride into the worker — and can't, fstate is cfg'd behind this feature).
+fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand", "dep:voca", "dep:num-bigint", "vsf/text-encode"]
 client = ["fanout"]
 
 [dependencies]
