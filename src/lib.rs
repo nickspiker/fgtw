@@ -36,6 +36,16 @@ pub mod keys;
 /// The one source of truth shared by the worker (verify) and clients (fetch-then-sign).
 pub mod fleet;
 
+/// The epoch of any fan-out blob, readable WITHOUT the `fanout` feature — the worker's monotonic guard needs it but compiles none of the fan-out crypto.
+/// Version-agnostic on purpose: the 3-byte magic leads and the big-endian epoch sits at 4..12 in every layout (the 4th byte was the ASCII '0' of the original tag, now a binary version numeral), so a reader can order blobs whose BODY it cannot parse. That is what lets a new-format rotation step over an old-format blob instead of proposing epoch 1 and being refused as stale forever.
+pub fn fanout_blob_epoch(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() >= 12 && &bytes[0..3] == b"PFO" {
+        Some(u64::from_be_bytes(bytes[4..12].try_into().unwrap()))
+    } else {
+        None
+    }
+}
+
 /// Per-member fan-out — sealing the fleet key to each current member's device key, and opening your own.
 /// A device recovers the current key by trial-decrypting its own wrap; a removed device just isn't a wrap target next epoch.
 /// The scoped-key-bundle / KEK-DEK generalisation (rotate keys, not data) grows from here — see `docs/fleet-vault-security.md` in photon.
