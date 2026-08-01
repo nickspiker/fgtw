@@ -5,40 +5,48 @@
 //! PRIMARY (identity → device set)   `IdentityCount` at `key_identity(handle_proof)`, `DevicePointer` at `key_pointer(handle_proof, i)` for dense `i ∈ [0, N)`.
 //! SECONDARY (device → address)      `DeviceAddress` at `key_address(device_pubkey)`.
 //!
-//! Split so that an address change — the overwhelmingly common write — touches ONE slot in place: same key, same length, no run shift, no lock, no epoch bump. Membership changes are rare and are the only thing that moves anything.
+//! Split so that an address change — the overwhelmingly common write — touches ONE slot in place: same key, same length, no run shift, no lock, no epoch bump.
+//! Membership changes are rare and are the only thing that moves anything.
 //!
-//! Addressing is a shift and a mask. Capacity is a power of two and keys are BLAKE3 output (uniform over 2^256), so the top bits of the key are literally the slice and slot index — no division, no float, no rounding, and the same 32-byte key doubles as the Kademlia id, which is the key→node mapping `docs/peers-are-fgtw.md` Phase D leaves undefined.
+//! Addressing is a shift and a mask.
+//! Capacity is a power of two and keys are BLAKE3 output (uniform over 2^256), so the top bits of the key are literally the slice and slot index — no division, no float, no rounding, and the same 32-byte key doubles as the Kademlia id, which is the key→node mapping `docs/peers-are-fgtw.md` Phase D leaves undefined.
 //!
-//! ENUMERATION IS OPEN by design (peers-are-fgtw.md): every record is self-describing so a slice host can dump its whole range and a reader can make sense of it. Privacy comes from the consent gate — a `handle_proof` grants nothing to someone who lacks the identity seed — never from address obscurity.
+//! ENUMERATION IS OPEN by design (peers-are-fgtw.md): every record is self-describing so a slice host can dump its whole range and a reader can make sense of it.
+//! Privacy comes from the consent gate — a `handle_proof` grants nothing to someone who lacks the identity seed — never from address obscurity.
 //!
-//! `identity_seed` DERIVATION RULE (nothing here uses it today; addresses are all `handle_proof`-derived): it is the Ed25519 *secret* seed for the identity key, so it is never hashed raw. Any future derivation goes through a domain separator and/or a keyed hash AND through `ihi::spaghettify` (which BLAKE3s internally) — the precedent is photon's log tag, `spaghettify(b"photon_log_v1" ‖ identity_seed)`, with a domain deliberately distinct from the encryption key so the two cannot collide.
+//! `identity_seed` DERIVATION RULE (nothing here uses it today; addresses are all `handle_proof`-derived): it is the Ed25519 *secret* seed for the identity key, so it is never hashed raw.
+//! Any future derivation goes through a domain separator and/or a keyed hash AND through `ihi::spaghettify` (which BLAKE3s internally) — the precedent is photon's log tag, `spaghettify(b"photon_log_v1" ‖ identity_seed)`, with a domain deliberately distinct from the encryption key so the two cannot collide.
 
 use blake3::Hasher;
 
-/// Bytes per record. Divides 4 KiB exactly (16 records per block), which keeps a probe inside one read and leaves a block-level Merkle tree an option later without records straddling block boundaries.
+/// Bytes per record.
+/// Divides 4 KiB exactly (16 records per block), which keeps a probe inside one read and leaves a block-level Merkle tree an option later without records straddling block boundaries.
 pub const STRIDE: usize = 256;
 
-/// Slots in one slice. 1 MiB / 256 B. Power of two so the slot index is a bit-field of the key.
+/// Slots in one slice. 1 MiB / 256 B.
+/// Power of two so the slot index is a bit-field of the key.
 pub const SLICE_SLOTS: usize = 4096;
 /// `log2(SLICE_SLOTS)` — the slot bit-field width.
 pub const SLOT_BITS: u32 = 12;
 
-/// The slice-index bit-field width the network is CURRENTLY using. Not a constant of the format —
-/// growth is `n → n+1`, which halves every slice and lets each host keep the half matching its own
-/// handle (purely local; the sort order already puts the two halves contiguous). Every addressing
-/// call takes `slice_bits` explicitly so a node can serve one width while the network moves to the
-/// next, and so a small width is testable.
-/// 2^24 = 16.7M slices ≈ 40B devices at ~58% fill in 1 MiB slices.
+/// The slice-index bit-field width the network is CURRENTLY using.
+/// Not a constant of the format — growth is `n → n+1`, which halves every slice and lets each host keep the half matching its own handle (purely local; the sort order already puts the two halves contiguous).
+/// Every addressing call takes `slice_bits` explicitly so a node can serve one width while the network moves to the next, and so a small width is testable. 2^24 = 16.7M slices ≈ 40B devices at ~58% fill in 1 MiB slices.
 pub const SLICE_BITS_DEFAULT: u32 = 24;
 
-/// Fill band. Below `FILL_MIN` halve, above `FILL_MAX` double. The gaps are not slack — they are what make the computed slot land EXACTLY instead of approximately. A dense array's rank drifts binomially from the interpolated guess (±√N/2 ≈ 16k records at 1e9); a gapped one is off only by collision displacement, which the band caps.
+/// Fill band.
+/// Below `FILL_MIN` halve, above `FILL_MAX` double.
+/// The gaps are not slack — they are what make the computed slot land EXACTLY instead of approximately.
+/// A dense array's rank drifts binomially from the interpolated guess (±√N/2 ≈ 16k records at 1e9); a gapped one is off only by collision displacement, which the band caps.
 pub const FILL_MIN: f32 = 0.375;
 pub const FILL_MAX: f32 = 0.75;
 
-/// Probe runway reserved at each end of a slice (~0.83%, 8.7 KiB). A key crowding the tail belongs to a neighbouring slice that centres it; the probe must never wrap to slot 0, which would manufacture a seam in a structure whose sortedness the range scans depend on.
+/// Probe runway reserved at each end of a slice (~0.83%, 8.7 KiB).
+/// A key crowding the tail belongs to a neighbouring slice that centres it; the probe must never wrap to slot 0, which would manufacture a seam in a structure whose sortedness the range scans depend on.
 pub const EDGE_MARGIN: usize = 34;
 
-// Domain separators. Every key is domain-tagged so the phonebook keyspace cannot collide with any other use of the same `handle_proof` or `device_pubkey` as a lookup key (fleet chain, fstate, fanout, bindreq, inbox all key on handle_proof today).
+// Domain separators.
+// Every key is domain-tagged so the phonebook keyspace cannot collide with any other use of the same `handle_proof` or `device_pubkey` as a lookup key (fleet chain, fstate, fanout, bindreq, inbox all key on handle_proof today).
 const DOMAIN_IDENTITY: &[u8] = b"PHOTON_PB_IDENTITY_v1";
 const DOMAIN_POINTER: &[u8] = b"PHOTON_PB_POINTER_v1";
 const DOMAIN_ADDRESS: &[u8] = b"PHOTON_PB_ADDRESS_v1";
@@ -53,17 +61,22 @@ pub const SIGN_COUNT: &[u8] = b"PHOTON_PB_COUNT_SIG_v1";
 /// The departing device's own claim: "I am leaving this identity." Consent-only removal — no device removes another, so this signature is required alongside a CURRENT member's witness.
 pub const SIGN_DEPART: &[u8] = b"PHOTON_PB_DEPART_SIG_v1";
 
-/// What kind of record occupies a slot. Stored as the first byte, so a slice dump is interpretable without external context (the phonebook is enumerable by design).
+/// What kind of record occupies a slot.
+/// Stored as the first byte, so a slice dump is interpretable without external context (the phonebook is enumerable by design).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecordKind {
-    /// Slot has never been written, or was vacated. An empty slot terminates a probe: nothing is ever placed left of its ideal slot, so if the key existed it would be at or before this gap.
+    /// Slot has never been written, or was vacated.
+    /// An empty slot terminates a probe: nothing is ever placed left of its ideal slot, so if the key existed it would be at or before this gap.
     Empty = 0,
-    /// PRIMARY: how many devices this identity has. `key_identity(handle_proof)`.
+    /// PRIMARY: how many devices this identity has.
+    /// `key_identity(handle_proof)`.
     IdentityCount = 1,
-    /// PRIMARY: the device at index `i` of this identity. `key_pointer(handle_proof, i)`.
+    /// PRIMARY: the device at index `i` of this identity.
+    /// `key_pointer(handle_proof, i)`.
     DevicePointer = 2,
-    /// SECONDARY: where this device is. `key_address(device_pubkey)`.
+    /// SECONDARY: where this device is.
+    /// `key_address(device_pubkey)`.
     DeviceAddress = 3,
 }
 
@@ -79,7 +92,8 @@ impl RecordKind {
     }
 }
 
-/// A 32-byte record address. Uniform BLAKE3 output, so it is simultaneously the storage address, the sort key, and the Kademlia node-distance key.
+/// A 32-byte record address.
+/// Uniform BLAKE3 output, so it is simultaneously the storage address, the sort key, and the Kademlia node-distance key.
 pub type Key = [u8; 32];
 
 /// `key_identity(handle_proof)` — where an identity's device count lives.
@@ -140,9 +154,12 @@ pub fn address_of(key: &Key, slice_bits: u32) -> u64 {
 //
 // There is no separate serialisation: the record IS its bytes, which is what makes a slice mmap-able and an address update a byte patch at a computed offset rather than a re-encode.
 //
-// No record stores its own key. The key is RECOMPUTED from the fields that define it, so the two can never disagree — a record moved to the wrong slot is detectable, and a record whose contents were edited addresses itself somewhere else.
+// No record stores its own key.
+// The key is RECOMPUTED from the fields that define it, so the two can never disagree — a record moved to the wrong slot is detectable, and a record whose contents were edited addresses itself somewhere else.
 //
-// Field offsets are explicit and every layout leaves reserve bytes. That reserve is the migration budget: a field added inside the stride costs nothing, a field that overflows 256 is a flag day. Spend it deliberately.
+// Field offsets are explicit and every layout leaves reserve bytes.
+// That reserve is the migration budget: a field added inside the stride costs nothing, a field that overflows 256 is a flag day.
+// Spend it deliberately.
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One slot's worth of bytes, interpreted by its leading kind byte.
@@ -199,7 +216,8 @@ fn rd_i64(b: &[u8; STRIDE], at: usize) -> i64 {
 }
 
 impl Record {
-    /// An unwritten slot. All zeros, so a zeroed page reads as empty and a sparse file needs no initialisation pass.
+    /// An unwritten slot.
+    /// All zeros, so a zeroed page reads as empty and a sparse file needs no initialisation pass.
     pub fn empty() -> Self {
         Record([0u8; STRIDE])
     }
@@ -212,7 +230,8 @@ impl Record {
     }
 
     /// The address this record belongs at, recomputed from its own defining fields.
-    /// `None` for an empty slot. Because it is derived rather than stored, a record cannot claim a slot its contents do not entitle it to.
+    /// `None` for an empty slot.
+    /// Because it is derived rather than stored, a record cannot claim a slot its contents do not entitle it to.
     pub fn key(&self) -> Option<Key> {
         match self.kind() {
             RecordKind::Empty => None,
@@ -225,8 +244,10 @@ impl Record {
         }
     }
 
-    /// The monotonic guard for this slot. Epoch for the primary records, timestamp for an address.
-    /// One rule at every level: a write must be strictly GREATER than what the slot holds, or it is refused. That single comparison gives replay protection and serialises concurrent writers without any old/new bookkeeping.
+    /// The monotonic guard for this slot.
+    /// Epoch for the primary records, timestamp for an address.
+    /// One rule at every level: a write must be strictly GREATER than what the slot holds, or it is refused.
+    /// That single comparison gives replay protection and serialises concurrent writers without any old/new bookkeeping.
     pub fn epoch(&self) -> i64 {
         match self.kind() {
             RecordKind::Empty => i64::MIN,
@@ -268,7 +289,8 @@ impl Record {
         rd64(&self.0, IC_WITNESS_SIG)
     }
     /// The device that left, and its own departure signature — `None` when this transition was an add.
-    /// Removal requires BOTH this and a witness that is a CURRENT member: the leaver consents, a live member attests. Neither alone suffices, and a member that has itself departed is not a witness.
+    /// Removal requires BOTH this and a witness that is a CURRENT member: the leaver consents, a live member attests.
+    /// Neither alone suffices, and a member that has itself departed is not a witness.
     pub fn departing(&self) -> Option<([u8; 32], [u8; 64])> {
         let d = rd32(&self.0, IC_DEPARTING);
         if d == [0u8; 32] {
@@ -334,13 +356,10 @@ impl Record {
         b[DA_SIG..DA_SIG + 64].copy_from_slice(sig);
         Record(b)
     }
-    /// Mint a SIGNED address record in one step: build, sign the covered bytes, rebuild with the
-    /// signature in place.
+    /// Mint a SIGNED address record in one step: build, sign the covered bytes, rebuild with the signature in place.
     ///
-    /// The two-step dance is easy to get subtly wrong at a call site (sign the wrong bytes, or sign
-    /// before a field is final and ship a record that cannot verify), and an address record that
-    /// fails verification is silently dropped by every reader — so the mistake is invisible until
-    /// nobody can be found. Doing it here once means a caller cannot express the broken version.
+    /// The two-step dance is easy to get subtly wrong at a call site (sign the wrong bytes, or sign before a field is final and ship a record that cannot verify), and an address record that fails verification is silently dropped by every reader — so the mistake is invisible until nobody can be found.
+    /// Doing it here once means a caller cannot express the broken version.
     pub fn sign_device_address(
         signing_key: &ed25519_dalek::SigningKey,
         handle_proof: &[u8; 32],
@@ -395,7 +414,8 @@ impl Record {
     }
 
     /// The bytes a CURRENT MEMBER signs to place a pointer: domain ‖ handle_proof ‖ index ‖ epoch ‖ device_pubkey.
-    /// The index IS covered here — that is what stops a placement being replayed into a different slot. Combined with the slot's monotonic epoch (which this placement itself set), a placement can never be replayed into its own slot either.
+    /// The index IS covered here — that is what stops a placement being replayed into a different slot.
+    /// Combined with the slot's monotonic epoch (which this placement itself set), a placement can never be replayed into its own slot either.
     pub fn placement_signing_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(SIGN_PLACEMENT.len() + 32 + 4 + 8 + 32);
         v.extend_from_slice(SIGN_PLACEMENT);
@@ -435,23 +455,24 @@ impl Record {
 // SLICE — a gapped, sorted, fixed-stride array of one slice's records.
 //
 // TWO INVARIANTS, and every operation exists to preserve them:
-//   (1) SORTED by key ascending.
-//   (2) NO RECORD LEFT OF ITS IDEAL SLOT — `slot_of(key) <= actual`.
+// (1) SORTED by key ascending.
+// (2) NO RECORD LEFT OF ITS IDEAL SLOT — `slot_of(key) <= actual`.
 //
-// (2) is what makes an empty slot prove absence: a lookup starts at the ideal slot and walks
-// RIGHT, so anything that existed would be at or before the first gap. Break (2) and records
-// silently become unfindable while still sitting in the file.
+// (2) is what makes an empty slot prove absence: a lookup starts at the ideal slot and walks RIGHT, so anything that existed would be at or before the first gap.
+// Break (2) and records silently become unfindable while still sitting in the file.
 //
-// The gaps are not slack. They are why the computed slot lands exactly rather than
-// approximately, and why a lookup is one block read instead of a multi-probe search.
+// The gaps are not slack.
+// They are why the computed slot lands exactly rather than approximately, and why a lookup is one block read instead of a multi-probe search.
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Why a write was refused. Every variant is a refusal to corrupt an invariant.
+/// Why a write was refused.
+/// Every variant is a refusal to corrupt an invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceError {
     /// No gap between the ideal slot and the end of the slice — the slice must grow, or the key belongs to a neighbour.
     Full,
-    /// Not strictly greater than the epoch the slot already holds. The monotonic rule doing its job: replay, a stale writer, or the loser of a concurrent write.
+    /// Not strictly greater than the epoch the slot already holds.
+    /// The monotonic rule doing its job: replay, a stale writer, or the loser of a concurrent write.
     StaleEpoch { stored: i64, incoming: i64 },
     /// The record's own contents do not hash into this slice.
     WrongSlice { expected: u32, got: u32 },
@@ -459,7 +480,8 @@ pub enum SliceError {
     EmptyRecord,
 }
 
-/// One slice: `SLICE_SLOTS` records, flat, addressed by slot index.
+/// One slice:
+/// `SLICE_SLOTS` records, flat, addressed by slot index.
 /// A flat byte buffer rather than parsed structs, because that IS the on-disk / mmap layout — an address update is a byte patch at `slot * STRIDE`, not a re-encode.
 pub struct Slice {
     slice_bits: u32,
@@ -477,7 +499,8 @@ impl Slice {
     pub fn slice_bits(&self) -> u32 { self.slice_bits }
     pub fn fill(&self) -> usize { self.fill }
     pub fn fill_ratio(&self) -> f32 { self.fill as f32 / SLICE_SLOTS as f32 }
-    /// Past the band's top the network should move to `slice_bits + 1`; below its floor, back down. The caller owns storage, so it owns the resize.
+    /// Past the band's top the network should move to `slice_bits + 1`; below its floor, back down.
+    /// The caller owns storage, so it owns the resize.
     pub fn wants_grow(&self) -> bool { self.fill_ratio() > FILL_MAX }
     pub fn wants_shrink(&self) -> bool { self.fill_ratio() < FILL_MIN }
 
@@ -495,10 +518,9 @@ impl Slice {
         self.buf[slot * STRIDE..(slot + 1) * STRIDE].fill(0);
     }
 
-    /// Find a key. Walks right from the ideal slot; stops on a match, on an empty slot (absence
-    /// proven), or once sort order has passed the target (also absence).
-    /// Returns the slot so callers can patch in place — an address update is same key, same length,
-    /// same slot, which is why it takes no lock and shifts nothing.
+    /// Find a key.
+    /// Walks right from the ideal slot; stops on a match, on an empty slot (absence proven), or once sort order has passed the target (also absence).
+    /// Returns the slot so callers can patch in place — an address update is same key, same length, same slot, which is why it takes no lock and shifts nothing.
     pub fn lookup(&self, key: &Key) -> Option<(usize, Record)> {
         let mut s = self.ideal(key);
         while s < SLICE_SLOTS {
@@ -515,10 +537,8 @@ impl Slice {
 
     /// Insert or replace, enforcing the monotonic epoch rule on replace.
     ///
-    /// At the ideal slot: step right past SMALLER keys; on a LARGER key, shift that run one slot
-    /// right and drop in. Shifting on larger is what preserves sort order — stepping past
-    /// everything would let a late arrival land after a bigger key, and range scans (a handle's
-    /// devices, a slice dump) would quietly stop being ordered while every lookup still passed.
+    /// At the ideal slot: step right past SMALLER keys; on a LARGER key, shift that run one slot right and drop in.
+    /// Shifting on larger is what preserves sort order — stepping past everything would let a late arrival land after a bigger key, and range scans (a handle's devices, a slice dump) would quietly stop being ordered while every lookup still passed.
     pub fn insert(&mut self, rec: &Record) -> Result<usize, SliceError> {
         let key = rec.key().ok_or(SliceError::EmptyRecord)?;
         let sid = slice_of(&key, self.slice_bits);
@@ -564,15 +584,12 @@ impl Slice {
         (from..SLICE_SLOTS).find(|&s| self.at(s).is_empty())
     }
 
-    /// Remove — the exact inverse of insert, so nothing accumulates. No tombstones: whatever
-    /// insert does, remove undoes, and the slice is indistinguishable from one the record never
-    /// entered.
+    /// Remove — the exact inverse of insert, so nothing accumulates.
+    /// No tombstones: whatever insert does, remove undoes, and the slice is indistinguishable from one the record never entered.
     ///
-    /// Pulls the following run LEFT into the freed slot, but only while a record's ideal slot is at
-    /// or before its destination. A record dragged left of its own ideal becomes permanently
-    /// unfindable, because lookups start at the ideal and only ever scan right. Sorted order means
-    /// the first record that cannot move left implies none after it can — every later key is
-    /// larger, so its ideal is at least as far right.
+    /// Pulls the following run LEFT into the freed slot, but only while a record's ideal slot is at or before its destination.
+    /// A record dragged left of its own ideal becomes permanently unfindable, because lookups start at the ideal and only ever scan right.
+    /// Sorted order means the first record that cannot move left implies none after it can — every later key is larger, so its ideal is at least as far right.
     pub fn remove(&mut self, key: &Key) -> bool {
         let Some((slot, _)) = self.lookup(key) else { return false };
         self.clear(slot);
@@ -592,8 +609,8 @@ impl Slice {
         true
     }
 
-    /// Every occupied slot in key order — the enumeration a slice host serves. The phonebook is
-    /// deliberately open and every record is self-describing, so a dump is meaningful to any reader.
+    /// Every occupied slot in key order — the enumeration a slice host serves.
+    /// The phonebook is deliberately open and every record is self-describing, so a dump is meaningful to any reader.
     pub fn iter(&self) -> impl Iterator<Item = (usize, Record)> + '_ {
         (0..SLICE_SLOTS).filter_map(move |s| {
             let r = self.at(s);
@@ -604,7 +621,8 @@ impl Slice {
     /// The raw fixed-stride body — what an mmap'd file holds verbatim and what ships inside a VSF document.
     pub fn as_bytes(&self) -> &[u8] { &self.buf }
 
-    /// Adopt a raw body, recounting fill. Rejects a body that is not exactly one slice.
+    /// Adopt a raw body, recounting fill.
+    /// Rejects a body that is not exactly one slice.
     pub fn from_bytes(slice_bits: u32, slice_id: u32, buf: Vec<u8>) -> Option<Self> {
         if buf.len() != SLICE_SLOTS * STRIDE { return None; }
         let mut s = Slice { slice_bits, slice_id, buf, fill: 0 };
@@ -612,8 +630,8 @@ impl Slice {
         Some(s)
     }
 
-    /// Do both invariants hold? The property tests lean on this; it is also the cheapest possible
-    /// repair check for a host that has just adopted a slice from a peer.
+    /// Do both invariants hold?
+    /// The property tests lean on this; it is also the cheapest possible repair check for a host that has just adopted a slice from a peer.
     pub fn check_invariants(&self) -> Result<(), String> {
         let mut last: Option<Key> = None;
         for (slot, rec) in self.iter() {
@@ -635,9 +653,8 @@ impl Slice {
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // VERIFICATION
 //
-// Each check answers exactly one question, and the split matters: a signature proves WHO wrote
-// something, never that they were ENTITLED to. Membership is the caller's check, because only the
-// caller holds the registry state to answer it.
+// Each check answers exactly one question, and the split matters: a signature proves WHO wrote something, never that they were ENTITLED to.
+// Membership is the caller's check, because only the caller holds the registry state to answer it.
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
@@ -647,12 +664,11 @@ fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
 }
 
 impl Record {
-    /// Self-verifying: the device signed its own address, and the key it signed with is in the
-    /// record. Proves "the holder of this device key claims this address under this identity".
+    /// Self-verifying: the device signed its own address, and the key it signed with is in the record.
+    /// Proves "the holder of this device key claims this address under this identity".
     ///
-    /// Does NOT prove the device belongs to that identity's fleet — a stranger can sign a row for
-    /// any `handle_proof` they scraped. That binding is the PRIMARY registry's job (a current
-    /// member placed a pointer to this device), and it is the gap the gossip path has today.
+    /// Does NOT prove the device belongs to that identity's fleet — a stranger can sign a row for any `handle_proof` they scraped.
+    /// That binding is the PRIMARY registry's job (a current member placed a pointer to this device), and it is the gap the gossip path has today.
     pub fn verify_address(&self) -> bool {
         self.kind() == RecordKind::DeviceAddress
             && verify_ed25519(&self.device_pubkey(), &self.address_signing_bytes(), &self.address_sig())
@@ -660,26 +676,24 @@ impl Record {
 
     /// The placement was signed by the device that claims to have made it.
     ///
-    /// The caller MUST separately confirm that `placer()` is a CURRENT member — a departed
-    /// member's signature is still cryptographically valid forever, and treating it as authority
-    /// would let a device removed months ago keep rearranging the registry.
+    /// The caller MUST separately confirm that `placer()` is a CURRENT member — a departed member's signature is still cryptographically valid forever, and treating it as authority would let a device removed months ago keep rearranging the registry.
     pub fn verify_placement(&self) -> bool {
         self.kind() == RecordKind::DevicePointer
             && verify_ed25519(&self.placer(), &self.placement_signing_bytes(), &self.placement_sig())
     }
 
-    /// The count was attested by the device that claims to have witnessed it. Same caveat: the
-    /// caller confirms the witness is current.
+    /// The count was attested by the device that claims to have witnessed it.
+    /// Same caveat: the caller confirms the witness is current.
     pub fn verify_count(&self) -> bool {
         self.kind() == RecordKind::IdentityCount
             && verify_ed25519(&self.witness(), &self.count_signing_bytes(), &self.witness_sig())
     }
 
-    /// A removal is only consented if the DEPARTING device signed its own departure. No device
-    /// removes another, so this is required in addition to a current member's witness — and it is
-    /// the leaver's own key, which nobody else holds.
+    /// A removal is only consented if the DEPARTING device signed its own departure.
+    /// No device removes another, so this is required in addition to a current member's witness — and it is the leaver's own key, which nobody else holds.
     ///
-    /// `true` for an add (nothing departed). A removal missing this signature is NOT consent.
+    /// `true` for an add (nothing departed).
+    /// A removal missing this signature is NOT consent.
     pub fn verify_departure(&self) -> bool {
         if self.kind() != RecordKind::IdentityCount { return false; }
         let Some((dev, sig)) = self.departing() else { return true };
@@ -689,17 +703,114 @@ impl Record {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
+// PROJECTION — the fold is the truth, the registry is its readable shadow.
+//
+// Any CURRENT member converges its own identity's registry onto the folded member set: appends get placement-signed pointers at fresh tail indices, removals pop-and-swap (the tail pointer relocates into the hole — the address core is index-free by design, so relocation needs nobody online), and the count re-attests.
+// Writes are idempotent and epoch-guarded, so racing siblings settle on whichever plan lands last — race-and-converge, no lease, no owner.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The stored primary-registry state for one identity, as read back from storage: the count record plus the dense pointer run.
+/// `pointers[i]` is expected to carry index `i`.
+#[derive(Debug, Clone, Default)]
+pub struct RegistryView {
+    pub count: Option<Record>,
+    pub pointers: Vec<Record>,
+}
+
+impl RegistryView {
+    /// Structural + cryptographic verification: right kinds, right identity, dense indices, every signature checks.
+    /// Membership of the SIGNERS is deliberately not checked here — that needs the fold, which the caller holds (verify_placement's caveat applies).
+    pub fn verify(&self, handle_proof: &[u8; 32]) -> bool {
+        if let Some(c) = &self.count {
+            if !c.verify_count() || !c.verify_departure() || c.handle_proof() != *handle_proof {
+                return false;
+            }
+            if c.count() as usize != self.pointers.len() {
+                return false;
+            }
+        } else if !self.pointers.is_empty() {
+            return false; // pointers without a count have no attested extent
+        }
+        for (i, p) in self.pointers.iter().enumerate() {
+            if !p.verify_placement() || p.handle_proof() != *handle_proof || p.index() as usize != i {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The device set the registry currently points at, in index order.
+    pub fn devices(&self) -> Vec<[u8; 32]> {
+        self.pointers.iter().map(|p| p.device_pubkey()).collect()
+    }
+}
+
+/// The minimal record writes that converge the stored registry onto the folded member set.
+/// Empty when already in sync.
+/// Every emitted record carries `epoch` (strictly newer than any stored, or storage rejects it — pass eagle-now).
+/// `departing` is the leaver's own consent signature over [`Record::departure_signing_bytes`] when this convergence removes it; a fold-driven removal whose consent already lives in the CHAIN may pass `None` — chain readers still see the consent, registry-only readers see an unconsented shrink and can fetch the chain.
+pub fn registry_plan(
+    signer: &ed25519_dalek::SigningKey,
+    handle_proof: &[u8; 32],
+    fold: &[[u8; 32]],
+    view: &RegistryView,
+    epoch: i64,
+    departing: Option<(&[u8; 32], &[u8; 64])>,
+) -> Vec<Record> {
+    use ed25519_dalek::Signer;
+    let placer: [u8; 32] = signer.verifying_key().to_bytes();
+    let current = view.devices();
+
+    // Pop-and-swap: a removed slot takes the tail pointer, the run stays dense, untouched indices keep their records (and their epochs) exactly as stored.
+    let mut list = current.clone();
+    let mut i = 0;
+    while i < list.len() {
+        if fold.contains(&list[i]) {
+            i += 1;
+        } else {
+            let last = list.len() - 1;
+            list.swap(i, last);
+            list.pop();
+            // Do not advance: the swapped-in tail needs the same check.
+        }
+    }
+    for d in fold {
+        if !list.contains(d) {
+            list.push(*d);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (idx, dev) in list.iter().enumerate() {
+        if current.get(idx) == Some(dev) {
+            continue; // this slot is already right — leave its stored record alone
+        }
+        let unsigned = Record::new_device_pointer(handle_proof, idx as u32, dev, epoch, &placer, &[0u8; 64]);
+        let sig = signer.sign(&unsigned.placement_signing_bytes()).to_bytes();
+        out.push(Record::new_device_pointer(handle_proof, idx as u32, dev, epoch, &placer, &sig));
+    }
+
+    let count_stale = view
+        .count
+        .as_ref()
+        .map(|c| c.count() as usize != list.len())
+        .unwrap_or(true);
+    if !out.is_empty() || count_stale {
+        let unsigned = Record::new_identity_count(handle_proof, list.len() as u32, epoch, &placer, &[0u8; 64], departing);
+        let sig = signer.sign(&unsigned.count_signing_bytes()).to_bytes();
+        out.push(Record::new_identity_count(handle_proof, list.len() as u32, epoch, &placer, &sig, departing));
+    }
+    out
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
 // TRANSPORT — a slice body inside a complete VSF document.
 //
-// COMPLETE FILES ONLY: the body ships with a header carrying its geometry (slice_bits, slice_id,
-// fill) and a BLAKE3 provenance hash, so a receiving host knows how to address what it was handed
-// and can reject a torn transfer. The body itself is an UNBOXED section — raw fixed-stride bytes,
-// byte-addressable, exactly what an mmap'd file holds — because wrapping a million records as
-// schema fields would defeat the entire point of the layout.
+// COMPLETE FILES ONLY: the body ships with a header carrying its geometry (slice_bits, slice_id, fill) and a BLAKE3 provenance hash, so a receiving host knows how to address what it was handed and can reject a torn transfer.
+// The body itself is an UNBOXED section — raw fixed-stride bytes, byte-addressable, exactly what an mmap'd file holds — because wrapping a million records as schema fields would defeat the entire point of the layout.
 //
-// The provenance hash covers a SNAPSHOT in transit. It is not maintained across in-place updates
-// (that would be 33 minutes of BLAKE3 per IP change at 10 TB); per-record signatures are the
-// durable integrity, and this hash only says "the bytes you received are the bytes that were sent".
+// The provenance hash covers a SNAPSHOT in transit.
+// It is not maintained across in-place updates (that would be 33 minutes of BLAKE3 per IP change at 10 TB); per-record signatures are the durable integrity, and this hash only says "the bytes you received are the bytes that were sent".
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The unboxed section holding the fixed-stride body.
@@ -719,11 +830,10 @@ impl Slice {
             .build()
     }
 
-    /// Read a slice back from a transport document. Verified: the header must decode and its
-    /// provenance hash must be self-consistent before a single record is trusted.
+    /// Read a slice back from a transport document.
+    /// Verified: the header must decode and its provenance hash must be self-consistent before a single record is trusted.
     ///
-    /// Geometry comes from the document, not from the caller's assumption — a host serving width
-    /// `n` while the network moves to `n+1` must not silently reinterpret a body at the wrong width.
+    /// Geometry comes from the document, not from the caller's assumption — a host serving width `n` while the network moves to `n+1` must not silently reinterpret a body at the wrong width.
     pub fn from_document(doc: &[u8]) -> Result<Self, String> {
         let (header, _) = vsf::verification::read_verified(doc, None)
             .map_err(|e| format!("phonebook slice failed verified read: {e}"))?;
@@ -774,10 +884,9 @@ fn vsf_u64(v: &vsf::VsfType) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// Tests run at `slice_bits = 0` — ONE slice covering the whole keyspace — so a few thousand
-    /// records land in it directly. At the production width (2^24 slices) hitting one specific
-    /// slice by brute force would take ~3e10 hashes. The slot arithmetic under test is identical
-    /// either way; only the field above it moves.
+    /// Tests run at `slice_bits = 0` — ONE slice covering the whole keyspace — so a few thousand records land in it directly.
+    /// At the production width (2^24 slices) hitting one specific slice by brute force would take ~3e10 hashes.
+    /// The slot arithmetic under test is identical either way; only the field above it moves.
     const TB: u32 = 0;
 
     fn ptr(seed: u32, epoch: i64) -> Record {
@@ -797,8 +906,8 @@ mod tests {
 
     // ── addressing ──
 
-    /// The slot must be a pure bit-field of the key. If this ever needs a division or a float, the
-    /// "one read, no refine step" guarantee is gone.
+    /// The slot must be a pure bit-field of the key.
+    /// If this ever needs a division or a float, the "one read, no refine step" guarantee is gone.
     #[test]
     fn slot_is_a_bitfield_not_arithmetic() {
         for n in 0u32..2000 {
@@ -813,8 +922,7 @@ mod tests {
         }
     }
 
-    /// Domain separation. handle_proof already keys the fleet chain, fstate, fanout, bindreq and
-    /// inbox — an undomained hash would put the phonebook in all of their keyspaces at once.
+    /// Domain separation. handle_proof already keys the fleet chain, fstate, fanout, bindreq and inbox — an undomained hash would put the phonebook in all of their keyspaces at once.
     #[test]
     fn domains_do_not_collide() {
         let x = [7u8; 32];
@@ -824,9 +932,8 @@ mod tests {
         assert_ne!(key_pointer(&x, 0), key_pointer(&x, 1), "index must change the address");
     }
 
-    /// Consecutive device indices must scatter. If they clustered, one identity's devices would
-    /// collide with each other by construction and probe distance would scale with fleet size —
-    /// the clumping this addressing exists to avoid.
+    /// Consecutive device indices must scatter.
+    /// If they clustered, one identity's devices would collide with each other by construction and probe distance would scale with fleet size — the clumping this addressing exists to avoid.
     #[test]
     fn pointer_indices_scatter() {
         let hp = [3u8; 32];
@@ -847,8 +954,8 @@ mod tests {
 
     // ── slice invariants ──
 
-    /// The core promise: findable at or after the computed slot, and the walk stays inside one
-    /// 4 KiB block (16 slots). If this regresses, "one read per lookup" is gone.
+    /// The core promise: findable at or after the computed slot, and the walk stays inside one 4 KiB block (16 slots).
+    /// If this regresses, "one read per lookup" is gone.
     #[test]
     fn every_record_findable_within_one_block() {
         let (s, made) = populate(2400); // ~58% fill, the production design point
@@ -861,16 +968,16 @@ mod tests {
         }
     }
 
-    /// Invariant (2). Violating it is silent corruption: the record is still in the file, but a
-    /// lookup starting at its ideal and scanning right never reaches it.
+    /// Invariant (2).
+    /// Violating it is silent corruption: the record is still in the file, but a lookup starting at its ideal and scanning right never reaches it.
     #[test]
     fn no_record_left_of_its_ideal_slot() {
         let (s, _) = populate(3000);
         s.check_invariants().expect("invariants hold after inserts");
     }
 
-    /// Invariant (1). Catches stepping right past a LARGER key instead of shifting it — every
-    /// lookup would still pass while the array quietly stopped being sorted.
+    /// Invariant (1).
+    /// Catches stepping right past a LARGER key instead of shifting it — every lookup would still pass while the array quietly stopped being sorted.
     #[test]
     fn insert_preserves_sort_order() {
         let (s, made) = populate(3000);
@@ -890,7 +997,8 @@ mod tests {
         assert!(s.lookup(&ptr(999_999, 1).key().unwrap()).is_none());
     }
 
-    /// Remove is the exact inverse of insert. Both invariants must survive every single removal.
+    /// Remove is the exact inverse of insert.
+    /// Both invariants must survive every single removal.
     #[test]
     fn remove_is_the_inverse_of_insert() {
         let (mut s, made) = populate(2000);
@@ -903,8 +1011,8 @@ mod tests {
         assert_eq!(s.fill(), 0);
     }
 
-    /// Interleaved churn — the case a hand-written sequence misses. A wrong left-shift guard shows
-    /// up here as a record still in the buffer but unfindable.
+    /// Interleaved churn — the case a hand-written sequence misses.
+    /// A wrong left-shift guard shows up here as a record still in the buffer but unfindable.
     #[test]
     fn random_churn_keeps_every_record_findable() {
         let (mut s, made) = populate(1500);
@@ -935,8 +1043,8 @@ mod tests {
 
     // ── the monotonic rule, and the attacks it closes ──
 
-    /// Strictly greater or nothing. Equal is refused too — that is what serialises two concurrent
-    /// writers without any old/new bookkeeping.
+    /// Strictly greater or nothing.
+    /// Equal is refused too — that is what serialises two concurrent writers without any old/new bookkeeping.
     #[test]
     fn epoch_must_strictly_increase() {
         let mut s = Slice::new(TB, 0);
@@ -953,8 +1061,9 @@ mod tests {
         assert!(s.insert(&newer).is_ok());
     }
 
-    /// The shuffle attack, all three replay targets. Each is closed by a DIFFERENT rule, so this
-    /// asserts all three are still present. Remove any one and reordering opens up.
+    /// The shuffle attack, all three replay targets.
+    /// Each is closed by a DIFFERENT rule, so this asserts all three are still present.
+    /// Remove any one and reordering opens up.
     #[test]
     fn placement_replay_fails_at_every_target() {
         let mut s = Slice::new(TB, 0);
@@ -966,8 +1075,7 @@ mod tests {
         assert!(matches!(s.insert(&victim), Err(SliceError::StaleEpoch { .. })),
             "a placement can never be replayed into the slot it belongs to");
 
-        // (b) into a DIFFERENT index: the index is inside both the key derivation and the
-        // placement signature, so it cannot be moved without becoming a different record.
+        // (b) into a DIFFERENT index: the index is inside both the key derivation and the placement signature, so it cannot be moved without becoming a different record.
         let moved = Record::new_device_pointer(
             &victim.handle_proof(), victim.index() + 1, &victim.device_pubkey(),
             victim.epoch(), &victim.placer(), &victim.placement_sig());
@@ -975,16 +1083,15 @@ mod tests {
         assert_ne!(moved.placement_signing_bytes(), victim.placement_signing_bytes(),
             "the signature covers the index, so it does not carry over");
 
-        // (c) into an EMPTIED slot: only the tail is ever emptied, and it is emptied because it is
-        // now out of range. Landing there is inert until the count rises, which needs a current
-        // member's witness signature.
+        // (c) into an EMPTIED slot: only the tail is ever emptied, and it is emptied because it is now out of range.
+        // Landing there is inert until the count rises, which needs a current member's witness signature.
         s.remove(&vkey);
         assert!(s.insert(&victim).is_ok(), "an emptied slot accepts it");
         assert!(s.lookup(&vkey).is_some(), "…but readers gate on index < N, so it is never read");
     }
 
-    /// Signing bytes must be domain-separated and must commit to what they claim. A signature over
-    /// one role must never verify in another.
+    /// Signing bytes must be domain-separated and must commit to what they claim.
+    /// A signature over one role must never verify in another.
     #[test]
     fn signing_bytes_are_domain_separated() {
         let hp = [1u8; 32];
@@ -997,15 +1104,13 @@ mod tests {
         assert!(c.count_signing_bytes().starts_with(SIGN_COUNT));
         assert!(Record::departure_signing_bytes(&hp, &[2u8; 32], 5).starts_with(SIGN_DEPART));
 
-        // The address signature covers handle_proof, so a device cannot be planted under another
-        // identity — the gap that lets a stranger mint a row for any scraped handle_proof today.
+        // The address signature covers handle_proof, so a device cannot be planted under another identity — the gap that lets a stranger mint a row for any scraped handle_proof today.
         let other = Record::new_device_address(&[2u8; 32], &[9u8; 32], &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 64]);
         assert_ne!(a.address_signing_bytes(), other.address_signing_bytes());
     }
 
-    /// Removal is consent-only: the departing device's own signature AND a current member's
-    /// witness. The record carries both, and the witness commits to WHICH device departed, so a
-    /// witness cannot be replayed to attest a different removal.
+    /// Removal is consent-only: the departing device's own signature AND a current member's witness.
+    /// The record carries both, and the witness commits to WHICH device departed, so a witness cannot be replayed to attest a different removal.
     #[test]
     fn removal_carries_consent_and_witness() {
         let hp = [1u8; 32];
@@ -1034,8 +1139,7 @@ mod tests {
         }
     }
 
-    /// Round-tripping the raw body preserves both invariants and the fill count — the body is what
-    /// an mmap'd file holds and what ships inside a VSF document, so it must survive verbatim.
+    /// Round-tripping the raw body preserves both invariants and the fill count — the body is what an mmap'd file holds and what ships inside a VSF document, so it must survive verbatim.
     #[test]
     fn raw_body_round_trips() {
         let (s, made) = populate(1500);
@@ -1061,9 +1165,8 @@ mod tests {
         k.sign(msg).to_bytes()
     }
 
-    /// The one-step mint must produce exactly what the hand-rolled two-step produces, and must
-    /// verify. This is the helper the client publishes through, so a regression here is an
-    /// unfindable device rather than a visible error.
+    /// The one-step mint must produce exactly what the hand-rolled two-step produces, and must verify.
+    /// This is the helper the client publishes through, so a regression here is an unfindable device rather than a visible error.
     #[test]
     fn sign_device_address_mints_a_verifying_record() {
         let dev = sk(3);
@@ -1085,9 +1188,8 @@ mod tests {
         assert_eq!(minted.key(), Some(key_address(&pk(&dev))), "keyed by device pubkey alone");
     }
 
-    /// The record crosses the wire to the seed as its raw 256 bytes and is reconstructed there
-    /// before `verify_address` runs. A stride change or a lossy copy would break publication
-    /// silently, so pin the exact byte-for-byte round trip the worker's `pb_put` performs.
+    /// The record crosses the wire to the seed as its raw 256 bytes and is reconstructed there before `verify_address` runs.
+    /// A stride change or a lossy copy would break publication silently, so pin the exact byte-for-byte round trip the worker's `pb_put` performs.
     #[test]
     fn address_record_survives_a_raw_stride_round_trip() {
         let dev = sk(4);
@@ -1105,8 +1207,7 @@ mod tests {
     }
 
     /// A device signs its own address, and the record self-verifies against the key inside it.
-    /// Tampering with ANY covered field must break it — that is the whole integrity story, since
-    /// there is no whole-file hash maintained across updates.
+    /// Tampering with ANY covered field must break it — that is the whole integrity story, since there is no whole-file hash maintained across updates.
     #[test]
     fn address_record_self_verifies_and_detects_tampering() {
         let dev = sk(1);
@@ -1133,9 +1234,8 @@ mod tests {
         assert!(!bad_key.verify_address(), "a signature by another key must not verify");
     }
 
-    /// A placement verifies against the placer named in it — but that is only WHO, never WHETHER
-    /// they were entitled. A departed member's signature stays valid forever, so the caller must
-    /// check current membership separately; this test pins that the check is genuinely absent here.
+    /// A placement verifies against the placer named in it — but that is only WHO, never WHETHER they were entitled.
+    /// A departed member's signature stays valid forever, so the caller must check current membership separately; this test pins that the check is genuinely absent here.
     #[test]
     fn placement_verifies_signer_but_not_membership() {
         let placer = sk(3);
@@ -1145,8 +1245,8 @@ mod tests {
         let r = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &sig);
         assert!(r.verify_placement());
 
-        // Same signature, different index → different signing bytes → fails. This is target (b) of
-        // the shuffle attack, closed cryptographically rather than by convention.
+        // Same signature, different index → different signing bytes → fails.
+        // This is target (b) of the shuffle attack, closed cryptographically rather than by convention.
         let moved = Record::new_device_pointer(&hp, 3, &[7u8; 32], 10, &pk(&placer), &sig);
         assert!(!moved.verify_placement(), "a placement cannot be replayed at another index");
 
@@ -1158,8 +1258,8 @@ mod tests {
         assert!(srec.verify_placement(), "signature is valid — membership is the CALLER's check");
     }
 
-    /// Consent-only removal: the departing device's own signature is required, and an unsigned or
-    /// wrongly-signed departure is not consent. An add has nothing to prove.
+    /// Consent-only removal: the departing device's own signature is required, and an unsigned or wrongly-signed departure is not consent.
+    /// An add has nothing to prove.
     #[test]
     fn departure_requires_the_leavers_own_signature() {
         let leaver = sk(4);
@@ -1181,8 +1281,7 @@ mod tests {
         assert!(!wrong_epoch.verify_departure(), "the departure is bound to its epoch");
     }
 
-    /// The witness attests the count AND which device departed, so it cannot be replayed against a
-    /// different removal.
+    /// The witness attests the count AND which device departed, so it cannot be replayed against a different removal.
     #[test]
     fn count_witness_commits_to_the_departure() {
         let witness = sk(6);
@@ -1201,9 +1300,8 @@ mod tests {
 
     // ── transport ──
 
-    /// A slice ships as a COMPLETE VSF file: header, provenance hash, geometry, and the raw
-    /// fixed-stride body as an unboxed section. Round-trip must preserve every record and both
-    /// invariants, and the geometry must come from the document rather than the caller.
+    /// A slice ships as a COMPLETE VSF file: header, provenance hash, geometry, and the raw fixed-stride body as an unboxed section.
+    /// Round-trip must preserve every record and both invariants, and the geometry must come from the document rather than the caller.
     #[test]
     fn slice_round_trips_through_a_vsf_document() {
         let (s, made) = populate(1500);
@@ -1234,8 +1332,7 @@ mod tests {
         assert!(Slice::from_document(b"not a vsf document").is_err());
     }
 
-    /// Every layout must fit the stride with reserve left over — the reserve is the migration
-    /// budget, and a field that overflows 256 is a flag day rather than a free addition.
+    /// Every layout must fit the stride with reserve left over — the reserve is the migration budget, and a field that overflows 256 is a flag day rather than a free addition.
     #[test]
     fn layouts_fit_the_stride_with_reserve() {
         assert_eq!(STRIDE, 256);

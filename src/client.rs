@@ -52,10 +52,9 @@ fn parse_section(bytes: &[u8]) -> Result<(String, vsf::VsfSection), String> {
     Ok((section.name.clone(), section))
 }
 
-/// If `body` is an FGTW `error` frame, return its `(reason, detail)`. The worker answers every
-/// failure with one of these at HTTP 200 — VSF is the wire — so callers branch on the stable
-/// `reason` label (`not_found`, `stale`, `bad_signature`, …), never an HTTP status. Both frame
-/// shapes parse here: plain (hp + hb) and FGTW-header-signed (ke/ge, canonical scheme).
+/// If `body` is an FGTW `error` frame, return its `(reason, detail)`.
+/// The worker answers every failure with one of these at HTTP 200 — VSF is the wire — so callers branch on the stable `reason` label (`not_found`, `stale`, `bad_signature`, …), never an HTTP status.
+/// Both frame shapes parse here: plain (hp + hb) and FGTW-header-signed (ke/ge, canonical scheme).
 pub fn error_frame(body: &[u8]) -> Option<(String, String)> {
     let (name, section) = parse_section(body).ok()?;
     if name != "error" {
