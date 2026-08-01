@@ -426,7 +426,7 @@ pub fn post_fanout<T: FgtwTransport>(
 ) -> Result<(), String> {
     let mut section = vsf::VsfSection::new("fanout_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("bl", VsfType::ge(fanout_to_bytes(epoch, wraps)));
+    section.add_field("bl", VsfType::ge(fanout_to_bytes(epoch, &device_key.public.to_bytes(), wraps)));
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
         .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
@@ -445,11 +445,11 @@ pub fn post_fanout<T: FgtwTransport>(
     Ok(())
 }
 
-/// Fetch the current fan-out (epoch + wraps), or None if none published yet.
+/// Fetch the current fan-out (epoch + rotator + wraps), or None if none published yet. A pre-v1 blob fails the version gate inside `fanout_from_bytes` and surfaces as an error the rotation path treats as absent (hard flag-day).
 pub fn fetch_fanout<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-) -> Result<Option<(u64, Vec<FanoutWrap>)>, String> {
+) -> Result<Option<(u64, [u8; 32], Vec<FanoutWrap>)>, String> {
     let mut section = vsf::VsfSection::new("fanout_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -474,12 +474,16 @@ pub fn rotate_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
-    members: &[[u8; 32]],
+    members: &[([u8; 32], [u8; 32])],
 ) -> Result<(u64, [u8; 32]), String> {
-    let current = fetch_fanout(t, handle_proof)?.map(|(e, _)| e).unwrap_or(0);
+    // A pre-v1 blob errors out of the parse — treat it as absent so rotation re-establishes over it (hard flag-day; the epoch guard still holds because the worker reads the epoch positionally at the same offset).
+    let current = fetch_fanout(t, handle_proof)
+        .unwrap_or(None)
+        .map(|(e, _, _)| e)
+        .unwrap_or(0);
     let epoch = current + 1;
     let key = new_fleet_key();
-    let wraps = fanout_seal(handle_proof, epoch, &key, members)?;
+    let wraps = fanout_seal(handle_proof, epoch, &key, &device_key.public.to_bytes(), members)?;
     post_fanout(t, handle_proof, device_key, epoch, &wraps)?;
     Ok((epoch, key))
 }
@@ -489,9 +493,12 @@ pub fn recover_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
+    pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
 ) -> Result<Option<[u8; 32]>, String> {
     match fetch_fanout(t, handle_proof)? {
-        Some((epoch, wraps)) => Ok(fanout_open(handle_proof, epoch, &wraps, device_key)),
+        Some((epoch, rotator, wraps)) => Ok(pair_secret_for(&rotator).and_then(|ps| {
+            fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps)
+        })),
         None => Ok(None),
     }
 }
@@ -502,17 +509,25 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
+    pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
 ) -> Result<Option<[u8; 32]>, String> {
-    match fetch_fanout(t, handle_proof)? {
-        Some((epoch, wraps)) => Ok(fanout_open(handle_proof, epoch, &wraps, device_key)),
-        None => {
-            let members = current_members(t, handle_proof)?;
+    match fetch_fanout(t, handle_proof) {
+        Ok(Some((epoch, rotator, wraps))) => Ok(pair_secret_for(&rotator).and_then(|ps| {
+            fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps)
+        })),
+        // Err = a pre-v1 blob (hard flag-day) — fall through to establish over it, same as absent.
+        Ok(None) | Err(_) => {
+            // COMPLIANT members only: a member with no pair secret toward us gets no wrap — dark until it re-clutches (user directive 2026-08-01).
+            let members: Vec<([u8; 32], [u8; 32])> = current_members(t, handle_proof)?
+                .into_iter()
+                .filter_map(|m| pair_secret_for(&m).map(|ps| (m, ps)))
+                .collect();
             if members.is_empty() {
                 return Ok(None);
             }
             match rotate_fleet_key(t, handle_proof, device_key, &members) {
                 Ok((_, k)) => Ok(Some(k)),
-                Err(_) => recover_fleet_key(t, handle_proof, device_key),
+                Err(_) => recover_fleet_key(t, handle_proof, device_key, pair_secret_for),
             }
         }
     }
