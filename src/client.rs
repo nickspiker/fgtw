@@ -444,6 +444,30 @@ pub fn post_fanout<T: FgtwTransport>(
     Ok(())
 }
 
+/// The raw fan-out blob as stored, unparsed — the rotation path needs the EPOCH even from a blob whose body it cannot read (a pre-v1 layout), or it proposes epoch 1 and the worker refuses it as stale forever.
+pub fn fetch_fanout_blob<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+) -> Result<Option<Vec<u8>>, String> {
+    let mut section = vsf::VsfSection::new("fanout_get");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    let resp = t.post(unsigned_req(section)?)?;
+    if is_error(&resp.body, "not_found") {
+        return Ok(None);
+    }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw fanout_get {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    let (_, stored) = parse_section(&resp.body)?;
+    match stored.get_field("bl").and_then(|f| f.values.first()) {
+        Some(VsfType::ge(b)) => Ok(Some(b.clone())),
+        _ => Ok(None),
+    }
+}
+
 /// Fetch the current fan-out (epoch + rotator + wraps), or None if none published yet. A pre-v1 blob fails the version gate inside `fanout_from_bytes` and surfaces as an error the rotation path treats as absent (hard flag-day).
 pub fn fetch_fanout<T: FgtwTransport>(
     t: &T,
@@ -475,10 +499,10 @@ pub fn rotate_fleet_key<T: FgtwTransport>(
     device_key: &Keypair,
     members: &[([u8; 32], [u8; 32])],
 ) -> Result<(u64, [u8; 32]), String> {
-    // A pre-v1 blob errors out of the parse — treat it as absent so rotation re-establishes over it (hard flag-day; the epoch guard still holds because the worker reads the epoch positionally at the same offset).
-    let current = fetch_fanout(t, handle_proof)
+    // Read the stored epoch from the RAW blob: a pre-v1 body is unparseable, but its epoch sits at the same offset, and stepping past it is the only way a v1 rotation survives the worker's monotonic guard (proposing epoch 1 over a live epoch is refused as stale forever — the flag-day deadlock observed 2026-08-01).
+    let current = fetch_fanout_blob(t, handle_proof)
         .unwrap_or(None)
-        .map(|(e, _, _)| e)
+        .and_then(|b| crate::fanout::fanout_blob_epoch(&b))
         .unwrap_or(0);
     let epoch = current + 1;
     let key = new_fleet_key();
@@ -494,11 +518,14 @@ pub fn recover_fleet_key<T: FgtwTransport>(
     device_key: &Keypair,
     pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
 ) -> Result<Option<[u8; 32]>, String> {
-    match fetch_fanout(t, handle_proof)? {
-        Some((epoch, rotator, wraps)) => Ok(pair_secret_for(&rotator).and_then(|ps| {
+    // An unreadable (pre-v1) blob means "no key for us yet", NOT a transport failure: reporting it as an error made the establish fallback re-propagate it, so the device logged `fleet key sync failed` and stayed dark instead of rotating.
+    match fetch_fanout(t, handle_proof) {
+        Ok(Some((epoch, rotator, wraps))) => Ok(pair_secret_for(&rotator).and_then(|ps| {
             fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps)
         })),
-        None => Ok(None),
+        Ok(None) => Ok(None),
+        Err(e) if e.starts_with("fanout:") => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

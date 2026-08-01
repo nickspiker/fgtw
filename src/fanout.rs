@@ -172,7 +172,10 @@ pub fn fanout_to_bytes(epoch: u64, rotator_ed: &[u8; 32], wraps: &[FanoutWrap]) 
     out
 }
 
-/// Parse a fan-out blob. Bounds-checked — a truncated or corrupt blob fails rather than panicking. A pre-v1 blob (the old ASCII-tagged "PFO0") fails the version gate and reads as an error the caller treats as absent — rotation re-establishes (hard flag-day).
+// The version-agnostic epoch reader lives at the crate root (`crate::fanout_blob_epoch`) because the WORKER needs it without compiling any fan-out crypto; re-exported here so fan-out call sites read naturally.
+pub use crate::fanout_blob_epoch;
+
+/// Parse a fan-out blob. Bounds-checked — a truncated or corrupt blob fails rather than panicking. A pre-v1 blob (the old ASCII-tagged "PFO0") fails the version gate and reads as an error the caller treats as absent — rotation re-establishes over it (hard flag-day), using [`fanout_blob_epoch`] to keep the epoch monotonic across the boundary.
 pub fn fanout_from_bytes(bytes: &[u8]) -> Result<(u64, [u8; 32], Vec<FanoutWrap>), String> {
     let mut p = 0usize;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
@@ -290,6 +293,10 @@ mod tests {
         let mut legacy = bytes.clone();
         legacy[3] = b'0';
         assert!(fanout_from_bytes(&legacy).is_err());
+        // …but its EPOCH still reads, which is what lets a v1 rotator step OVER it instead of proposing epoch 1 and being refused as stale forever.
+        assert_eq!(fanout_blob_epoch(&legacy), Some(epoch));
+        assert_eq!(fanout_blob_epoch(&bytes), Some(epoch));
+        assert_eq!(fanout_blob_epoch(b"nope"), None);
         // A tampered wrap fails its AEAD tag (no silent wrong key).
         let mut tampered = wraps.clone();
         *tampered[0].ct.last_mut().unwrap() ^= 1;
