@@ -1342,4 +1342,98 @@ mod tests {
         assert!(DP_PLACE_SIG + 64 <= STRIDE, "DevicePointer overflows");
         assert!(DA_SIG + 64 <= STRIDE, "DeviceAddress overflows");
     }
+
+    /// Test-side registry storage: apply a plan's records the way per-key storage would (count replaces, a pointer lands at its index), then trim to the attested extent.
+    fn apply_plan(view: &mut RegistryView, plan: &[Record]) {
+        for r in plan {
+            match r.kind() {
+                RecordKind::IdentityCount => view.count = Some(*r),
+                RecordKind::DevicePointer => {
+                    let i = r.index() as usize;
+                    while view.pointers.len() <= i {
+                        view.pointers.push(Record::empty());
+                    }
+                    view.pointers[i] = *r;
+                }
+                _ => panic!("a plan only emits count + pointer records"),
+            }
+        }
+        let n = view.count.as_ref().map(|c| c.count() as usize).unwrap_or(0);
+        view.pointers.truncate(n);
+    }
+
+    #[test]
+    fn plan_converges_from_empty_then_goes_quiet() {
+        let member = sk(1);
+        let hp = [9u8; 32];
+        let fold = [pk(&sk(1)), pk(&sk(2))];
+        let mut view = RegistryView::default();
+        let plan = registry_plan(&member, &hp, &fold, &view, 100, None);
+        assert_eq!(plan.len(), 3, "two pointers + the count");
+        apply_plan(&mut view, &plan);
+        assert!(view.verify(&hp), "a plan minted by one member must verify for any reader");
+        assert_eq!(view.devices(), fold.to_vec());
+        // In sync → the next plan is empty, so racing siblings settle instead of ping-ponging writes.
+        assert!(registry_plan(&member, &hp, &fold, &view, 101, None).is_empty());
+    }
+
+    #[test]
+    fn plan_appends_without_touching_stored_slots() {
+        let member = sk(1);
+        let hp = [9u8; 32];
+        let mut view = RegistryView::default();
+        let plan0 = registry_plan(&member, &hp, &[pk(&sk(1)), pk(&sk(2))], &view, 100, None);
+        apply_plan(&mut view, &plan0);
+        let stored_first = view.pointers[0];
+        let fold3 = [pk(&sk(1)), pk(&sk(2)), pk(&sk(3))];
+        let plan = registry_plan(&member, &hp, &fold3, &view, 200, None);
+        assert_eq!(plan.len(), 2, "one new pointer + the count — stored slots stay untouched");
+        apply_plan(&mut view, &plan);
+        assert!(view.verify(&hp));
+        assert_eq!(view.devices(), fold3.to_vec());
+        assert_eq!(view.pointers[0].0, stored_first.0, "an untouched slot keeps its record (and epoch) exactly as stored");
+    }
+
+    #[test]
+    fn plan_removes_by_pop_and_swap_with_consent() {
+        let member = sk(1);
+        let hp = [9u8; 32];
+        let leaver = sk(2);
+        let mut view = RegistryView::default();
+        let fold3 = [pk(&sk(1)), pk(&leaver), pk(&sk(3))];
+        let plan0 = registry_plan(&member, &hp, &fold3, &view, 100, None);
+        apply_plan(&mut view, &plan0);
+        // The leaver consents with its OWN key over the departure bytes at the new epoch.
+        let fold2 = [pk(&sk(1)), pk(&sk(3))];
+        let leaver_pk = pk(&leaver);
+        let consent = {
+            use ed25519_dalek::Signer;
+            leaver.sign(&Record::departure_signing_bytes(&hp, &leaver_pk, 200)).to_bytes()
+        };
+        let plan = registry_plan(&member, &hp, &fold2, &view, 200, Some((&leaver_pk, &consent)));
+        assert_eq!(plan.len(), 2, "the relocated tail pointer + the count");
+        apply_plan(&mut view, &plan);
+        assert!(view.verify(&hp), "verify covers the departure consent riding the count");
+        assert_eq!(view.devices(), vec![pk(&sk(1)), pk(&sk(3))], "the tail popped into the hole — indices stay dense");
+        let count = view.count.unwrap();
+        assert_eq!(count.departing().unwrap().0, leaver_pk);
+        assert!(count.verify_departure());
+    }
+
+    #[test]
+    fn view_verify_rejects_tampering() {
+        let member = sk(1);
+        let hp = [9u8; 32];
+        let mut view = RegistryView::default();
+        let plan0 = registry_plan(&member, &hp, &[pk(&sk(1)), pk(&sk(2))], &view, 100, None);
+        apply_plan(&mut view, &plan0);
+        assert!(view.verify(&hp));
+        // A pointer moved to the wrong slot fails (index is inside the placement signature).
+        view.pointers.swap(0, 1);
+        assert!(!view.verify(&hp), "a shuffled pointer run must not verify");
+        view.pointers.swap(0, 1);
+        // A count that disagrees with the pointer run fails.
+        view.pointers.pop();
+        assert!(!view.verify(&hp), "count and pointer extent must agree");
+    }
 }
