@@ -52,6 +52,10 @@ pub fn fanout_blob_epoch(bytes: &[u8]) -> Option<u64> {
 #[cfg(feature = "fanout")]
 pub mod fanout;
 
+/// Scoped blobs — one ciphertext, many keyholders: a data key wrapped per reader into a private slot only that reader can find. The sharing primitive for avatars now and attachments later; see photon docs/scoped-blobs.md.
+#[cfg(feature = "fanout")]
+pub mod scoped_blob;
+
 /// Fleet-shared encrypted state — the codec for the slot each app writes its shared state into (photon: the contact roster; calendar: events).
 /// Data model + serialize + CRDT merge; the seal-and-push transport is the client's.
 #[cfg(feature = "fanout")]
