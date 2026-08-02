@@ -90,6 +90,38 @@ pub fn open_slot(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Option
     Some(SlotContents { blob_id, dek })
 }
 
+/// Seal a bare 32-byte VALUE (e.g. a fleet key) into a reader's slot. Unlike [`seal_slot`], the value REPLACES itself across epochs under one (kek, purpose) — so this uses a fresh random nonce per seal, prefixed, where the slot's fixed nonce would repeat across distinct plaintexts.
+pub fn seal_value(
+    kek_secret: &[u8; 32],
+    purpose: &[u8],
+    value: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
+    let key = slot_key(kek_secret, purpose);
+    let nonce_bytes: [u8; 12] = rand::random();
+    let nonce = Nonce::from(nonce_bytes);
+    let mut out = nonce_bytes.to_vec();
+    let ct = ChaCha20Poly1305::new((&key).into())
+        .encrypt(&nonce, value.as_slice())
+        .map_err(|_| "scoped: value seal failed".to_string())?;
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a value slot. `None` when the bytes are not ours (wrong secret, wrong purpose, tampered, absent).
+pub fn open_value(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Option<[u8; 32]> {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
+    if sealed.len() < 12 {
+        return None;
+    }
+    let key = slot_key(kek_secret, purpose);
+    let nonce = Nonce::from(<[u8; 12]>::try_from(&sealed[..12]).ok()?);
+    let plain = ChaCha20Poly1305::new((&key).into())
+        .decrypt(&nonce, &sealed[12..])
+        .ok()?;
+    <[u8; 32]>::try_from(plain.as_slice()).ok()
+}
+
 /// Encrypt the content once under the DEK. The blob id is bound in, so a ciphertext cannot be swapped between addresses while still opening.
 pub fn seal_content(dek: &[u8; 32], blob_id: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
@@ -281,5 +313,29 @@ mod tests {
         let b = Keypair::from_seed(&[4u8; 32]);
         assert_eq!(self_kek(&a), self_kek(&a));
         assert_ne!(self_kek(&a), self_kek(&b));
+    }
+}
+
+#[cfg(test)]
+mod value_slot_tests {
+    use super::*;
+
+    /// A value round-trips under its (kek, purpose); a rotated value re-seals under the SAME pair and still opens — the epochs-replace-in-place property the fleet-key recovery slot rides on.
+    #[test]
+    fn value_round_trips_and_replaces() {
+        let kek = [3u8; 32];
+        let purpose = b"fleet-key-test";
+        let v1 = [7u8; 32];
+        let sealed1 = seal_value(&kek, purpose, &v1).unwrap();
+        assert_eq!(open_value(&kek, purpose, &sealed1), Some(v1));
+
+        let v2 = [8u8; 32];
+        let sealed2 = seal_value(&kek, purpose, &v2).unwrap();
+        assert_eq!(open_value(&kek, purpose, &sealed2), Some(v2));
+        // Distinct nonces: two seals of even the SAME value never share bytes.
+        assert_ne!(seal_value(&kek, purpose, &v1).unwrap(), sealed1);
+        // Wrong secret or purpose opens nothing.
+        assert_eq!(open_value(&[4u8; 32], purpose, &sealed2), None);
+        assert_eq!(open_value(&kek, b"other", &sealed2), None);
     }
 }
