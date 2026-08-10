@@ -481,6 +481,20 @@ pub fn fstate_from_bytes(bytes: &[u8]) -> Result<FleetState, String> {
 }
 
 /// CRDT merge: union by handle_proof, per-entry last-writer-wins on `updated`. Deterministic and order-independent (commutative/idempotent). A tombstone wins an `updated` tie so a concurrent remove beats a concurrent re-add — deletes are conservative.
+/// Canonical total order over a roster entry's CONTENT (everything but the key and the clock), for the equal-stamp tie-break below — same role as the value-bytes compare in `merge_global_settings`. Without it, two devices writing different content at the same instant each kept their own winner forever (whichever arrived second in the merge's input order), so the fleet held two truths.
+fn roster_entry_canon(e: &RosterEntry) -> impl Ord + '_ {
+    (
+        &e.handle_hash,
+        &e.public_identity,
+        &e.avatar_pin,
+        e.added,
+        &e.ceremony_owner,
+        e.woven,
+        e.trust_level,
+        &e.published_name,
+    )
+}
+
 pub fn merge_rosters(a: Vec<RosterEntry>, b: Vec<RosterEntry>) -> Vec<RosterEntry> {
     use std::collections::HashMap;
     let mut by: HashMap<[u8; 32], RosterEntry> = HashMap::new();
@@ -489,7 +503,10 @@ pub fn merge_rosters(a: Vec<RosterEntry>, b: Vec<RosterEntry>) -> Vec<RosterEntr
             None => true,
             Some(cur) => {
                 e.updated > cur.updated
-                    || (e.updated == cur.updated && e.tombstone && !cur.tombstone)
+                    || (e.updated == cur.updated
+                        && (e.tombstone && !cur.tombstone
+                            || (e.tombstone == cur.tombstone
+                                && roster_entry_canon(&e) > roster_entry_canon(cur))))
             }
         };
         if replace {
@@ -644,6 +661,29 @@ mod tests {
         stale.trust_level = 0;
         let merged = merge_rosters(vec![newer.clone()], vec![stale]);
         assert_eq!(merged[0].trust_level, 3, "an older entry must never downgrade trust");
+    }
+
+    /// EQUAL-STAMP writes of different content must converge to ONE winner regardless of merge order — the canonical-content tie-break (merge_global_settings' value-bytes rule, roster edition). Without it each side kept whichever entry arrived second in ITS OWN input order, so two devices could hold different winners forever.
+    #[test]
+    fn equal_stamp_roster_merge_is_commutative() {
+        let mut x = roster_entry(7, 500, false);
+        x.published_name = "WrittenOnDeviceA".into();
+        let mut y = roster_entry(7, 500, false);
+        y.published_name = "WrittenOnDeviceB".into();
+
+        let ab = merge_rosters(vec![x.clone()], vec![y.clone()]);
+        let ba = merge_rosters(vec![y.clone()], vec![x.clone()]);
+        assert_eq!(ab.len(), 1);
+        assert_eq!(ab, ba, "the equal-stamp winner must not depend on argument order");
+
+        // The tombstone-first rule still outranks content: an equal-stamp tombstone beats any live entry from either side.
+        let dead = roster_entry(7, 500, true);
+        for merged in [
+            merge_rosters(vec![x.clone()], vec![dead.clone()]),
+            merge_rosters(vec![dead.clone()], vec![x.clone()]),
+        ] {
+            assert!(merged[0].tombstone, "an equal-stamp tombstone wins from either side");
+        }
     }
 
     /// A roster the reader can't parse must not take the SETTINGS with it. The layers share one document but are independent, and a roster version bump is a documented flag-day whose cost is one roster re-push. Propagating the error made the whole fstate unreadable, and because push is pull-merge-push, the failed pull rebased on empty and the next push DESTROYED the fleet's settings on FGTW — observed live on the v2→v3 bump ("8 roster entries, 0 global settings, 0 device maps").
