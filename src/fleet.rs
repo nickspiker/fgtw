@@ -51,11 +51,13 @@ pub struct Egg {
 }
 
 /// What a fleet op does. `u8` discriminant is the on-wire `kind`; wire-stable.
+/// Checkpoint (2026-08-12) is the fleet-plane epoch spine (photon docs/braid.md §14.4): a chain-format flag-day — pre-checkpoint builds hard-fail the parse on kind 3, which is the approved atomic-update behaviour, never a tolerated fork.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpKind {
     Genesis = 0,
     Add = 1,
     Remove = 2,
+    Checkpoint = 3,
 }
 
 impl OpKind {
@@ -64,6 +66,7 @@ impl OpKind {
             0 => Some(OpKind::Genesis),
             1 => Some(OpKind::Add),
             2 => Some(OpKind::Remove),
+            3 => Some(OpKind::Checkpoint),
             _ => None,
         }
     }
@@ -92,6 +95,12 @@ pub struct FleetOp {
     pub consent_t: i64,
     /// ADD ONLY: the added device's OWN signature over [`bindreq_signing_bytes`]`(handle_proof, device_pubkey, consent_t)` — the subject consenting to its membership (bilateral add; the sovereign-records rule). NOT a signature over this op's signing bytes, so it's data the sponsor's egg commits to, like the genesis identity binding. Empty on genesis/remove ops.
     pub consent_sig: Vec<u8>,
+    /// CHECKPOINT ONLY: the monotonic checkpoint sequence number, strictly prev+1 starting at 1 — the epoch index `k` the fleet's key schedule advances on. 0 elsewhere.
+    pub ckpt_k: u64,
+    /// CHECKPOINT ONLY: blake3 commitment to the SECRET settled-root (the merkle root over the fleet's settled message rows) — the chain carries only this preimage-hiding commitment, never the root. `[0; 32]` elsewhere.
+    pub ckpt_commit: [u8; 32],
+    /// CHECKPOINT ONLY: the fan-out fleet-key epoch this checkpoint folds into its derivation, so a catching-up sibling knows WHICH fleet key enters `epoch_k`. Already-public information (the fan-out slot shows its epoch). 0 elsewhere.
+    pub ckpt_fanout_epoch: u64,
     /// Signature eggs over [`FleetOp::signing_bytes`]; every listed egg must verify (the egg-list rule).
     pub sigs: Vec<Egg>,
 }
@@ -153,6 +162,12 @@ impl FleetOp {
         b.extend_from_slice(&self.identity_pubkey); // bound in so the device sig also commits to the identity key (it can't be swapped)
         b.extend_from_slice(&self.consent_t.to_le_bytes());
         b.extend_from_slice(&self.consent_sig); // bound in so the consent can't be swapped under the sponsor's egg
+        // Checkpoint fields append KIND-GATED: every pre-checkpoint op kind keeps byte-identical signing bytes, so chains signed by pre-2026-08-12 builds still verify — an unconditional append would break every deployed fleet's signatures at once.
+        if self.kind == OpKind::Checkpoint {
+            b.extend_from_slice(&self.ckpt_k.to_le_bytes());
+            b.extend_from_slice(&self.ckpt_commit);
+            b.extend_from_slice(&self.ckpt_fanout_epoch.to_le_bytes());
+        }
         b
     }
 
@@ -234,6 +249,12 @@ pub enum FoldError {
     ConsentStale { index: usize },
     /// A non-Add op carries consent fields it has no business carrying.
     StrayConsent { index: usize },
+    /// A non-Checkpoint op carries checkpoint fields it has no business carrying.
+    StrayCheckpoint { index: usize },
+    /// A Checkpoint with `k == 0` or an all-zero commit — structurally void.
+    CheckpointMalformed { index: usize },
+    /// A Checkpoint whose `k` is not exactly the previous checkpoint's `k + 1` (first is 1) — a skipped or replayed epoch index.
+    CheckpointOutOfSequence { index: usize },
     /// A Remove signed by anyone but the departing device itself — expulsion doesn't exist (self-signed departure only).
     RemoveNotSelfSigned { index: usize },
     /// An op carries a different `handle_proof` than the genesis — a spliced/transplanted chain.
@@ -266,6 +287,7 @@ impl MembershipBlob {
         }
         let mut members: Vec<[u8; 32]> = Vec::new();
         let mut expected_prev = [0u8; 32];
+        let mut last_ckpt_k = 0u64;
         let identity = self.ops[0].handle_proof;
 
         for (i, op) in self.ops.iter().enumerate() {
@@ -275,12 +297,15 @@ impl MembershipBlob {
             if op.prev_hash != expected_prev {
                 return Err(FoldError::BrokenChain { index: i });
             }
-            // Structural checks before the sig check: only genesis carries an identity binding, only Add carries consent (both are in signing_bytes, so a stray one would otherwise surface as a confusing BadSignature).
+            // Structural checks before the sig check: only genesis carries an identity binding, only Add carries consent, only Checkpoint carries the epoch triple (all are in signing_bytes, so a stray one would otherwise surface as a confusing BadSignature).
             if op.kind != OpKind::Genesis && (op.identity_pubkey != [0u8; 32] || !op.identity_sig.is_empty()) {
                 return Err(FoldError::StrayIdentityBinding { index: i });
             }
             if op.kind != OpKind::Add && (op.consent_t != 0 || !op.consent_sig.is_empty()) {
                 return Err(FoldError::StrayConsent { index: i });
+            }
+            if op.kind != OpKind::Checkpoint && (op.ckpt_k != 0 || op.ckpt_commit != [0u8; 32] || op.ckpt_fanout_epoch != 0) {
+                return Err(FoldError::StrayCheckpoint { index: i });
             }
             if !op.verify_sigs() {
                 return Err(FoldError::BadSignature { index: i });
@@ -329,6 +354,19 @@ impl MembershipBlob {
                     if members.len() == before {
                         return Err(FoldError::RemoveNonMember { index: i });
                     }
+                }
+                OpKind::Checkpoint => {
+                    // Membership is untouched; the op only pins the epoch spine, so the gates are: a current member signed it, the fields are non-void, and k advances by exactly one.
+                    if !members.contains(&op.signer_pubkey) {
+                        return Err(FoldError::SignerNotMember { index: i });
+                    }
+                    if op.ckpt_k == 0 || op.ckpt_commit == [0u8; 32] || op.device_pubkey != op.signer_pubkey {
+                        return Err(FoldError::CheckpointMalformed { index: i });
+                    }
+                    if op.ckpt_k != last_ckpt_k + 1 {
+                        return Err(FoldError::CheckpointOutOfSequence { index: i });
+                    }
+                    last_ckpt_k = op.ckpt_k;
                 }
             }
             expected_prev = op.chain_hash();
@@ -396,6 +434,7 @@ impl MembershipBlob {
             pk,
             Some(&identity_key),
             None,
+            None,
         );
         MembershipBlob { ops: vec![op] }
     }
@@ -413,6 +452,7 @@ impl MembershipBlob {
             device_key.public.to_bytes(),
             None,
             Some((consent_t, consent_sig)),
+            None,
         );
         self.ops.push(op);
     }
@@ -431,13 +471,38 @@ impl MembershipBlob {
             pk,
             None,
             None,
+            None,
         );
         self.ops.push(op);
     }
 
+    /// Append a Checkpoint: any current member pins epoch `k` with the settled-root commitment and the fan-out epoch it folds. Single winner per k by the same `extends()` forward-only discipline every append rides — a loser's push fails the extension check and it re-derives against the winner.
+    pub fn checkpoint(&mut self, device_key: &Keypair, eagle_time: i64, k: u64, commit: [u8; 32], fanout_epoch: u64) {
+        let hp = self.handle_proof().unwrap_or([0u8; 32]);
+        let pk = device_key.public.to_bytes();
+        let op = sign_op(
+            device_key,
+            hp,
+            self.head(),
+            OpKind::Checkpoint,
+            pk,
+            eagle_time,
+            pk,
+            None,
+            None,
+            Some((k, commit, fanout_epoch)),
+        );
+        self.ops.push(op);
+    }
+
+    /// The newest checkpoint's `(k, commit, fanout_epoch)`, or `None` if the chain has no checkpoint yet. Does no validation itself — callers fold first, which enforces sequencing and signatures.
+    pub fn latest_checkpoint(&self) -> Option<(u64, [u8; 32], u64)> {
+        self.ops.iter().rev().find(|op| op.kind == OpKind::Checkpoint).map(|op| (op.ckpt_k, op.ckpt_commit, op.ckpt_fanout_epoch))
+    }
+
     // ── VSF wire form: section "fleet" with one repeated "op" multi-value field per op (same shape as PhonebookResponse's "peer" fields, so the FGTW worker mirrors the parse with the existing pattern).
-    //    Positional op layout: hP(handle_proof) hb(prev) u(kind) ke(device) e6(time) ke(signer), then GENESIS-ONLY ke(identity_pubkey) ge(identity_sig), then ADD-ONLY e6(consent_t) ge(consent_sig), then (u scheme, ge sig) egg pairs to the end.
-    //    The identity/consent pairs are gated by kind (known at value index 2) and mutually exclusive, so no op carries waste and the egg tail stays unambiguous. Appending a PQ egg = two more trailing values; nothing before them moves. ──
+    //    Positional op layout: hP(handle_proof) hb(prev) u(kind) ke(device) e6(time) ke(signer), then GENESIS-ONLY ke(identity_pubkey) ge(identity_sig), then ADD-ONLY e6(consent_t) ge(consent_sig), then CHECKPOINT-ONLY u(k) hb(commit) u(fanout_epoch), then (u scheme, ge sig) egg pairs to the end.
+    //    The identity/consent/checkpoint groups are gated by kind (known at value index 2) and mutually exclusive, so no op carries waste and the egg tail stays unambiguous. Appending a PQ egg = two more trailing values; nothing before them moves. ──
 
     /// Encode to a complete VSF file (header + provenance + the "fleet" section). Network/disk transport.
     pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
@@ -458,6 +523,11 @@ impl MembershipBlob {
             if op.kind == OpKind::Add {
                 values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
                 values.push(VsfType::ge(op.consent_sig.clone()));
+            }
+            if op.kind == OpKind::Checkpoint {
+                values.push(VsfType::u(op.ckpt_k as usize, false));
+                values.push(VsfType::hb(op.ckpt_commit.to_vec()));
+                values.push(VsfType::u(op.ckpt_fanout_epoch as usize, false));
             }
             for egg in &op.sigs {
                 values.push(VsfType::u(egg.scheme as usize, false));
@@ -492,7 +562,7 @@ impl MembershipBlob {
     }
 }
 
-/// Build + sign one op. Each enabled scheme contributes an egg over the op's signing bytes; v1 = Ed25519. `consent` = the added device's `(t, binding-request signature)`, Add only.
+/// Build + sign one op. Each enabled scheme contributes an egg over the op's signing bytes; v1 = Ed25519. `consent` = the added device's `(t, binding-request signature)`, Add only. `checkpoint` = `(k, commit, fanout_epoch)`, Checkpoint only.
 #[allow(clippy::too_many_arguments)]
 fn sign_op(
     device_key: &Keypair,
@@ -504,10 +574,12 @@ fn sign_op(
     signer_pubkey: [u8; 32],
     identity: Option<&ed25519_dalek::SigningKey>,
     consent: Option<(i64, Vec<u8>)>,
+    checkpoint: Option<(u64, [u8; 32], u64)>,
 ) -> FleetOp {
     use ed25519_dalek::Signer;
     let identity_pubkey = identity.map(|k| k.verifying_key().to_bytes()).unwrap_or([0u8; 32]);
     let (consent_t, consent_sig) = consent.unwrap_or((0, Vec::new()));
+    let (ckpt_k, ckpt_commit, ckpt_fanout_epoch) = checkpoint.unwrap_or((0, [0u8; 32], 0));
     let mut op = FleetOp {
         handle_proof,
         prev_hash,
@@ -519,6 +591,9 @@ fn sign_op(
         identity_sig: Vec::new(),
         consent_t,
         consent_sig,
+        ckpt_k,
+        ckpt_commit,
+        ckpt_fanout_epoch,
         sigs: Vec::new(),
     };
     let msg = op.signing_bytes();
@@ -554,12 +629,15 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
     };
     let signer_pubkey = take_ke32(&values[5], "signer")?;
 
-    // GENESIS carries the identity binding (ke pubkey, ge sig), ADD carries the consent (e6 t, ge sig), each before the egg pairs; the pairs are kind-gated and mutually exclusive.
+    // GENESIS carries the identity binding (ke pubkey, ge sig), ADD carries the consent (e6 t, ge sig), CHECKPOINT carries the epoch triple (u k, hb commit, u fanout_epoch), each before the egg pairs; the groups are kind-gated and mutually exclusive.
     let mut i = 6;
     let mut identity_pubkey = [0u8; 32];
     let mut identity_sig = Vec::new();
     let mut consent_t = 0i64;
     let mut consent_sig = Vec::new();
+    let mut ckpt_k = 0u64;
+    let mut ckpt_commit = [0u8; 32];
+    let mut ckpt_fanout_epoch = 0u64;
     if kind == OpKind::Genesis {
         identity_pubkey = take_ke32(values.get(6).ok_or("fleet op: genesis missing identity pubkey")?, "identity")?;
         identity_sig = match values.get(7) {
@@ -578,6 +656,12 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
             _ => return Err("fleet op: add missing consent sig".into()),
         };
         i = 8;
+    }
+    if kind == OpKind::Checkpoint {
+        ckpt_k = take_u64(values.get(6).ok_or("fleet op: checkpoint missing k")?, "k")?;
+        ckpt_commit = take_hb32(values.get(7).ok_or("fleet op: checkpoint missing commit")?, "commit")?;
+        ckpt_fanout_epoch = take_u64(values.get(8).ok_or("fleet op: checkpoint missing fanout epoch")?, "fanout epoch")?;
+        i = 9;
     }
 
     // Remaining values are (scheme:u, sig:ge) egg pairs.
@@ -608,8 +692,21 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
         identity_sig,
         consent_t,
         consent_sig,
+        ckpt_k,
+        ckpt_commit,
+        ckpt_fanout_epoch,
         sigs,
     })
+}
+
+fn take_u64(v: &VsfType, what: &str) -> Result<u64, String> {
+    match v {
+        VsfType::u(n, false) => Ok(*n as u64),
+        other => {
+            use vsf::schema::FromVsfType;
+            u64::from_vsf_type(other).map_err(|_| format!("fleet op: bad {what} (u)"))
+        }
+    }
 }
 
 fn take_hp32(v: &VsfType, what: &str) -> Result<[u8; 32], String> {
@@ -727,7 +824,7 @@ mod tests {
         let (t, s) = consent_for(&b, 190);
         blob.add(&a, pk(&b), 200, t, s);
         // a tries to expel b — expulsion doesn't exist.
-        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), None, None);
+        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), None, None, None);
         blob.ops.push(expel);
         assert_eq!(blob.fold(), Err(FoldError::RemoveNotSelfSigned { index: 2 }));
     }
@@ -737,7 +834,7 @@ mod tests {
         let a = key(1);
         let b = key(2);
         // A genesis whose signer != device is forged.
-        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), None, None);
+        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), None, None, None);
         let blob = MembershipBlob { ops: vec![forged] };
         assert_eq!(blob.fold(), Err(FoldError::GenesisNotSelfSigned));
     }
@@ -758,7 +855,7 @@ mod tests {
         // Re-sign the tampered op correctly but leave its prev_hash stale → chain breaks instead.
         let a2 = key(1);
         let (t7, s7) = consent_for(&key(7), 190);
-        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), None, Some((t7, s7)));
+        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), None, Some((t7, s7)), None);
         assert_eq!(blob.fold(), Err(FoldError::BrokenChain { index: 1 }));
 
         // Swap the consent under the sponsor's egg — consent is in signing_bytes, so the egg breaks.
@@ -891,6 +988,106 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::StrayConsent { index: 2 }));
     }
 
+    /// The signature-stability guard for the Checkpoint flag-day: these bytes were generated by the PRE-checkpoint build (2026-08-12, before kind 3 existed). Genesis/Add/Remove signing bytes are kind-gated to exclude the checkpoint fields precisely so this chain — and every fleet chain deployed in the field — keeps verifying. If this test fails, deployed fleets brick on update.
+    #[test]
+    fn pinned_pre_checkpoint_chain_still_parses_and_folds() {
+        const PINNED_HEX: &str = "52c3853c7a330979330962337e6c3404136536237edeb2824c5c006870331f4d0baa0b8e1566fe11128f43a2a4e9483f82a5af4acd27a94e6df043bdc6a37f6862331f4f3f5a57908e2951a9b7d385510994b16ae44ba669157fc37af6b0d700a4f93b6e330128643305666c6565743a6f337e2c623403952c6e3303293e5b286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f00000000000000000000000000000000000000000000000000000000000000002c7533002c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000642c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c6b65331ffc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a272c6765333f39148ed5a51baf7f765600b277f8ac2fddf445b55ed8c261d3a8eca449a7286614d00939188337bd07f1248654b86bc5c6659f14f9d504ce0fc5fded4b3d30092c7533002c6765333feb2b722e7d441cec833a63f76026ae7aadb29316d0164bfb61d4c2f34866bf3a4e53c5c6d628f12f32613316cabece5e32a53c4b4ff3bb147ccecfd9cc2e580b29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f934c5a5c68855e63a020b9a8da384f37b3cb0ccf7d6a090c56130cbad4a90d912c7533012c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c653600000000000000c82c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000be2c6765333f0d5b6753187a455f5f2ae54016ecbc96b082e5d58f2bc768ebe6686baf21f18ad5527b359610eeda8ac917e04f4d92ddc242ed26bbd7bf4cb0f210e7ea292b082c7533002c6765333f1aa37898dea850c91e4c57c133fa3ef49f648f62b96d55b768adba460a463db2a031e1d92e1b923c2490e61ff237490227cc795ce61ae1969f7ee9a3047f240e29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331fbb1daf28635b791d0c66592c912d78bd71ade425974d947601464709b16c65712c7533022c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c6536000000000000012c2c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c7533002c6765333f75b772ee48e506047eca02a0db47b81d9bb708caa6478172a001eb5cbb8f3cee45de3fcc818477127f87142ced6f4c89fa008d3ca19aa4e4923347a3e7699b09295d";
+        let bytes: Vec<u8> = (0..PINNED_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PINNED_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        let blob = MembershipBlob::from_vsf_bytes(&bytes).expect("pre-checkpoint chain must parse");
+        // genesis a, add b, b departs → the live set is a alone, and the genesis identity binding still verifies.
+        let a = key(1);
+        assert_eq!(blob.fold().expect("pre-checkpoint chain must fold"), vec![pk(&a)]);
+        assert!(blob.genesis_identity_matches(&SEED));
+        assert_eq!(blob.latest_checkpoint(), None);
+    }
+
+    #[test]
+    fn checkpoint_folds_and_leaves_membership_untouched() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        blob.checkpoint(&b, 300, 1, [0x11; 32], 4);
+        blob.checkpoint(&a, 400, 2, [0x22; 32], 4);
+        assert_eq!(blob.fold().unwrap(), vec![pk(&a), pk(&b)]);
+        assert_eq!(blob.latest_checkpoint(), Some((2, [0x22; 32], 4)));
+        // Membership ops keep working after a checkpoint — the spine interleaves, never blocks.
+        blob.depart(&b, 500);
+        assert_eq!(blob.fold().unwrap(), vec![pk(&a)]);
+    }
+
+    #[test]
+    fn checkpoint_by_non_member_is_rejected() {
+        let a = key(1);
+        let stranger = key(9);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.checkpoint(&stranger, 200, 1, [0x11; 32], 1);
+        assert_eq!(blob.fold(), Err(FoldError::SignerNotMember { index: 1 }));
+    }
+
+    #[test]
+    fn checkpoint_sequence_must_advance_by_one() {
+        let a = key(1);
+        // First checkpoint must be k=1.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.checkpoint(&a, 200, 2, [0x11; 32], 1);
+        assert_eq!(blob.fold(), Err(FoldError::CheckpointOutOfSequence { index: 1 }));
+        // A skip after a valid one fails too.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.checkpoint(&a, 200, 1, [0x11; 32], 1);
+        blob.checkpoint(&a, 300, 3, [0x22; 32], 1);
+        assert_eq!(blob.fold(), Err(FoldError::CheckpointOutOfSequence { index: 2 }));
+        // As does a replayed index.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.checkpoint(&a, 200, 1, [0x11; 32], 1);
+        blob.checkpoint(&a, 300, 1, [0x22; 32], 1);
+        assert_eq!(blob.fold(), Err(FoldError::CheckpointOutOfSequence { index: 2 }));
+    }
+
+    #[test]
+    fn void_or_misattributed_checkpoint_is_rejected() {
+        let a = key(1);
+        // Zero commit is structurally void.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.checkpoint(&a, 200, 1, [0u8; 32], 1);
+        assert_eq!(blob.fold(), Err(FoldError::CheckpointMalformed { index: 1 }));
+        // A checkpoint whose device field names someone other than its signer is void (the minter speaks for itself only).
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let op = sign_op(&a, HP, blob.head(), OpKind::Checkpoint, pk(&key(7)), 200, pk(&a), None, None, Some((1, [0x11; 32], 1)));
+        blob.ops.push(op);
+        assert_eq!(blob.fold(), Err(FoldError::CheckpointMalformed { index: 1 }));
+    }
+
+    #[test]
+    fn stray_checkpoint_fields_are_rejected() {
+        // The checkpoint triple is kind-gated OUT of Add signing bytes (signature stability), so a bolted-on triple wouldn't break the egg — the structural gate is what rejects it.
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        blob.ops[1].ckpt_k = 1;
+        assert_eq!(blob.fold(), Err(FoldError::StrayCheckpoint { index: 1 }));
+    }
+
+    #[test]
+    fn checkpoint_round_trips_thru_vsf() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        blob.checkpoint(&b, 300, 1, [0x33; 32], 9);
+        let parsed = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(parsed, blob);
+        assert_eq!(parsed.fold().unwrap(), vec![pk(&a), pk(&b)]);
+        assert_eq!(parsed.latest_checkpoint(), Some((1, [0x33; 32], 9)));
+    }
+
     #[test]
     fn bindreq_verifies_both_signatures() {
         let device = key(6);
@@ -915,3 +1112,4 @@ mod tests {
         assert!(!stale.verify(&HP, &identity_pubkey));
     }
 }
+
