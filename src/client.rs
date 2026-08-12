@@ -163,6 +163,61 @@ pub fn ensure_member<T: FgtwTransport>(
     }
 }
 
+/// Append a Checkpoint op and publish it. The worker's forward-extension gate is the single-winner rule: a stale push means a sibling advanced the chain first, so refetch and adjudicate.
+/// `Ok(None)` = our op landed (we are the minter for `k`). `Ok(Some((k, commit, fanout_epoch)))` = a competing checkpoint at-or-past our k already rides the chain — the caller discards its candidate and adopts the winner's. `Err` = transport trouble, or a racing MEMBERSHIP op made the head stale — the caller re-arms on its next edge with a fresh fetch.
+pub fn push_checkpoint<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+    device_key: &Keypair,
+    k: u64,
+    commit: [u8; 32],
+    fanout_epoch: u64,
+) -> Result<Option<(u64, [u8; 32], u64)>, String> {
+    let me = device_key.public.to_bytes();
+    let mut blob = fetch(t, handle_proof)?.ok_or("no fleet chain to checkpoint")?;
+    let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+    if !members.contains(&me) {
+        return Err("this device is not a current member".into());
+    }
+    let latest = blob.latest_checkpoint();
+    if latest.map(|(lk, _, _)| lk).unwrap_or(0) + 1 != k {
+        // Someone already checkpointed at-or-past our k (or we skipped one) — the chain, not us, is the truth.
+        return Ok(latest);
+    }
+    blob.checkpoint(device_key, vsf::eagle_time_oscillations(), k, commit, fanout_epoch);
+    match publish(t, &blob) {
+        Ok(()) => Ok(None),
+        Err(e) if e == "fleet: stale" => {
+            let now = fetch(t, handle_proof)?.ok_or("fleet chain vanished during checkpoint race")?;
+            now.fold().map_err(|e| format!("raced fleet invalid: {e:?}"))?;
+            match now.latest_checkpoint() {
+                // A sibling's checkpoint won the slot — adopt theirs.
+                Some((wk, wc, wf)) if wk >= k => Ok(Some((wk, wc, wf))),
+                // A membership op raced us; our k may still be next — the caller re-derives against the new head and retries on its edge.
+                _ => Err("fleet: stale".into()),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// [`recover_fleet_key`], keeping the fan-out epoch alongside the key — the epoch spine folds the fleet key AND needs to name which one, so recovery callers that feed derivation want the pair.
+pub fn recover_fleet_key_with_epoch<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+    device_key: &Keypair,
+    pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
+) -> Result<Option<(u64, [u8; 32])>, String> {
+    match fetch_fanout(t, handle_proof) {
+        Ok(Some((epoch, rotator, wraps))) => Ok(pair_secret_for(&rotator).and_then(|ps| {
+            fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps).map(|k| (epoch, k))
+        })),
+        Ok(None) => Ok(None),
+        Err(e) if e.starts_with("fanout:") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The current device-pubkey member set (empty if no fleet yet).
 pub fn current_members<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Vec<[u8; 32]>, String> {
     match fetch(t, handle_proof)? {
