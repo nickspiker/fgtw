@@ -415,6 +415,48 @@ pub fn device_release<T: FgtwTransport>(
     Ok(())
 }
 
+/// Lock a device out of its fleet at the worker (treat-as-stolen): the worker writes a `device_lock/` entry and refuses that device at announce forever, surviving any wipe.
+/// `member_key` signs as a current fleet member — the worker folds the chain and rejects a non-member, so this can't lock a device outside the caller's own fleet.
+pub fn device_lock<T: FgtwTransport>(
+    t: &T,
+    member_key: &Keypair,
+    handle_proof: &[u8; 32],
+    locked_pubkey: &[u8; 32],
+) -> Result<(), String> {
+    let mut section = vsf::VsfSection::new("device_lock");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("ld", VsfType::ke(locked_pubkey.to_vec()));
+    let resp = signed_req(t, member_key, section, "device_lock")?;
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw device_lock {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
+}
+
+/// Unlock a device the fleet previously locked (the owner's deliberate reversal): the worker deletes the `device_lock/` entry so the device announces normally again.
+/// Same member-gated auth as `device_lock`; idempotent.
+pub fn device_unlock<T: FgtwTransport>(
+    t: &T,
+    member_key: &Keypair,
+    handle_proof: &[u8; 32],
+    locked_pubkey: &[u8; 32],
+) -> Result<(), String> {
+    let mut section = vsf::VsfSection::new("device_unlock");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("ld", VsfType::ke(locked_pubkey.to_vec()));
+    let resp = signed_req(t, member_key, section, "device_unlock")?;
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw device_unlock {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
+}
+
 /// EXISTING device: the pending binding requests for OUR fleet — the matcher's candidate set. Member-gated at the worker (signed envelope, signer must fold as a current member); every returned request is re-verified HERE too (freshness + both signatures against `Ed25519(identity_seed)`), so a compromised relay can inject nothing.
 pub fn bindreq_list<T: FgtwTransport>(
     t: &T,
