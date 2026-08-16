@@ -43,7 +43,10 @@ pub struct RosterEntry {
 // Version history (the bump is the flag-day: an old blob fails the read, the roster re-syncs from live contacts and the settings re-push — both are resyncable caches, so a bump costs one re-push).
 // v0 carried handle strings (and seeds in handle_hash); v2 added ceremony_owner + woven; v3 trust_level; v4 published_name; v5 dropped the never-used petname slot.
 // v6 retired the hand-rolled "PRST5"/"PSET0"/"PFST1" byte layouts: the plaintext is now a real VSF document and the version rides the spec's `z` type — no more ASCII digit welded into a magic tag (which also changed the tag's LENGTH at revision ten).
-const FSTATE_VERSION: usize = 6;
+// v7 types the settings VALUES: an entry's value is any VsfType, natively typed in the document (zoom is an f5, a lock is a ke, a timestamp is an e — vsfinfo reads the file, and so will whoever opens it in ten years), retiring the v(b'r') raw-blob wrapper. v6 docs still read (their values arrive AS v'r' and the typed getters carry legacy fallbacks); writers emit v7, so every push migrates.
+const FSTATE_VERSION: usize = 7;
+/// The oldest settings/roster version this reader still accepts — v6's only difference is raw-wrapped values, which decode into the same typed field.
+const FSTATE_VERSION_COMPAT: usize = 6;
 
 const ROSTER_SECTION: &str = "fleet_roster";
 const GLOBALS_SECTION: &str = "fleet_globals";
@@ -67,13 +70,13 @@ fn devices_schema() -> SectionSchema {
         .field("row", TypeConstraint::Any)
 }
 
-/// True when the section's `z` version is exactly ours. A mismatch reads as "not this format" — the flag-day rule, applied per section.
+/// True when the section's `z` version is ours or within the compat window (v6: raw-wrapped values, same structure otherwise). Anything else reads as "not this format" — the flag-day rule, applied per section.
 fn version_matches(section: &SectionBuilder) -> bool {
     section
         .get_fields("version")
         .first()
         .and_then(|f| f.values.first())
-        .map(|v| matches!(v, VsfType::z(n) if *n == FSTATE_VERSION))
+        .map(|v| matches!(v, VsfType::z(n) if *n == FSTATE_VERSION || *n == FSTATE_VERSION_COMPAT))
         .unwrap_or(false)
 }
 
@@ -164,11 +167,8 @@ fn get_key(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<
     }
 }
 
-fn get_raw(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<Vec<u8>> {
-    match m.get(name)? {
-        VsfType::v(marker, b) if *marker == b'r' => Some(b.clone()),
-        _ => None,
-    }
+fn get_value(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<VsfType> {
+    m.get(name).map(|v| (*v).clone())
 }
 
 fn roster_section_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -276,10 +276,11 @@ pub fn roster_from_bytes(bytes: &[u8]) -> Result<Vec<RosterEntry>, String> {
 }
 
 /// One fleet-GLOBAL setting: the value every linked device follows. `value` is a flattened VSF value (opaque to this codec — the app types it at the edges), so any spec type can ride without the codec knowing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SettingEntry {
     pub key: String,
-    pub value: Vec<u8>,
+    /// The value, natively typed (v7): an f5 zoom, a ke lock, an e timestamp, an x name. A v6 doc's value arrives as the legacy v(b'r', bytes) wrapper and re-encodes typed on the next write.
+    pub value: VsfType,
     /// Logical clock — the newest write across the fleet wins the merge.
     pub updated: i64,
     /// A deleted key stays as a tombstone so a stale device can't resurrect it.
@@ -287,16 +288,17 @@ pub struct SettingEntry {
 }
 
 /// One entry in a DEVICE's own settings map. `linked = true` (the birth default) means the device follows the global value for this key and local `value` is only the fallback; `linked = false` means this device set it locally and the global stops applying.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceSetting {
     pub key: String,
-    pub value: Vec<u8>,
+    /// Typed like [`SettingEntry::value`].
+    pub value: VsfType,
     pub updated: i64,
     pub linked: bool,
 }
 
 /// A device's settings map. Authored ONLY by that device (single-writer), so merge is newest-copy-wins on `updated` — no per-key CRDT needed. Membership (the fleet fold) is the authority on which devices exist; a removed device's map is dropped by the app at reconcile, not tombstoned here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceSettings {
     pub device_pubkey: [u8; 32],
     /// Stamp of the newest write in this map — the whole-map logical clock for newest-copy-wins.
@@ -305,7 +307,7 @@ pub struct DeviceSettings {
 }
 
 /// The full fleet-shared state: the roster plus the settings layers.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FleetState {
     pub roster: Vec<RosterEntry>,
     pub global_settings: Vec<SettingEntry>,
@@ -326,7 +328,7 @@ fn globals_section_bytes(global: &[SettingEntry]) -> Vec<u8> {
                     label("key"),
                     VsfType::d(e.key.clone()),
                     label("value"),
-                    VsfType::v(b'r', e.value.clone()),
+                    e.value.clone(),
                     label("updated"),
                     VsfType::e(EtType::e6(e.updated)),
                     label("tombstone"),
@@ -343,7 +345,7 @@ fn decode_globals_section(sec: &SectionBuilder) -> Vec<SettingEntry> {
     for row in sec.get_fields("setting") {
         let m = labeled_values(&row.values);
         let (Some(key), Some(value), Some(updated)) =
-            (get_key(&m, "key"), get_raw(&m, "value"), get_e6(&m, "updated"))
+            (get_key(&m, "key"), get_value(&m, "value"), get_e6(&m, "updated"))
         else {
             continue;
         };
@@ -385,7 +387,7 @@ fn devices_section_bytes(devices: &[DeviceSettings]) -> Vec<u8> {
                         label("key"),
                         VsfType::d(e.key.clone()),
                         label("value"),
-                        VsfType::v(b'r', e.value.clone()),
+                        e.value.clone(),
                         label("entry_updated"),
                         VsfType::e(EtType::e6(e.updated)),
                         label("linked"),
@@ -414,7 +416,7 @@ fn decode_devices_section(sec: &SectionBuilder) -> Vec<DeviceSettings> {
         };
         slot.updated = slot.updated.max(map_updated);
         if let (Some(key), Some(value), Some(entry_updated)) =
-            (get_key(&m, "key"), get_raw(&m, "value"), get_e6(&m, "entry_updated"))
+            (get_key(&m, "key"), get_value(&m, "value"), get_e6(&m, "entry_updated"))
         {
             let linked = get_u3(&m, "linked").unwrap_or(0) != 0;
             slot.entries.push(DeviceSetting { key, value, updated: entry_updated, linked });
@@ -529,7 +531,8 @@ pub fn merge_global_settings(a: Vec<SettingEntry>, b: Vec<SettingEntry>) -> Vec<
                 e.updated > cur.updated
                     || (e.updated == cur.updated
                         && (e.tombstone && !cur.tombstone
-                            || (e.tombstone == cur.tombstone && e.value > cur.value)))
+                            || (e.tombstone == cur.tombstone
+                                && e.value.flatten() > cur.value.flatten())))
             }
         };
         if replace {
@@ -542,11 +545,12 @@ pub fn merge_global_settings(a: Vec<SettingEntry>, b: Vec<SettingEntry>) -> Vec<
 }
 
 /// Canonical ordering key for a device map — entries sorted by field, for the deterministic tie-break below. (This replaced a serialized-bytes comparison: the document codec stamps a creation time, so its bytes are no longer a stable order.)
-fn device_map_canon(d: &DeviceSettings) -> Vec<(&str, &[u8], i64, bool)> {
+fn device_map_canon(d: &DeviceSettings) -> Vec<(&str, Vec<u8>, i64, bool)> {
     let mut rows: Vec<_> = d
         .entries
         .iter()
-        .map(|e| (e.key.as_str(), e.value.as_slice(), e.updated, e.linked))
+        // The typed value orders by its FLATTENED wire bytes — pure and identical on every device, which is all a tie-break needs.
+        .map(|e| (e.key.as_str(), e.value.flatten(), e.updated, e.linked))
         .collect();
     rows.sort();
     rows
@@ -624,10 +628,46 @@ mod tests {
 
     /// The version rides the document as a `z` field and gates the parse: a wrong version reads as absent, which upstream means "re-sync from live contacts" — the flag-day, without a length-changing ASCII tag.
     #[test]
+    fn a_v6_document_with_raw_wrapped_values_still_reads() {
+        // The typed-values migration (v7) must not orphan deployed settings: a v6 doc's v(b'r') values decode into the typed field AS the legacy wrapper — photon's getters carry per-key fallbacks — and the next write re-encodes them typed.
+        let sec = globals_schema()
+            .build()
+            .set("version", VsfType::z(FSTATE_VERSION_COMPAT))
+            .unwrap()
+            .append_multi(
+                "setting",
+                vec![
+                    label("key"),
+                    VsfType::d("display.zoom".into()),
+                    label("value"),
+                    VsfType::v(b'r', 0.75f32.to_le_bytes().to_vec()),
+                    label("updated"),
+                    VsfType::e(EtType::e6(100)),
+                    label("tombstone"),
+                    VsfType::u3(0),
+                ],
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+        let dev = devices_schema()
+            .build()
+            .set("version", VsfType::z(FSTATE_VERSION_COMPAT))
+            .unwrap()
+            .encode()
+            .unwrap();
+        let doc = document(vec![(GLOBALS_SECTION, sec), (DEVICES_SECTION, dev)]);
+        let (g, _) = settings_from_bytes(&doc).expect("a v6 settings doc must still read");
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].value, VsfType::v(b'r', 0.75f32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
     fn version_mismatch_reads_as_absent_roster() {
+        // v6 sits in the deliberate compat window (typed-values migration), so the mismatch probe sits BELOW it.
         let sec = roster_schema()
             .build()
-            .set("version", VsfType::z(FSTATE_VERSION - 1))
+            .set("version", VsfType::z(FSTATE_VERSION_COMPAT - 1))
             .unwrap()
             .encode()
             .unwrap();
@@ -696,7 +736,7 @@ mod tests {
                 GLOBALS_SECTION,
                 globals_section_bytes(&[SettingEntry {
                     key: "display.theme".into(),
-                    value: vec![7],
+                    value: VsfType::u3(7),
                     updated: 42,
                     tombstone: false,
                 }]),
@@ -731,7 +771,7 @@ mod tests {
     }
 
     fn setting(key: &str, value: &[u8], updated: i64, tombstone: bool) -> SettingEntry {
-        SettingEntry { key: key.to_string(), value: value.to_vec(), updated, tombstone }
+        SettingEntry { key: key.to_string(), value: VsfType::hR(value.to_vec()), updated, tombstone }
     }
 
     fn device_map(pk: u8, updated: i64, entries: Vec<DeviceSetting>) -> DeviceSettings {
@@ -739,7 +779,7 @@ mod tests {
     }
 
     fn dev_setting(key: &str, value: &[u8], updated: i64, linked: bool) -> DeviceSetting {
-        DeviceSetting { key: key.to_string(), value: value.to_vec(), updated, linked }
+        DeviceSetting { key: key.to_string(), value: VsfType::hR(value.to_vec()), updated, linked }
     }
 
     #[test]
@@ -783,7 +823,7 @@ mod tests {
         let ab = merge_global_settings(vec![old.clone()], vec![newer.clone()]);
         let ba = merge_global_settings(vec![newer.clone()], vec![old.clone()]);
         assert_eq!(ab, ba);
-        assert_eq!(ab[0].value, b"amber");
+        assert_eq!(ab[0].value, VsfType::hR(b"amber".to_vec()));
         // Tombstone wins an exact tie (delete beats concurrent write).
         let alive = setting("k", &[1], 200, false);
         let dead = setting("k", &[1], 200, true);
@@ -795,7 +835,7 @@ mod tests {
         let xy = merge_global_settings(vec![x.clone()], vec![y.clone()]);
         let yx = merge_global_settings(vec![y], vec![x]);
         assert_eq!(xy, yx);
-        assert_eq!(xy[0].value, vec![9]);
+        assert_eq!(xy[0].value, VsfType::hR(vec![9]));
     }
 
     #[test]
@@ -808,7 +848,7 @@ mod tests {
         assert_eq!(ab, ba);
         // Device 7 took the newer whole map (link bit + value together — never a cross-copy mix).
         let seven = ab.iter().find(|d| d.device_pubkey == [7; 32]).unwrap();
-        assert_eq!(seven.entries[0].value, vec![2]);
+        assert_eq!(seven.entries[0].value, VsfType::hR(vec![2]));
         assert!(!seven.entries[0].linked);
         // Device 8, absent from one side, survives the merge (offline device's map persists).
         assert!(ab.iter().any(|d| d.device_pubkey == [8; 32]));
