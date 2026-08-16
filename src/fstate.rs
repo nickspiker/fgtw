@@ -147,10 +147,8 @@ fn get_e6(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<i
 }
 
 fn get_u3(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<u8> {
-    match m.get(name)? {
-        VsfType::u3(t) => Some(*t),
-        _ => None,
-    }
+    // Width-agnostic on purpose: the writer emits u3 today, but the reader must not care which width (the key names the semantics — an exact-variant match dies the day the encoder's choice changes).
+    m.get(name)?.as_u64().and_then(|n| u8::try_from(n).ok())
 }
 
 fn get_text(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<String> {
