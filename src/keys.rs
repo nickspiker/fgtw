@@ -40,9 +40,10 @@ pub fn derive_device_keypair(fingerprint: &[u8]) -> Keypair {
     Keypair::from_seed(&seed)
 }
 
-/// The ONE canonical spelling of a handle, applied before EVERY derivation (handle proof + identity seed). ihi only does Unicode NFC, so without this the same handle typed with different case, spacing, or camelCase concatenation derives a DIFFERENT identity — the observed "double handle proof": one device attests `FractalDecoder`, another types `fractal decoder`, the probe finds no chain, and a second genesis forks the identity.
-/// Rules: split on whitespace AND lower→Upper camelCase boundaries, lowercase every word, join with single spaces. `"FractalDecoder"`, `" Fractal  Decoder "`, and `"fractal decoder"` all canonicalize to `"fractal decoder"`.
-pub fn canonical_handle(handle: &str) -> String {
+/// HANDLES ARE BYTE-PRECISE (Nick's rule, restored 2026-08-18 after the folding crept in against it): `Zeno` ≠ `zeno`, `"   "` is a literal handle, and the ONLY validation anywhere is non-empty. Every derivation hashes the raw typed string as VSF x text — case, spacing, tabs, all of it is the human's choice and the human's entropy. The old case/space/camelCase folding (justified by the "double handle proof" fork) is deleted: a mistyped handle surfaces as a FRESH identity behind the permanence interstitial — a loud, human-decidable moment — never a silent rewrite of their input.
+///
+/// MIGRATION-EXPIRES: v58 — identities attested while the folding was live are keyed to their FOLDED string (e.g. an identity always typed `Adam` lives under `adam`). Until every affected person has re-learned or re-attested, photon's fresh-claim screen carries a hint about the old folding; that hint (and this note) go when the marker does.
+pub fn legacy_folded_handle(handle: &str) -> String {
     let mut words: Vec<String> = Vec::new();
     for token in handle.split_whitespace() {
         let mut cur = String::new();
@@ -65,14 +66,13 @@ pub fn canonical_handle(handle: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The legacy folder still folds the way old builds did — it exists ONLY so the migration hint can name where a pre-2026-08-18 identity lives. It is NEVER applied to a derivation.
     #[test]
-    fn canonical_folds_case_spacing_and_camel() {
-        assert_eq!(canonical_handle("FractalDecoder"), "fractal decoder");
-        assert_eq!(canonical_handle(" Fractal  Decoder "), "fractal decoder");
-        assert_eq!(canonical_handle("fractal decoder"), "fractal decoder");
-        assert_eq!(canonical_handle("nem"), "nem");
-        // ALL-CAPS is a single word (no lower→Upper boundary), not per-letter splits.
-        assert_eq!(canonical_handle("NASA"), "nasa");
+    fn legacy_folder_reproduces_the_old_folding() {
+        assert_eq!(legacy_folded_handle("FractalDecoder"), "fractal decoder");
+        assert_eq!(legacy_folded_handle(" Fractal  Decoder "), "fractal decoder");
+        assert_eq!(legacy_folded_handle("Adam"), "adam");
+        assert_eq!(legacy_folded_handle("NASA"), "nasa");
     }
 
     #[test]
