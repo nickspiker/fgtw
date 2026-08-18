@@ -62,24 +62,30 @@ pub fn seal_slot(
     purpose: &[u8],
     contents: &SlotContents,
 ) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
+    use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305};
     let key = slot_key(kek_secret, purpose);
     let mut plain = [0u8; 64];
     plain[..32].copy_from_slice(&contents.blob_id);
     plain[32..].copy_from_slice(&contents.dek);
-    // Fixed nonce is safe because the key is unique per (reader secret, purpose) AND the plaintext is re-sealed only when the DEK changes — a rewrite under the same key carries the same 64 bytes, so no two distinct plaintexts ever share a nonce.
-    ChaCha20Poly1305::new((&key).into())
-        .encrypt((&[0u8; 12]).into(), plain.as_slice())
+    // Fixed nonce is safe because the key is unique per (reader secret, purpose) AND the plaintext is re-sealed only when the DEK changes — a rewrite under the same key carries the same 64 bytes, so no two distinct plaintexts ever share a nonce. XChaCha20 (24-byte zero nonce) since the 2026-08-18 migration; open_slot read-boths the legacy 12-byte ChaCha form.
+    XChaCha20Poly1305::new((&key).into())
+        .encrypt((&[0u8; 24]).into(), plain.as_slice())
         .map_err(|_| "scoped: slot seal failed".to_string())
 }
 
 /// Open our own slot. `None` when the bytes are not ours to read (wrong secret, wrong purpose, tampered, or an empty/absent slot).
 pub fn open_slot(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Option<SlotContents> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
     let key = slot_key(kek_secret, purpose);
-    let plain = ChaCha20Poly1305::new((&key).into())
-        .decrypt((&[0u8; 12]).into(), sealed)
-        .ok()?;
+    // Read-both: current XChaCha20 (24-byte zero nonce), then legacy ChaCha20 (12-byte zero nonce).
+    let plain = XChaCha20Poly1305::new((&key).into())
+        .decrypt((&[0u8; 24]).into(), sealed)
+        .ok()
+        .or_else(|| {
+            ChaCha20Poly1305::new((&key).into())
+                .decrypt((&[0u8; 12]).into(), sealed)
+                .ok()
+        })?;
     if plain.len() != 64 {
         return None;
     }
@@ -96,12 +102,13 @@ pub fn seal_value(
     purpose: &[u8],
     value: &[u8; 32],
 ) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
+    use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
     let key = slot_key(kek_secret, purpose);
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from(nonce_bytes);
+    // XChaCha20 + fresh 24-byte random nonce (2026-08-18 migration; open_value read-boths 12-byte legacy).
+    let nonce_bytes: [u8; 24] = rand::random();
+    let nonce = XNonce::from(nonce_bytes);
     let mut out = nonce_bytes.to_vec();
-    let ct = ChaCha20Poly1305::new((&key).into())
+    let ct = XChaCha20Poly1305::new((&key).into())
         .encrypt(&nonce, value.as_slice())
         .map_err(|_| "scoped: value seal failed".to_string())?;
     out.extend_from_slice(&ct);
@@ -110,26 +117,36 @@ pub fn seal_value(
 
 /// Open a value slot. `None` when the bytes are not ours (wrong secret, wrong purpose, tampered, absent).
 pub fn open_value(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Option<[u8; 32]> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
-    if sealed.len() < 12 {
-        return None;
-    }
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce};
     let key = slot_key(kek_secret, purpose);
-    let nonce = Nonce::from(<[u8; 12]>::try_from(&sealed[..12]).ok()?);
-    let plain = ChaCha20Poly1305::new((&key).into())
-        .decrypt(&nonce, &sealed[12..])
-        .ok()?;
+    // Read-both: current XChaCha20 ([nonce:24][ct]), then legacy ChaCha20 ([nonce:12][ct]).
+    let plain = if sealed.len() >= 24 + 16 {
+        XNonce::try_from(&sealed[..24])
+            .ok()
+            .and_then(|n| XChaCha20Poly1305::new((&key).into()).decrypt(&n, &sealed[24..]).ok())
+    } else {
+        None
+    };
+    let plain = plain.or_else(|| {
+        if sealed.len() < 12 + 16 {
+            return None;
+        }
+        let n = Nonce::from(<[u8; 12]>::try_from(&sealed[..12]).ok()?);
+        ChaCha20Poly1305::new((&key).into())
+            .decrypt(&n, &sealed[12..])
+            .ok()
+    })?;
     <[u8; 32]>::try_from(plain.as_slice()).ok()
 }
 
 /// Encrypt the content once under the DEK. The blob id is bound in, so a ciphertext cannot be swapped between addresses while still opening.
 pub fn seal_content(dek: &[u8; 32], blob_id: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
-    // Fresh random nonce per seal, prefixed to the ciphertext — the same construction kete uses for vault blobs. A fixed nonce would be wrong here: unlike a slot, the content changes under a key that may be reused across a rewrite.
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from(nonce_bytes);
+    use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
+    // Fresh random 24-byte nonce per seal, prefixed to the ciphertext — the same construction kete uses for vault blobs (XChaCha20 since the 2026-08-18 migration; open_content read-boths 12-byte legacy). A fixed nonce would be wrong here: unlike a slot, the content changes under a key that may be reused across a rewrite.
+    let nonce_bytes: [u8; 24] = rand::random();
+    let nonce = XNonce::from(nonce_bytes);
     let mut out = nonce_bytes.to_vec();
-    let ct = ChaCha20Poly1305::new((dek).into())
+    let ct = XChaCha20Poly1305::new((dek).into())
         .encrypt(
             &nonce,
             chacha20poly1305::aead::Payload {
@@ -144,8 +161,22 @@ pub fn seal_content(dek: &[u8; 32], blob_id: &[u8; 32], plaintext: &[u8]) -> Res
 
 /// Decrypt content fetched from `blob_id`. `None` if the key is wrong, the bytes were tampered with, or the object was served from a different address than the one it was sealed for.
 pub fn open_content(dek: &[u8; 32], blob_id: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
-    if sealed.len() < 12 {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce};
+    // Read-both: current XChaCha20 ([nonce:24][ct], blob_id AAD), then legacy ChaCha20 ([nonce:12][ct]).
+    if sealed.len() >= 24 + 16 {
+        if let Ok(n) = XNonce::try_from(&sealed[..24]) {
+            if let Ok(pt) = XChaCha20Poly1305::new((dek).into()).decrypt(
+                &n,
+                chacha20poly1305::aead::Payload {
+                    msg: &sealed[24..],
+                    aad: blob_id,
+                },
+            ) {
+                return Some(pt);
+            }
+        }
+    }
+    if sealed.len() < 12 + 16 {
         return None;
     }
     let (nonce_bytes, ct) = sealed.split_at(12);
@@ -200,6 +231,49 @@ mod tests {
 
     fn secret(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    /// Legacy 12-byte-nonce ChaCha20 blobs (slot, value, content) must still open — the read-both
+    /// migration path. Each is synthesized directly under the same derived key the new sealer uses.
+    #[test]
+    fn opens_legacy_12byte_nonce_formats() {
+        use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
+        let kek = secret(1);
+        let dek = new_dek();
+        let blob_id = new_blob_id();
+
+        // slot: fixed [0;12] nonce, no prefix.
+        let contents = SlotContents { blob_id, dek };
+        let mut plain = [0u8; 64];
+        plain[..32].copy_from_slice(&blob_id);
+        plain[32..].copy_from_slice(&dek);
+        let legacy_slot = ChaCha20Poly1305::new((&slot_key(&kek, b"avatar")).into())
+            .encrypt((&[0u8; 12]).into(), plain.as_slice())
+            .unwrap();
+        assert_eq!(open_slot(&kek, b"avatar", &legacy_slot).unwrap(), contents);
+
+        // value: [nonce:12][ct].
+        let value = [0x9au8; 32];
+        let n = [0x11u8; 12];
+        let ct = ChaCha20Poly1305::new((&slot_key(&kek, b"fleetkey")).into())
+            .encrypt(&Nonce::from(n), value.as_slice())
+            .unwrap();
+        let mut legacy_value = n.to_vec();
+        legacy_value.extend_from_slice(&ct);
+        assert_eq!(open_value(&kek, b"fleetkey", &legacy_value).unwrap(), value);
+
+        // content: [nonce:12][ct] with blob_id AAD.
+        let content = b"pre-migration pixels";
+        let n2 = [0x22u8; 12];
+        let ct2 = ChaCha20Poly1305::new((&dek).into())
+            .encrypt(
+                &Nonce::from(n2),
+                chacha20poly1305::aead::Payload { msg: content, aad: &blob_id },
+            )
+            .unwrap();
+        let mut legacy_content = n2.to_vec();
+        legacy_content.extend_from_slice(&ct2);
+        assert_eq!(open_content(&dek, &blob_id, &legacy_content).unwrap(), content);
     }
 
     /// The round trip every reader performs: find my slot, unwrap the key, open the one shared ciphertext.

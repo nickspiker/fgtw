@@ -76,7 +76,7 @@ pub fn fanout_seal(
     rotator_ed: &[u8; 32],
     members: &[([u8; 32], [u8; 32])],
 ) -> Result<Vec<FanoutWrap>, String> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
+    use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305};
     use x25519_dalek::{PublicKey as XPublic, StaticSecret};
     let mut wraps = Vec::with_capacity(members.len());
     for (member_ed, pair_secret) in members {
@@ -101,8 +101,11 @@ pub fn fanout_seal(
             &recipient_xpk,
             pair_secret,
         );
-        let ct = ChaCha20Poly1305::new((&ak).into())
-            .encrypt((&[0u8; 12]).into(), fleet_key.as_slice())
+        // XChaCha20-Poly1305 with a fixed 24-byte zero nonce — safe because `ak` is unique per wrap
+        // (fresh ephemeral epk per member), so no nonce is ever reused across distinct plaintexts
+        // (2026-08-18 migration; fanout_open read-boths the legacy 12-byte-nonce ChaCha wraps).
+        let ct = XChaCha20Poly1305::new((&ak).into())
+            .encrypt((&[0u8; 24]).into(), fleet_key.as_slice())
             .map_err(|_| "fanout: seal failed".to_string())?;
         wraps.push(FanoutWrap { epk, commit, ct });
     }
@@ -118,7 +121,7 @@ pub fn fanout_open(
     device_key: &Keypair,
     pair_secret: &[u8; 32],
 ) -> Option<[u8; 32]> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
     use x25519_dalek::{PublicKey as XPublic, StaticSecret};
     let my_xsk = StaticSecret::from(device_key.secret.to_scalar_bytes());
     let my_xpk = device_key.public.to_montgomery().to_bytes();
@@ -144,9 +147,16 @@ pub fn fanout_open(
         if commit != w.commit {
             continue;
         }
-        if let Ok(pt) = ChaCha20Poly1305::new((&ak).into())
-            .decrypt((&[0u8; 12]).into(), w.ct.as_slice())
-        {
+        // Read-both: current XChaCha20 (24-byte zero nonce), then legacy ChaCha20 (12-byte zero nonce).
+        let pt = XChaCha20Poly1305::new((&ak).into())
+            .decrypt((&[0u8; 24]).into(), w.ct.as_slice())
+            .ok()
+            .or_else(|| {
+                ChaCha20Poly1305::new((&ak).into())
+                    .decrypt((&[0u8; 12]).into(), w.ct.as_slice())
+                    .ok()
+            });
+        if let Some(pt) = pt {
             if let Ok(k) = <[u8; 32]>::try_from(pt.as_slice()) {
                 return Some(k);
             }
