@@ -132,14 +132,14 @@ pub struct BindRequest {
     pub t: i64,
     /// The device key's signature over [`bindreq_signing_bytes`] — the consent (becomes `consent_sig`).
     pub device_sig: Vec<u8>,
-    /// `Ed25519(identity_seed)`'s signature over the same bytes — the registry write gate (only the handle's owner can enter the set). Checked against the chain's genesis identity pubkey; never enters the chain itself.
+    /// `Ed25519(identity_seed)`'s signature over the same bytes — an ANTI-SPAM gate on the pending-request slot: posting requires knowing the handle STRING, which `handle_proof` (public, it is the slot key) does not. NOTE: this is NOT "only the owner can enter the set" — `identity_seed = BLAKE3(handle)` is public-derivable, and entering the member set still requires a member sponsor's Add. Checked against the chain's genesis identity pubkey; never enters the chain itself. See docs/fleet-identity-remediation.md.
     pub identity_sig: Vec<u8>,
     /// NFC instant-add commitment: `pair::nfc_secret_hash(S, device_pubkey, t)` where `S` is the 32-byte random secret the joiner serves over the NFC tap. All-zero = no NFC offered. DELIBERATELY OUTSIDE `bindreq_signing_bytes` — those bytes are the chain's consent verification forever (every future fold re-checks consent_sig against them), so a new field there is a protocol-wide flag-day; the binding lives inside the keyed hash instead (recomputed per candidate with ITS pubkey+t), so a tampered/transplanted hash simply never matches — fail-closed, never wrong-device.
     pub nfc_hash: [u8; 32],
 }
 
 impl BindRequest {
-    /// Verify both signatures against this fleet: the device's own consent, and the identity co-signature under `identity_pubkey` (the genesis key). The worker gates writes with this; the old device re-checks at list time.
+    /// Verify both signatures: the device's own consent, and the identity co-signature under `identity_pubkey`. NOTE: the identity co-signature is a handle-knowledge ANTI-SPAM gate, NOT an ownership/membership gate (see the `identity_sig` field doc and docs/fleet-identity-remediation.md). The worker screens writes with this; the old device re-checks at list time. Actual membership still requires a member sponsor's Add.
     pub fn verify(&self, handle_proof: &[u8; 32], identity_pubkey: &[u8; 32]) -> bool {
         let msg = bindreq_signing_bytes(handle_proof, &self.device_pubkey, self.t);
         verify_ed25519(&self.device_pubkey, &msg, &self.device_sig)
@@ -184,7 +184,7 @@ impl FleetOp {
     }
 
     /// Verify the GENESIS identity binding: `identity_sig` is a valid signature over [`FleetOp::signing_bytes`] by `identity_pubkey`.
-    /// This proves the founder held `identity_seed` (the handle's secret preimage); a peer who knows the handle additionally checks `identity_pubkey == Ed25519(identity_seed)` via [`MembershipBlob::genesis_identity_matches`].
+    /// NOTE: `identity_seed = BLAKE3(handle)` is a PUBLIC function of the handle, so this binding proves only that the signer KNEW the handle string — NOT that they own it (anyone who knows the handle reproduces `Ed25519(identity_seed)`). It is not an ownership proof. Real identity assurance is the TOFU genesis-hash pin plus device-secret-gated membership; see docs/fleet-identity-remediation.md.
     fn verify_identity_binding(&self) -> bool {
         self.identity_pubkey != [0u8; 32]
             && self.identity_sig.len() == 64
@@ -318,8 +318,12 @@ impl MembershipBlob {
                     if op.signer_pubkey != op.device_pubkey {
                         return Err(FoldError::GenesisNotSelfSigned);
                     }
-                    // The genesis MUST be co-signed by the identity key — this is the link that closes the chain onto the handle's owner.
-                    if !op.verify_identity_binding() {
+                    // Genesis must carry an identity_pubkey (both v1 and v2 set it — the bindreq anti-spam gate keys off it).
+                    if op.identity_pubkey == [0u8; 32] {
+                        return Err(FoldError::BadIdentityBinding);
+                    }
+                    // v1 genesis carries the identity self-cosignature; verify it WHEN PRESENT. v2 genesis (docs/identity-succession.md) omits it (empty identity_sig) and is accepted — the binding only ever proved handle-string knowledge, never ownership (docs/fleet-identity-remediation.md). A non-empty but INVALID sig stays a hard reject (a corrupt v1 op).
+                    if !op.identity_sig.is_empty() && !op.verify_identity_binding() {
                         return Err(FoldError::BadIdentityBinding);
                     }
                     members.push(op.device_pubkey);
@@ -401,8 +405,8 @@ impl MembershipBlob {
         prior.ops.len() <= self.ops.len() && self.ops[..prior.ops.len()] == prior.ops[..]
     }
 
-    /// Peer check: does the genesis identity key match `Ed25519(identity_seed)` — the key a contact derives from the handle?
-    /// `fold()` already proves the genesis is self-consistently identity-signed; this additionally proves it's THIS handle's owner, so a contact who knows your handle can't be fooled by a squatted fleet under your `handle_proof`.
+    /// Does the genesis identity key equal `Ed25519(identity_seed)`, the canonical key derived from the handle?
+    /// NOTE: since `identity_seed = BLAKE3(handle)` is public, a squatter who knows the handle uses the SAME canonical key and passes this too — so it is NOT proof against a squatted fleet, only a check that the founder used the canonical derivation (a weak integrity signal). Retained as a utility; production trust decisions use `genesis_handle_proof` + the TOFU genesis-hash pin instead. See docs/fleet-identity-remediation.md.
     pub fn genesis_identity_matches(&self, identity_seed: &[u8; 32]) -> bool {
         let expect = ed25519_dalek::SigningKey::from_bytes(identity_seed).verifying_key().to_bytes();
         self.ops.first().map(|op| op.identity_pubkey == expect).unwrap_or(false)
@@ -413,9 +417,14 @@ impl MembershipBlob {
         self.ops.first().map(|op| op.identity_pubkey)
     }
 
+    /// The genesis op's `handle_proof` — the slot this chain claims. A caller that fetched by a known `handle_proof` compares against this to reject a relay that swapped in a structurally-valid chain from a DIFFERENT slot (the probe-time TOCTOU). `handle_proof` is public (it IS the slot key), so this is a slot-consistency check, NOT an ownership proof.
+    pub fn genesis_handle_proof(&self) -> Option<[u8; 32]> {
+        self.ops.first().map(|op| op.handle_proof)
+    }
+
     // ── builders (sign with the local device key; the device is the only thing that can authorise) ──
 
-    /// Start a brand-new fleet: the founding device self-signs itself in, bound to `handle_proof`, and the identity key `Ed25519(identity_seed)` co-signs to prove the founder owns the handle. Both ownerships are already present, so genesis needs no separate consent.
+    /// Start a brand-new fleet: the founding device self-signs itself in, bound to `handle_proof`, and the identity key `Ed25519(identity_seed)` co-signs. NOTE: `identity_seed = BLAKE3(handle)` is public, so the co-signature proves only knowledge of the handle string, NOT ownership (see docs/fleet-identity-remediation.md); it is retained for wire compatibility. The real binding is the device self-signature over `handle_proof`, and founding already requires producing the memory-hard `handle_proof`. Genesis needs no separate consent: the founding device is both the subject and the sole authoriser.
     pub fn genesis(
         device_key: &Keypair,
         handle_proof: [u8; 32],
@@ -432,7 +441,34 @@ impl MembershipBlob {
             pk,
             eagle_time,
             pk,
+            identity_key.verifying_key().to_bytes(),
             Some(&identity_key),
+            None,
+            None,
+        );
+        MembershipBlob { ops: vec![op] }
+    }
+
+    /// Start a brand-new **v2** fleet (docs/identity-succession.md): identical to [`genesis`] except the genesis carries NO `identity_sig` — only the `identity_pubkey` the bindreq anti-spam gate keys off. The inert self-cosignature (which proved only handle-string knowledge, never ownership — docs/fleet-identity-remediation.md) is gone from the wire. `signing_bytes` is unchanged (the device egg still commits to `identity_pubkey`), and `chain_hash` naturally excludes the now-empty `identity_sig` (blake3 over zero bytes is a no-op), so a v2 genesis links exactly like a v1 one minus that field. `fold` accepts it. This is what new fleets found under.
+    pub fn genesis_v2(
+        device_key: &Keypair,
+        handle_proof: [u8; 32],
+        identity_seed: &[u8; 32],
+        eagle_time: i64,
+    ) -> Self {
+        let pk = device_key.public.to_bytes();
+        let identity_pubkey =
+            ed25519_dalek::SigningKey::from_bytes(identity_seed).verifying_key().to_bytes();
+        let op = sign_op(
+            device_key,
+            handle_proof,
+            [0u8; 32],
+            OpKind::Genesis,
+            pk,
+            eagle_time,
+            pk,
+            identity_pubkey,
+            None, // v2: embed the pubkey, do NOT sign the inert identity_sig
             None,
             None,
         );
@@ -450,6 +486,7 @@ impl MembershipBlob {
             new_device,
             eagle_time,
             device_key.public.to_bytes(),
+            [0u8; 32],
             None,
             Some((consent_t, consent_sig)),
             None,
@@ -469,6 +506,7 @@ impl MembershipBlob {
             pk,
             eagle_time,
             pk,
+            [0u8; 32],
             None,
             None,
             None,
@@ -488,6 +526,7 @@ impl MembershipBlob {
             pk,
             eagle_time,
             pk,
+            [0u8; 32],
             None,
             None,
             Some((k, commit, fanout_epoch)),
@@ -508,32 +547,7 @@ impl MembershipBlob {
     pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
         let mut section = vsf::VsfSection::new("fleet");
         for op in &self.ops {
-            let mut values = vec![
-                VsfType::hP(op.handle_proof.to_vec()),
-                VsfType::hb(op.prev_hash.to_vec()),
-                VsfType::u(op.kind as usize, false),
-                VsfType::ke(op.device_pubkey.to_vec()),
-                VsfType::e(vsf::types::EtType::e6(op.eagle_time)),
-                VsfType::ke(op.signer_pubkey.to_vec()),
-            ];
-            if op.kind == OpKind::Genesis {
-                values.push(VsfType::ke(op.identity_pubkey.to_vec()));
-                values.push(VsfType::ge(op.identity_sig.clone()));
-            }
-            if op.kind == OpKind::Add {
-                values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
-                values.push(VsfType::ge(op.consent_sig.clone()));
-            }
-            if op.kind == OpKind::Checkpoint {
-                values.push(VsfType::u(op.ckpt_k as usize, false));
-                values.push(VsfType::hb(op.ckpt_commit.to_vec()));
-                values.push(VsfType::u(op.ckpt_fanout_epoch as usize, false));
-            }
-            for egg in &op.sigs {
-                values.push(VsfType::u(egg.scheme as usize, false));
-                values.push(VsfType::ge(egg.sig.clone()));
-            }
-            section.add_field_multi("op", values);
+            section.add_field_multi("op", op_field_values(op));
         }
         // Default build carries hp + hb — a provenance-only doc is unverifiable under read_verified, and from_vsf_bytes below refuses to parse one.
         vsf::VsfBuilder::new()
@@ -562,6 +576,176 @@ impl MembershipBlob {
     }
 }
 
+// ───────────────────────────── Identity succession ─────────────────────────────
+// docs/identity-succession.md. A re-founded identity proves continuity with its predecessor so a
+// contact who pinned the OLD genesis auto-migrates the pin — no delete-and-re-add. The trust anchor
+// is a DEVICE KEY of the old chain (a fingerprint-oracle secret, never handle-derived), so it is
+// unforgeable by anyone who merely knows the (public) handle.
+
+/// Domain tag so a continuity signature can never be confused with a fleet-op or bindreq signature.
+pub const SUCCESSION_DOMAIN: &[u8] = b"PHOTON_SUCCESSION_v1";
+
+/// The exact bytes a continuity egg signs: "the chain at `handle_proof` moves from `old_genesis_hash`
+/// to `new_genesis_hash`". `handle_proof` is stable across a re-found (same handle → same proof).
+pub fn succession_signing_bytes(
+    handle_proof: &[u8; 32],
+    old_genesis_hash: &[u8; 32],
+    new_genesis_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(SUCCESSION_DOMAIN.len() + 96);
+    v.extend_from_slice(SUCCESSION_DOMAIN);
+    v.extend_from_slice(handle_proof);
+    v.extend_from_slice(old_genesis_hash);
+    v.extend_from_slice(new_genesis_hash);
+    v
+}
+
+/// One re-founding device's signature vouching for the successor. `device_pubkey` must be a member of
+/// the PREDECESSOR chain — that is what the verifier checks it against.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContinuityEgg {
+    pub device_pubkey: [u8; 32],
+    pub scheme: u8,
+    pub sig: Vec<u8>,
+}
+
+/// A self-contained proof that the new chain (`new_genesis_hash`) succeeds the embedded `predecessor`,
+/// vouched by one or more predecessor-member devices. Published once per re-found; a contact holding
+/// the predecessor's genesis-hash pin verifies it and migrates the pin. See docs/identity-succession.md.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SuccessorRecord {
+    pub handle_proof: [u8; 32],
+    pub new_genesis_hash: [u8; 32],
+    pub predecessor: MembershipBlob,
+    pub continuity_eggs: Vec<ContinuityEgg>,
+}
+
+impl SuccessorRecord {
+    /// Build a successor: each device in `signers` (members of BOTH the old and new chains) signs a
+    /// continuity egg over `(handle_proof, predecessor.genesis_hash, new_genesis_hash)`. Signing with
+    /// every current device maximises the chance a contact matches one against the predecessor set.
+    pub fn new(
+        predecessor: MembershipBlob,
+        new_genesis_hash: [u8; 32],
+        handle_proof: [u8; 32],
+        signers: &[&Keypair],
+    ) -> Result<Self, String> {
+        use ed25519_dalek::Signer;
+        let old_gh = predecessor.genesis_hash().ok_or("predecessor has no genesis")?;
+        let msg = succession_signing_bytes(&handle_proof, &old_gh, &new_genesis_hash);
+        let continuity_eggs = signers
+            .iter()
+            .map(|kp| ContinuityEgg {
+                device_pubkey: kp.public.to_bytes(),
+                scheme: scheme::ED25519,
+                sig: kp.secret.sign(&msg).to_bytes().to_vec(),
+            })
+            .collect();
+        Ok(Self { handle_proof, new_genesis_hash, predecessor, continuity_eggs })
+    }
+
+    /// Contact-side verification. `pinned_genesis` is the genesis hash the contact currently trusts for
+    /// this identity. On `Ok`, the caller migrates its pin to `new_genesis_hash` (adopting the new
+    /// chain's fold, fetched separately, after confirming its genesis hash equals `new_genesis_hash`).
+    ///
+    /// Proves: (1) the predecessor folds, (2) it hashes to the CURRENT pin (monotonic — succeed only
+    /// FROM where the contact is, so a replay can't walk them backward), (3) it is for this
+    /// `handle_proof`, and (4) at least one continuity egg is signed by a PREDECESSOR MEMBER over the
+    /// exact transition. (4) is load-bearing: only a holder of an old-chain device secret can produce
+    /// it, so a handle-only attacker cannot forge a re-pin.
+    pub fn verify_for_pin(&self, pinned_genesis: &[u8; 32]) -> Result<(), String> {
+        let pred_members = self
+            .predecessor
+            .fold()
+            .map_err(|e| format!("successor predecessor invalid: {e:?}"))?;
+        let old_gh = self.predecessor.genesis_hash().ok_or("successor predecessor has no genesis")?;
+        if &old_gh != pinned_genesis {
+            return Err("successor predecessor does not match the pinned genesis".into());
+        }
+        if self.predecessor.genesis_handle_proof() != Some(self.handle_proof) {
+            return Err("successor handle_proof does not match its predecessor".into());
+        }
+        let msg = succession_signing_bytes(&self.handle_proof, &old_gh, &self.new_genesis_hash);
+        let vouched = self.continuity_eggs.iter().any(|egg| {
+            pred_members.contains(&egg.device_pubkey)
+                && egg.scheme == scheme::ED25519
+                && verify_ed25519(&egg.device_pubkey, &msg, &egg.sig)
+        });
+        if !vouched {
+            return Err("no valid continuity egg from a predecessor member".into());
+        }
+        Ok(())
+    }
+
+    /// Encode to a complete VSF file — section "succession": `hp`, `new`, the predecessor's `op` fields
+    /// verbatim (reusing the fleet op codec), and one `cegg` field `[ke device, u scheme, ge sig]` per egg.
+    pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut section = vsf::VsfSection::new("succession");
+        section.add_field("hp", VsfType::hP(self.handle_proof.to_vec()));
+        section.add_field("new", VsfType::hb(self.new_genesis_hash.to_vec()));
+        for op in &self.predecessor.ops {
+            section.add_field_multi("op", op_field_values(op));
+        }
+        for egg in &self.continuity_eggs {
+            section.add_field_multi(
+                "cegg",
+                vec![
+                    VsfType::ke(egg.device_pubkey.to_vec()),
+                    VsfType::u(egg.scheme as usize, false),
+                    VsfType::ge(egg.sig.clone()),
+                ],
+            );
+        }
+        vsf::VsfBuilder::new()
+            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .add_section_direct(section)
+            .build()
+            .map_err(|e| format!("succession to_vsf: {e}"))
+    }
+
+    /// Parse from a complete VSF file. Structural only — [`verify_for_pin`] does the cryptographic checks.
+    pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let (header, header_end) = vsf::verification::read_verified(bytes, None)
+            .map_err(|e| format!("succession verification: {e}"))?;
+        let section = header
+            .primary_section(bytes, header_end)
+            .map_err(|e| format!("succession section: {e}"))?;
+        let handle_proof = take_hp32(
+            section.get_field("hp").and_then(|f| f.values.first()).ok_or("succession: missing hp")?,
+            "hp",
+        )?;
+        let new_genesis_hash = take_hb32(
+            section.get_field("new").and_then(|f| f.values.first()).ok_or("succession: missing new")?,
+            "new",
+        )?;
+        let mut predecessor = MembershipBlob::default();
+        for field in section.get_fields("op") {
+            predecessor.ops.push(parse_op(&field.values)?);
+        }
+        let mut continuity_eggs = Vec::new();
+        for field in section.get_fields("cegg") {
+            let v = &field.values;
+            let device_pubkey = take_ke32(v.first().ok_or("cegg: missing device")?, "cegg device")?;
+            // Same fallback as the egg-tail scheme decode: the codec may round-trip a small `u` as a
+            // narrower type, so accept `u(_, false)` OR anything `u8::from_vsf_type` can read.
+            let scheme = match v.get(1) {
+                Some(VsfType::u(s, false)) => *s as u8,
+                Some(other) => {
+                    use vsf::schema::FromVsfType;
+                    u8::from_vsf_type(other).map_err(|_| "cegg: bad scheme".to_string())?
+                }
+                None => return Err("cegg: missing scheme".into()),
+            };
+            let sig = match v.get(2) {
+                Some(VsfType::ge(s)) => s.clone(),
+                _ => return Err("cegg: bad sig".into()),
+            };
+            continuity_eggs.push(ContinuityEgg { device_pubkey, scheme, sig });
+        }
+        Ok(Self { handle_proof, new_genesis_hash, predecessor, continuity_eggs })
+    }
+}
+
 /// Build + sign one op. Each enabled scheme contributes an egg over the op's signing bytes; v1 = Ed25519. `consent` = the added device's `(t, binding-request signature)`, Add only. `checkpoint` = `(k, commit, fanout_epoch)`, Checkpoint only.
 #[allow(clippy::too_many_arguments)]
 fn sign_op(
@@ -572,12 +756,13 @@ fn sign_op(
     device_pubkey: [u8; 32],
     eagle_time: i64,
     signer_pubkey: [u8; 32],
-    identity: Option<&ed25519_dalek::SigningKey>,
+    // GENESIS identity binding: `identity_pubkey` is the canonical `Ed25519(identity_seed)` embedded in the op (and in signing_bytes, so the device egg commits to it — the bindreq anti-spam gate keys off it). `identity_signer` is Some ONLY for a v1 genesis, where it also produces the `identity_sig` self-cosignature; a v2 genesis passes the pubkey with `None` (empty identity_sig, docs/identity-succession.md); non-genesis ops pass `[0;32]` + `None`.
+    identity_pubkey: [u8; 32],
+    identity_signer: Option<&ed25519_dalek::SigningKey>,
     consent: Option<(i64, Vec<u8>)>,
     checkpoint: Option<(u64, [u8; 32], u64)>,
 ) -> FleetOp {
     use ed25519_dalek::Signer;
-    let identity_pubkey = identity.map(|k| k.verifying_key().to_bytes()).unwrap_or([0u8; 32]);
     let (consent_t, consent_sig) = consent.unwrap_or((0, Vec::new()));
     let (ckpt_k, ckpt_commit, ckpt_fanout_epoch) = checkpoint.unwrap_or((0, [0u8; 32], 0));
     let mut op = FleetOp {
@@ -601,10 +786,44 @@ fn sign_op(
         scheme: scheme::ED25519,
         sig: device_key.secret.sign(&msg).to_bytes().to_vec(),
     });
-    if let Some(idk) = identity {
+    if let Some(idk) = identity_signer {
         op.identity_sig = idk.sign(&msg).to_bytes().to_vec();
     }
     op
+}
+
+/// Encode one op to its positional "op" field values (the exact layout [`parse_op`] reads). Shared by
+/// the fleet chain codec and the succession record (which embeds a predecessor chain's ops verbatim).
+fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
+    let mut values = vec![
+        VsfType::hP(op.handle_proof.to_vec()),
+        VsfType::hb(op.prev_hash.to_vec()),
+        VsfType::u(op.kind as usize, false),
+        VsfType::ke(op.device_pubkey.to_vec()),
+        VsfType::e(vsf::types::EtType::e6(op.eagle_time)),
+        VsfType::ke(op.signer_pubkey.to_vec()),
+    ];
+    if op.kind == OpKind::Genesis {
+        values.push(VsfType::ke(op.identity_pubkey.to_vec()));
+        // v1 carries the identity self-cosignature; v2 (docs/identity-succession.md) OMITS it. The `ge` type stores `len-1`, so a zero-length value is unrepresentable — we don't emit it. The egg tail always begins with a `u` scheme (never a `ge`), so the parser discriminates the two layouts by type at this position.
+        if !op.identity_sig.is_empty() {
+            values.push(VsfType::ge(op.identity_sig.clone()));
+        }
+    }
+    if op.kind == OpKind::Add {
+        values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
+        values.push(VsfType::ge(op.consent_sig.clone()));
+    }
+    if op.kind == OpKind::Checkpoint {
+        values.push(VsfType::u(op.ckpt_k as usize, false));
+        values.push(VsfType::hb(op.ckpt_commit.to_vec()));
+        values.push(VsfType::u(op.ckpt_fanout_epoch as usize, false));
+    }
+    for egg in &op.sigs {
+        values.push(VsfType::u(egg.scheme as usize, false));
+        values.push(VsfType::ge(egg.sig.clone()));
+    }
+    values
 }
 
 /// Decode one positional "op" field's values back into a [`FleetOp`].
@@ -640,11 +859,16 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
     let mut ckpt_fanout_epoch = 0u64;
     if kind == OpKind::Genesis {
         identity_pubkey = take_ke32(values.get(6).ok_or("fleet op: genesis missing identity pubkey")?, "identity")?;
-        identity_sig = match values.get(7) {
-            Some(VsfType::ge(s)) => s.clone(),
-            _ => return Err("fleet op: genesis missing identity sig".into()),
-        };
-        i = 8;
+        // v1 genesis carries a `ge(identity_sig)` at position 7; v2 (docs/identity-succession.md) omits it. Discriminate by TYPE: a `ge` here is the v1 sig (egg tail begins at 8); anything else is the egg tail itself (v2, identity_sig empty, tail begins at 7). The egg tail always starts with a `u` scheme, never a `ge`, so this is unambiguous, and a genesis always carries at least the device egg so position 7 is never past the end.
+        match values.get(7) {
+            Some(VsfType::ge(s)) => {
+                identity_sig = s.clone();
+                i = 8;
+            }
+            _ => {
+                i = 7;
+            }
+        }
     }
     if kind == OpKind::Add {
         consent_t = match values.get(6) {
@@ -824,7 +1048,7 @@ mod tests {
         let (t, s) = consent_for(&b, 190);
         blob.add(&a, pk(&b), 200, t, s);
         // a tries to expel b — expulsion doesn't exist.
-        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), None, None, None);
+        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), [0u8; 32], None, None, None);
         blob.ops.push(expel);
         assert_eq!(blob.fold(), Err(FoldError::RemoveNotSelfSigned { index: 2 }));
     }
@@ -834,7 +1058,7 @@ mod tests {
         let a = key(1);
         let b = key(2);
         // A genesis whose signer != device is forged.
-        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), None, None, None);
+        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), [0u8; 32], None, None, None);
         let blob = MembershipBlob { ops: vec![forged] };
         assert_eq!(blob.fold(), Err(FoldError::GenesisNotSelfSigned));
     }
@@ -855,7 +1079,7 @@ mod tests {
         // Re-sign the tampered op correctly but leave its prev_hash stale → chain breaks instead.
         let a2 = key(1);
         let (t7, s7) = consent_for(&key(7), 190);
-        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), None, Some((t7, s7)), None);
+        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), [0u8; 32], None, Some((t7, s7)), None);
         assert_eq!(blob.fold(), Err(FoldError::BrokenChain { index: 1 }));
 
         // Swap the consent under the sponsor's egg — consent is in signing_bytes, so the egg breaks.
@@ -948,6 +1172,147 @@ mod tests {
         // The binding survives the VSF round-trip.
         let parsed = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
         assert!(parsed.fold().is_ok() && parsed.genesis_identity_matches(&SEED));
+    }
+
+    #[test]
+    fn genesis_handle_proof_returns_the_claimed_slot() {
+        // The accessor the anti-swap check (`current_members_verified`) reads: a chain's genesis handle_proof IS the slot it claims. A fetch-by-HP compares against this to reject a relay serving a chain from a different slot.
+        let a = key(1);
+        let blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        assert_eq!(blob.genesis_handle_proof(), Some(HP));
+        // A chain founded at a DIFFERENT slot reports that different proof → the `!= Some(queried)` check fires.
+        let other_hp = [0x55u8; 32];
+        let foreign = MembershipBlob::genesis(&a, other_hp, &SEED, 100);
+        assert_eq!(foreign.genesis_handle_proof(), Some(other_hp));
+        assert_ne!(foreign.genesis_handle_proof(), Some(HP));
+        // Empty blob claims no slot.
+        assert_eq!(MembershipBlob::default().genesis_handle_proof(), None);
+        // Survives the VSF round-trip.
+        let parsed = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.genesis_handle_proof(), Some(HP));
+    }
+
+    #[test]
+    fn v2_genesis_folds_omits_sig_keeps_pubkey() {
+        let a = key(1);
+        let blob = MembershipBlob::genesis_v2(&a, HP, &SEED, 100);
+        // Folds like any genesis.
+        assert_eq!(blob.fold().unwrap(), vec![pk(&a)]);
+        // The inert self-cosignature is gone from the wire…
+        assert!(blob.ops[0].identity_sig.is_empty(), "v2 genesis carries no identity_sig");
+        // …but the pubkey the bindreq gate keys off is still there (canonical Ed25519(seed)).
+        let expect = ed25519_dalek::SigningKey::from_bytes(&SEED).verifying_key().to_bytes();
+        assert_eq!(blob.ops[0].identity_pubkey, expect);
+        assert_eq!(blob.genesis_identity_pubkey(), Some(expect));
+    }
+
+    #[test]
+    fn v2_genesis_round_trips_through_vsf() {
+        // The load-bearing serialization check: an EMPTY `ge(identity_sig)` must survive encode→parse
+        // at its position, or the egg tail would misalign. If this passes, the empty-value discriminant holds.
+        let a = key(1);
+        let blob = MembershipBlob::genesis_v2(&a, HP, &SEED, 100);
+        let parsed = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.fold().unwrap(), vec![pk(&a)]);
+        assert!(parsed.ops[0].identity_sig.is_empty(), "empty identity_sig round-trips as empty");
+        assert_eq!(parsed.ops[0].identity_pubkey, blob.ops[0].identity_pubkey);
+        // The parsed op equals the original field-for-field ⇒ the egg tail parsed at the right offset.
+        // (Raw bytes differ only by the non-deterministic document creation timestamp, so compare the op.)
+        assert_eq!(parsed.ops[0], blob.ops[0]);
+    }
+
+    #[test]
+    fn v2_genesis_then_adds_fold_and_link() {
+        // Chain linkage THROUGH a v2 genesis: prev_hash chains off the v2 genesis's chain_hash,
+        // so if the v2 hash computation were wrong the Adds wouldn't link.
+        let a = key(1);
+        let b = key(2);
+        let c = key(3);
+        let mut blob = MembershipBlob::genesis_v2(&a, HP, &SEED, 100);
+        let (t1, s1) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t1, s1);
+        let (t2, s2) = consent_for(&c, 290);
+        blob.add(&b, pk(&c), 300, t2, s2);
+        assert_eq!(blob.fold().unwrap(), vec![pk(&a), pk(&b), pk(&c)]);
+        // And the whole multi-op v2 chain survives the codec.
+        let parsed = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.fold().unwrap(), vec![pk(&a), pk(&b), pk(&c)]);
+    }
+
+    #[test]
+    fn genesis_without_identity_pubkey_is_rejected() {
+        // A genesis validly device-signed but carrying NO identity_pubkey (degenerate) — the bindreq gate
+        // would have no key, so fold refuses it. Built via sign_op directly (no public builder makes one).
+        let a = key(1);
+        let op = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&a), 100, pk(&a), [0u8; 32], None, None, None);
+        let blob = MembershipBlob { ops: vec![op] };
+        assert_eq!(blob.fold(), Err(FoldError::BadIdentityBinding));
+    }
+
+    // ── Identity succession ──
+
+    /// A predecessor (v1) chain, a new v2 chain (re-found), and a successor vouched by an old-chain device.
+    fn succession_fixture() -> (MembershipBlob, [u8; 32], SuccessorRecord, Keypair) {
+        let a = key(1); // a device of the OLD fleet (the continuity signer)
+        let predecessor = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let old_gh = predecessor.genesis_hash().unwrap();
+        let new_device = key(9);
+        let new_chain = MembershipBlob::genesis_v2(&new_device, HP, &SEED, 500);
+        let new_gh = new_chain.genesis_hash().unwrap();
+        let record = SuccessorRecord::new(predecessor.clone(), new_gh, HP, &[&a]).unwrap();
+        (predecessor, old_gh, record, a)
+    }
+
+    #[test]
+    fn succession_round_trips_through_vsf() {
+        let (_pred, _old_gh, record, _a) = succession_fixture();
+        let parsed = SuccessorRecord::from_vsf_bytes(&record.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn contact_auto_repins_on_valid_succession() {
+        let (_pred, old_gh, record, _a) = succession_fixture();
+        // The contact pins old_gh; the successor is vouched by a predecessor member → migrate ok.
+        assert!(record.verify_for_pin(&old_gh).is_ok());
+        // Survives the codec too (what a contact actually fetches).
+        let parsed = SuccessorRecord::from_vsf_bytes(&record.to_vsf_bytes().unwrap()).unwrap();
+        assert!(parsed.verify_for_pin(&old_gh).is_ok());
+    }
+
+    #[test]
+    fn succession_rejected_without_old_member_egg() {
+        // The attacker case: a successor whose continuity egg is signed by a device NOT in the
+        // predecessor's member set. Knowing the (public) handle does not grant an old device secret.
+        let a = key(1);
+        let predecessor = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let old_gh = predecessor.genesis_hash().unwrap();
+        let new_gh = MembershipBlob::genesis_v2(&key(9), HP, &SEED, 500).genesis_hash().unwrap();
+        let stranger = key(42); // not a member of `predecessor`
+        let forged = SuccessorRecord::new(predecessor, new_gh, HP, &[&stranger]).unwrap();
+        assert!(forged.verify_for_pin(&old_gh).is_err());
+    }
+
+    #[test]
+    fn succession_predecessor_must_match_pin() {
+        let (_pred, _old_gh, record, _a) = succession_fixture();
+        // A contact pinned to a DIFFERENT genesis must not be re-pinned by this successor.
+        assert!(record.verify_for_pin(&[0x77; 32]).is_err());
+    }
+
+    #[test]
+    fn succession_handle_proof_must_match_predecessor() {
+        let (_pred, old_gh, mut record, _a) = succession_fixture();
+        record.handle_proof = [0x55; 32]; // predecessor is for HP, not this
+        assert!(record.verify_for_pin(&old_gh).is_err());
+    }
+
+    #[test]
+    fn succession_is_monotonic() {
+        let (_pred, _old_gh, record, _a) = succession_fixture();
+        // Once the contact has migrated to new_genesis_hash, replaying the same record (whose
+        // predecessor is the OLD chain) can't walk them back — its predecessor ≠ the new pin.
+        assert!(record.verify_for_pin(&record.new_genesis_hash).is_err());
     }
 
     #[test]
@@ -1057,7 +1422,7 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::CheckpointMalformed { index: 1 }));
         // A checkpoint whose device field names someone other than its signer is void (the minter speaks for itself only).
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        let op = sign_op(&a, HP, blob.head(), OpKind::Checkpoint, pk(&key(7)), 200, pk(&a), None, None, Some((1, [0x11; 32], 1)));
+        let op = sign_op(&a, HP, blob.head(), OpKind::Checkpoint, pk(&key(7)), 200, pk(&a), [0u8; 32], None, None, Some((1, [0x11; 32], 1)));
         blob.ops.push(op);
         assert_eq!(blob.fold(), Err(FoldError::CheckpointMalformed { index: 1 }));
     }
