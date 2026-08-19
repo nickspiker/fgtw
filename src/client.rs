@@ -5,7 +5,9 @@
 //! So photon rides its warm-TLS connection pool and its own error-message UX, the calendar can use a different HTTP client, and this crate stays reqwest-free.
 
 use crate::fanout::{fanout_from_bytes, fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
-use crate::fleet::{bindreq_signing_bytes, et_to_osc, BindRequest, MembershipBlob, BINDREQ_FRESH_OSC};
+use crate::fleet::{
+    bindreq_signing_bytes, et_to_osc, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
+};
 use crate::fstate::{fstate_from_bytes, fstate_to_bytes, FleetState};
 use crate::keys::Keypair;
 use vsf::VsfType;
@@ -104,6 +106,39 @@ pub fn publish<T: FgtwTransport>(t: &T, blob: &MembershipBlob) -> Result<(), Str
     }
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw fleet_put {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
+}
+
+/// Fetch the succession record for a handle (docs/identity-succession.md), or `None` if none is published. Read-only; a contact then runs `SuccessorRecord::verify_for_pin` against its own pin — the worker does NOT verify continuity, only slot storage.
+pub fn fetch_successor<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<SuccessorRecord>, String> {
+    let mut section = vsf::VsfSection::new("succession_get");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    let resp = t.post(unsigned_req(section)?)?;
+    if is_error(&resp.body, "not_found") {
+        return Ok(None);
+    }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw succession_get {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(Some(SuccessorRecord::from_vsf_bytes(&resp.body)?))
+}
+
+/// Publish a succession record. MEMBER-GATED: `device_key` must fold as a member of the CURRENT chain at `record.handle_proof` — the worker checks the write signature against that chain. The record's continuity eggs are what a contact later verifies; this write signature only authorises the write (stops a stranger squatting the slot). Idempotent: a member may overwrite.
+pub fn publish_successor<T: FgtwTransport>(
+    t: &T,
+    device_key: &Keypair,
+    record: &SuccessorRecord,
+) -> Result<(), String> {
+    let resp = signed_req(t, device_key, record.to_section(), "succession_put")?;
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw succession_put {reason}: {detail}"));
     }
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));

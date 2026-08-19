@@ -666,8 +666,8 @@ impl SuccessorRecord {
         Ok(())
     }
 
-    /// Encode to a complete VSF file — section "succession": `hp`, `new`, the predecessor's `op` fields verbatim (reusing the fleet op codec), and one `cegg` field `[ke device, u scheme, ge sig]` per egg.
-    pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
+    /// The "succession" section: `hp`, `new`, the predecessor's `op` fields verbatim (reusing the fleet op codec), and one `cegg` field `[ke device, u scheme, ge sig]` per egg. Exposed so the member-gated publish can wrap it in a device-signed envelope.
+    pub fn to_section(&self) -> vsf::VsfSection {
         let mut section = vsf::VsfSection::new("succession");
         section.add_field("hp", VsfType::hP(self.handle_proof.to_vec()));
         section.add_field("new", VsfType::hb(self.new_genesis_hash.to_vec()));
@@ -684,9 +684,14 @@ impl SuccessorRecord {
                 ],
             );
         }
+        section
+    }
+
+    /// Encode to a complete (unsigned) VSF file — the form served from the succession slot and re-parsed by a contact.
+    pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
         vsf::VsfBuilder::new()
             .creation_time_oscillations(vsf::eagle_time_oscillations())
-            .add_section_direct(section)
+            .add_section_direct(self.to_section())
             .build()
             .map_err(|e| format!("succession to_vsf: {e}"))
     }
