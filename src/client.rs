@@ -141,8 +141,9 @@ pub fn ensure_member<T: FgtwTransport>(
             Err(_) => {} // fold-dead v0 chain — flag-day supersession, genesis below
         }
     }
+    // New fleets found under v2 (no inert identity_sig; docs/identity-succession.md). Existing v1 chains still fold via the retained v1 path.
     let blob =
-        MembershipBlob::genesis(device_key, *handle_proof, identity_seed, vsf::eagle_time_oscillations());
+        MembershipBlob::genesis_v2(device_key, *handle_proof, identity_seed, vsf::eagle_time_oscillations());
     // A rejected publish is NOT fatal by itself (a racing sibling may have won the slot), but it must not vanish either — the refetch below adjudicates, and the publish error rides along if that also comes up empty.
     let publish_err = publish(t, &blob).err();
     // Trust the network, not ourselves: re-fetch the canonical chain and accept ONLY if it names this device. The fleet slot has no compare-and-set, so two devices racing a fresh handle's genesis both "publish" but the slot settles on ONE — the loser re-reads here, finds it isn't a member, and fails cleanly instead of announcing as a phantom founder.
@@ -226,17 +227,16 @@ pub fn current_members<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Resu
     }
 }
 
-/// The current device-pubkey member set for OUR OWN fleet, refusing any chain whose genesis is not co-signed by `Ed25519(identity_seed)`. `fold()` proves the chain is internally consistent; only this check pins it to OUR identity — without it, a relay that served the real chain once can swap in a structurally-valid foreign chain later (the probe-time-only TOCTOU). Every own-fleet fetch that feeds a trust decision (join loop, bind polling, fanout recovery) belongs here; `current_members` stays for CONTACT chains, where the peer-side genesis check lives in the caller.
+/// The current device-pubkey member set for OUR OWN fleet, refusing any chain whose genesis `handle_proof` is not the slot we queried. `fold()` proves the chain is internally consistent; this pins it to the slot we asked for — without it, a relay that served the real chain once can swap in a structurally-valid chain from a DIFFERENT slot later (the probe-time-only TOCTOU). `handle_proof` is public (it IS the slot key), so this is a slot-consistency check, NOT an ownership proof — identity is handle-derived and cannot be proven owned; see docs/fleet-identity-remediation.md. Every own-fleet fetch that feeds a trust decision (join loop, bind polling, fanout recovery) belongs here; `current_members` stays for CONTACT chains, where the peer-side genesis-hash pin lives in the caller.
 pub fn current_members_verified<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-    identity_seed: &[u8; 32],
 ) -> Result<Vec<[u8; 32]>, String> {
     match fetch(t, handle_proof)? {
         Some(b) => {
             let members = b.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
-            if !b.genesis_identity_matches(identity_seed) {
-                return Err("fleet chain is not rooted in this identity — refusing it".into());
+            if b.genesis_handle_proof() != Some(*handle_proof) {
+                return Err("fleet chain is not for this handle_proof slot — refusing it".into());
             }
             Ok(members)
         }
