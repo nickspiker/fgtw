@@ -233,8 +233,7 @@ mod tests {
         [b; 32]
     }
 
-    /// Legacy 12-byte-nonce ChaCha20 blobs (slot, value, content) must still open — the read-both
-    /// migration path. Each is synthesized directly under the same derived key the new sealer uses.
+    /// Legacy 12-byte-nonce ChaCha20 blobs (slot, value, content) must still open — the read-both migration path. Each is synthesized directly under the same derived key the new sealer uses.
     #[test]
     fn opens_legacy_12byte_nonce_formats() {
         use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};

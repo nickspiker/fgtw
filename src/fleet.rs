@@ -577,10 +577,7 @@ impl MembershipBlob {
 }
 
 // ───────────────────────────── Identity succession ─────────────────────────────
-// docs/identity-succession.md. A re-founded identity proves continuity with its predecessor so a
-// contact who pinned the OLD genesis auto-migrates the pin — no delete-and-re-add. The trust anchor
-// is a DEVICE KEY of the old chain (a fingerprint-oracle secret, never handle-derived), so it is
-// unforgeable by anyone who merely knows the (public) handle.
+// docs/identity-succession.md. A re-founded identity proves continuity with its predecessor so a contact who pinned the OLD genesis auto-migrates the pin — no delete-and-re-add. The trust anchor is a DEVICE KEY of the old chain (a fingerprint-oracle secret, never handle-derived), so it is unforgeable by anyone who merely knows the (public) handle.
 
 /// Domain tag so a continuity signature can never be confused with a fleet-op or bindreq signature.
 pub const SUCCESSION_DOMAIN: &[u8] = b"PHOTON_SUCCESSION_v1";
@@ -600,8 +597,7 @@ pub fn succession_signing_bytes(
     v
 }
 
-/// One re-founding device's signature vouching for the successor. `device_pubkey` must be a member of
-/// the PREDECESSOR chain — that is what the verifier checks it against.
+/// One re-founding device's signature vouching for the successor. `device_pubkey` must be a member of the PREDECESSOR chain — that is what the verifier checks it against.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContinuityEgg {
     pub device_pubkey: [u8; 32],
@@ -610,8 +606,7 @@ pub struct ContinuityEgg {
 }
 
 /// A self-contained proof that the new chain (`new_genesis_hash`) succeeds the embedded `predecessor`,
-/// vouched by one or more predecessor-member devices. Published once per re-found; a contact holding
-/// the predecessor's genesis-hash pin verifies it and migrates the pin. See docs/identity-succession.md.
+/// vouched by one or more predecessor-member devices. Published once per re-found; a contact holding the predecessor's genesis-hash pin verifies it and migrates the pin. See docs/identity-succession.md.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SuccessorRecord {
     pub handle_proof: [u8; 32],
@@ -621,9 +616,7 @@ pub struct SuccessorRecord {
 }
 
 impl SuccessorRecord {
-    /// Build a successor: each device in `signers` (members of BOTH the old and new chains) signs a
-    /// continuity egg over `(handle_proof, predecessor.genesis_hash, new_genesis_hash)`. Signing with
-    /// every current device maximises the chance a contact matches one against the predecessor set.
+    /// Build a successor: each device in `signers` (members of BOTH the old and new chains) signs a continuity egg over `(handle_proof, predecessor.genesis_hash, new_genesis_hash)`. Signing with every current device maximises the chance a contact matches one against the predecessor set.
     pub fn new(
         predecessor: MembershipBlob,
         new_genesis_hash: [u8; 32],
@@ -644,15 +637,11 @@ impl SuccessorRecord {
         Ok(Self { handle_proof, new_genesis_hash, predecessor, continuity_eggs })
     }
 
-    /// Contact-side verification. `pinned_genesis` is the genesis hash the contact currently trusts for
-    /// this identity. On `Ok`, the caller migrates its pin to `new_genesis_hash` (adopting the new
-    /// chain's fold, fetched separately, after confirming its genesis hash equals `new_genesis_hash`).
+    /// Contact-side verification. `pinned_genesis` is the genesis hash the contact currently trusts for this identity. On `Ok`, the caller migrates its pin to `new_genesis_hash` (adopting the new chain's fold, fetched separately, after confirming its genesis hash equals `new_genesis_hash`).
     ///
     /// Proves: (1) the predecessor folds, (2) it hashes to the CURRENT pin (monotonic — succeed only
     /// FROM where the contact is, so a replay can't walk them backward), (3) it is for this
-    /// `handle_proof`, and (4) at least one continuity egg is signed by a PREDECESSOR MEMBER over the
-    /// exact transition. (4) is load-bearing: only a holder of an old-chain device secret can produce
-    /// it, so a handle-only attacker cannot forge a re-pin.
+    /// `handle_proof`, and (4) at least one continuity egg is signed by a PREDECESSOR MEMBER over the exact transition. (4) is load-bearing: only a holder of an old-chain device secret can produce it, so a handle-only attacker cannot forge a re-pin.
     pub fn verify_for_pin(&self, pinned_genesis: &[u8; 32]) -> Result<(), String> {
         let pred_members = self
             .predecessor
@@ -677,8 +666,7 @@ impl SuccessorRecord {
         Ok(())
     }
 
-    /// Encode to a complete VSF file — section "succession": `hp`, `new`, the predecessor's `op` fields
-    /// verbatim (reusing the fleet op codec), and one `cegg` field `[ke device, u scheme, ge sig]` per egg.
+    /// Encode to a complete VSF file — section "succession": `hp`, `new`, the predecessor's `op` fields verbatim (reusing the fleet op codec), and one `cegg` field `[ke device, u scheme, ge sig]` per egg.
     pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
         let mut section = vsf::VsfSection::new("succession");
         section.add_field("hp", VsfType::hP(self.handle_proof.to_vec()));
@@ -726,8 +714,7 @@ impl SuccessorRecord {
         for field in section.get_fields("cegg") {
             let v = &field.values;
             let device_pubkey = take_ke32(v.first().ok_or("cegg: missing device")?, "cegg device")?;
-            // Same fallback as the egg-tail scheme decode: the codec may round-trip a small `u` as a
-            // narrower type, so accept `u(_, false)` OR anything `u8::from_vsf_type` can read.
+            // Same fallback as the egg-tail scheme decode: the codec may round-trip a small `u` as a narrower type, so accept `u(_, false)` OR anything `u8::from_vsf_type` can read.
             let scheme = match v.get(1) {
                 Some(VsfType::u(s, false)) => *s as u8,
                 Some(other) => {
@@ -792,8 +779,7 @@ fn sign_op(
     op
 }
 
-/// Encode one op to its positional "op" field values (the exact layout [`parse_op`] reads). Shared by
-/// the fleet chain codec and the succession record (which embeds a predecessor chain's ops verbatim).
+/// Encode one op to its positional "op" field values (the exact layout [`parse_op`] reads). Shared by the fleet chain codec and the succession record (which embeds a predecessor chain's ops verbatim).
 fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
     let mut values = vec![
         VsfType::hP(op.handle_proof.to_vec()),
@@ -1208,8 +1194,7 @@ mod tests {
 
     #[test]
     fn v2_genesis_round_trips_through_vsf() {
-        // The load-bearing serialization check: an EMPTY `ge(identity_sig)` must survive encode→parse
-        // at its position, or the egg tail would misalign. If this passes, the empty-value discriminant holds.
+        // The load-bearing serialization check: an EMPTY `ge(identity_sig)` must survive encode→parse at its position, or the egg tail would misalign. If this passes, the empty-value discriminant holds.
         let a = key(1);
         let blob = MembershipBlob::genesis_v2(&a, HP, &SEED, 100);
         let parsed = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
@@ -1241,8 +1226,7 @@ mod tests {
 
     #[test]
     fn genesis_without_identity_pubkey_is_rejected() {
-        // A genesis validly device-signed but carrying NO identity_pubkey (degenerate) — the bindreq gate
-        // would have no key, so fold refuses it. Built via sign_op directly (no public builder makes one).
+        // A genesis validly device-signed but carrying NO identity_pubkey (degenerate) — the bindreq gate would have no key, so fold refuses it. Built via sign_op directly (no public builder makes one).
         let a = key(1);
         let op = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&a), 100, pk(&a), [0u8; 32], None, None, None);
         let blob = MembershipBlob { ops: vec![op] };
@@ -1282,8 +1266,7 @@ mod tests {
 
     #[test]
     fn succession_rejected_without_old_member_egg() {
-        // The attacker case: a successor whose continuity egg is signed by a device NOT in the
-        // predecessor's member set. Knowing the (public) handle does not grant an old device secret.
+        // The attacker case: a successor whose continuity egg is signed by a device NOT in the predecessor's member set. Knowing the (public) handle does not grant an old device secret.
         let a = key(1);
         let predecessor = MembershipBlob::genesis(&a, HP, &SEED, 100);
         let old_gh = predecessor.genesis_hash().unwrap();
@@ -1310,8 +1293,7 @@ mod tests {
     #[test]
     fn succession_is_monotonic() {
         let (_pred, _old_gh, record, _a) = succession_fixture();
-        // Once the contact has migrated to new_genesis_hash, replaying the same record (whose
-        // predecessor is the OLD chain) can't walk them back — its predecessor ≠ the new pin.
+        // Once the contact has migrated to new_genesis_hash, replaying the same record (whose predecessor is the OLD chain) can't walk them back — its predecessor ≠ the new pin.
         assert!(record.verify_for_pin(&record.new_genesis_hash).is_err());
     }
 
