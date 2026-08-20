@@ -686,6 +686,7 @@ pub fn recover_fleet_key<T: FgtwTransport>(
 }
 
 /// Recover the current fleet key, or ESTABLISH revision 1 if NO fan-out exists yet (the genesis founder). Handles the establish race: if another device published first, recover theirs instead.
+/// STATE-CARRYING APPS: an establish over an UNREADABLE (pre-v2) blob mints a key that opens none of the fleet's existing sealed state — if your app keeps state in the fstate slot, wrap this with the carry discipline (preserve under a cached key → mint → re-seal, and refuse the mint entirely when sealed state exists that nothing you hold can preserve). Photon's `recover_or_establish_carrying` is the reference.
 /// A fan-out that EXISTS but holds no wrap for us is NOT an establish case — that's a freshly-bound device whose wrap arrives with the sponsor's green-confirm GROW, and self-publishing in here would hand it the key before the human confirmed (voiding the two-phase gate: any member may publish, so the gate is only real if the joiner never publishes itself in). Wait: return None and let the next sync recover the grown fan-out.
 pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     t: &T,
