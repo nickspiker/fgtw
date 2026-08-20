@@ -237,17 +237,17 @@ pub fn push_checkpoint<T: FgtwTransport>(
     }
 }
 
-/// [`recover_fleet_key`], keeping the fan-out epoch alongside the key — the epoch spine folds the fleet key AND needs to name which one, so recovery callers that feed derivation want the pair.
+/// [`recover_fleet_key`], keeping the fan-out revision alongside the key — the epoch spine folds the fleet key AND needs to name the publish it came from, so recovery callers that feed derivation want the pair.
 pub fn recover_fleet_key_with_epoch<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
-    pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    identity_seed: &[u8; 32],
 ) -> Result<Option<(u64, [u8; 32])>, String> {
     match fetch_fanout(t, handle_proof) {
-        Ok(Some((epoch, rotator, wraps))) => Ok(pair_secret_for(&rotator).and_then(|ps| {
-            fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps).map(|k| (epoch, k))
-        })),
+        Ok(Some((revision, kfp, _rotator, wraps))) => {
+            Ok(fanout_open(handle_proof, &kfp, &wraps, device_key, identity_seed).map(|k| (revision, k)))
+        }
         Ok(None) => Ok(None),
         Err(e) if e.starts_with("fanout:") => Ok(None),
         Err(e) => Err(e),
@@ -547,17 +547,18 @@ pub fn bindreq_list<T: FgtwTransport>(
 
 // ── Fan-out transport + rotation ──
 
-/// Publish a fan-out to the always-online slot. Device-signed envelope (ke/ge) so FGTW checks the writer against the folded fleet chain; the epoch inside the blob drives the worker's monotonic guard.
+/// Publish a fan-out to the always-online slot. Device-signed envelope (ke/ge) so FGTW checks the writer against the folded fleet chain; the revision inside the blob drives the worker's monotonic guard.
 pub fn post_fanout<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
-    epoch: u64,
+    revision: u64,
+    kfp: &[u8; 32],
     wraps: &[FanoutWrap],
 ) -> Result<(), String> {
     let mut section = vsf::VsfSection::new("fanout_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("bl", VsfType::ge(fanout_to_bytes(epoch, &device_key.public.to_bytes(), wraps)));
+    section.add_field("bl", VsfType::ge(fanout_to_bytes(revision, kfp, &device_key.public.to_bytes(), wraps)));
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
         .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
@@ -576,7 +577,7 @@ pub fn post_fanout<T: FgtwTransport>(
     Ok(())
 }
 
-/// The raw fan-out blob as stored, unparsed — the rotation path needs the EPOCH even from a blob whose body it cannot read (a pre-v1 layout), or it proposes epoch 1 and the worker refuses it as stale forever.
+/// The raw fan-out blob as stored, unparsed — the publish path needs the REVISION even from a blob whose body it cannot read (a pre-v2 layout), or it proposes revision 1 and the worker refuses it as stale forever.
 pub fn fetch_fanout_blob<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
@@ -600,11 +601,11 @@ pub fn fetch_fanout_blob<T: FgtwTransport>(
     }
 }
 
-/// Fetch the current fan-out (epoch + rotator + wraps), or None if none published yet. A pre-v1 blob fails the version gate inside `fanout_from_bytes` and surfaces as an error the rotation path treats as absent (hard flag-day).
+/// Fetch the current fan-out (revision + kfp + rotator + wraps), or None if none published yet. A pre-v2 blob fails the version gate inside `fanout_from_bytes` and surfaces as an error the publish path treats as absent (hard flag-day).
 pub fn fetch_fanout<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-) -> Result<Option<(u64, [u8; 32], Vec<FanoutWrap>)>, String> {
+) -> Result<Option<(u64, [u8; 32], [u8; 32], Vec<FanoutWrap>)>, String> {
     let mut section = vsf::VsfSection::new("fanout_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -624,68 +625,87 @@ pub fn fetch_fanout<T: FgtwTransport>(
     }
 }
 
-/// Rotate (or first-establish) the fleet key: mint a FRESH key, seal it to `members`, publish at `stored_epoch + 1`. One operation for both genesis-establish and every membership-change rotation — a removed device just isn't in `members`.
-pub fn rotate_fleet_key<T: FgtwTransport>(
+/// MINT the fleet key — genesis and SHRINK only (docs/fleet-key.md): fresh key, sealed to every ira in `members`, published at `stored_revision + 1`. A locked/departed device just isn't in `members`. The CALLER owns the atomic shrink duty (preserve-pull the fstate slot under the old key BEFORE calling this, re-seal it under the returned key immediately after).
+pub fn mint_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
-    members: &[([u8; 32], [u8; 32])],
+    members: &[[u8; 32]],
+    identity_seed: &[u8; 32],
 ) -> Result<(u64, [u8; 32]), String> {
-    // Read the stored epoch from the RAW blob: a pre-v1 body is unparseable, but its epoch sits at the same offset, and stepping past it is the only way a v1 rotation survives the worker's monotonic guard (proposing epoch 1 over a live epoch is refused as stale forever — the flag-day deadlock observed 2026-08-01).
+    // Read the stored revision from the RAW blob: a pre-v2 body is unparseable, but its revision sits at the same offset, and stepping past it is the only way a v2 publish survives the worker's monotonic guard (proposing revision 1 over a live register is refused as stale forever — the flag-day deadlock observed 2026-08-01).
     let current = fetch_fanout_blob(t, handle_proof)
         .unwrap_or(None)
         .and_then(|b| crate::fanout::fanout_blob_epoch(&b))
         .unwrap_or(0);
-    let epoch = current + 1;
+    let revision = current + 1;
     let key = new_fleet_key();
-    let wraps = fanout_seal(handle_proof, epoch, &key, &device_key.public.to_bytes(), members)?;
-    post_fanout(t, handle_proof, device_key, epoch, &wraps)?;
-    Ok((epoch, key))
+    let kfp = crate::fanout::fleet_key_fingerprint(&key);
+    let wraps = fanout_seal(handle_proof, &key, members, identity_seed)?;
+    post_fanout(t, handle_proof, device_key, revision, &kfp, &wraps)?;
+    Ok((revision, key))
 }
 
-/// Recover the current fleet key from the always-online fan-out with this device's key alone (no live sibling). None if this device isn't in the current member set, or no fan-out exists yet.
+/// GROW the fan-out: republish wraps for the full `members` set under the SAME key, at revision+1. Never a mint — the fingerprint does not move, so no reader has adoption or re-seal work. Wraps are unlabelled (no recipient pubkeys in the slot), so a grower cannot know which member lacks one; a fresh full re-wrap is always correct and costs one ECDH per member. The publisher must hold the current key (`held_key` is verified against the stored blob's fingerprint — growing a fan-out you can't read is refused, that's a mint's job). Returns the new revision. A `stale` race loser refetches and re-applies.
+pub fn grow_fleet_wraps<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+    device_key: &Keypair,
+    held_key: &[u8; 32],
+    members: &[[u8; 32]],
+    identity_seed: &[u8; 32],
+) -> Result<u64, String> {
+    let (revision, kfp, _rotator, _wraps) = match fetch_fanout(t, handle_proof)? {
+        Some(f) => f,
+        None => return Err("fanout: nothing to grow (no fan-out published)".into()),
+    };
+    if crate::fanout::fleet_key_fingerprint(held_key) != kfp {
+        return Err("fanout: held key is not the published key — grow refused (mint owns key changes)".into());
+    }
+    let wraps = fanout_seal(handle_proof, held_key, members, identity_seed)?;
+    post_fanout(t, handle_proof, device_key, revision + 1, &kfp, &wraps)?;
+    Ok(revision + 1)
+}
+
+/// Recover the current fleet key from the always-online fan-out with this device's ira keypair + the identity seed alone (no live sibling, no ceremony). None if this device has no wrap (locked, departed, freshly-bound awaiting its sponsor's grow) or no fan-out exists yet.
 pub fn recover_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
-    pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    identity_seed: &[u8; 32],
 ) -> Result<Option<[u8; 32]>, String> {
-    // An unreadable (pre-v1) blob means "no key for us yet", NOT a transport failure: reporting it as an error made the establish fallback re-propagate it, so the device logged `fleet key sync failed` and stayed dark instead of rotating.
+    // An unreadable (pre-v2) blob means "no key for us yet", NOT a transport failure: reporting it as an error made the establish fallback re-propagate it, so the device logged `fleet key sync failed` and stayed dark instead of establishing.
     match fetch_fanout(t, handle_proof) {
-        Ok(Some((epoch, rotator, wraps))) => Ok(pair_secret_for(&rotator).and_then(|ps| {
-            fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps)
-        })),
+        Ok(Some((_, kfp, _rotator, wraps))) => {
+            Ok(fanout_open(handle_proof, &kfp, &wraps, device_key, identity_seed))
+        }
         Ok(None) => Ok(None),
         Err(e) if e.starts_with("fanout:") => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Recover the current fleet key, or ESTABLISH epoch 1 if NO fan-out exists yet (the genesis founder). Handles the establish race: if another device published epoch 1 first, recover theirs instead.
-/// A fan-out that EXISTS but holds no wrap for us is NOT an establish case — that's a freshly-bound device whose wrap arrives with the sponsor's green-confirm rotation, and self-rotating in here would hand it the key before the human confirmed (voiding the two-phase gate: any member may rotate, so the gate is only real if the joiner never rotates itself in). Wait: return None and let the next sync recover the confirmed epoch.
+/// Recover the current fleet key, or ESTABLISH revision 1 if NO fan-out exists yet (the genesis founder). Handles the establish race: if another device published first, recover theirs instead.
+/// A fan-out that EXISTS but holds no wrap for us is NOT an establish case — that's a freshly-bound device whose wrap arrives with the sponsor's green-confirm GROW, and self-publishing in here would hand it the key before the human confirmed (voiding the two-phase gate: any member may publish, so the gate is only real if the joiner never publishes itself in). Wait: return None and let the next sync recover the grown fan-out.
 pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
     device_key: &Keypair,
-    pair_secret_for: &dyn Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    identity_seed: &[u8; 32],
 ) -> Result<Option<[u8; 32]>, String> {
     match fetch_fanout(t, handle_proof) {
-        Ok(Some((epoch, rotator, wraps))) => Ok(pair_secret_for(&rotator).and_then(|ps| {
-            fanout_open(handle_proof, epoch, &rotator, &wraps, device_key, &ps)
-        })),
-        // Err = a pre-v1 blob (hard flag-day) — fall through to establish over it, same as absent.
+        Ok(Some((_, kfp, _rotator, wraps))) => {
+            Ok(fanout_open(handle_proof, &kfp, &wraps, device_key, identity_seed))
+        }
+        // Err = a pre-v2 blob (hard flag-day) — fall through to establish over it, same as absent.
         Ok(None) | Err(_) => {
-            // COMPLIANT members only: a member with no pair secret toward us gets no wrap — dark until it re-clutches (user directive 2026-08-01).
-            let members: Vec<([u8; 32], [u8; 32])> = current_members(t, handle_proof)?
-                .into_iter()
-                .filter_map(|m| pair_secret_for(&m).map(|ps| (m, ps)))
-                .collect();
+            let members = current_members(t, handle_proof)?;
             if members.is_empty() {
                 return Ok(None);
             }
-            match rotate_fleet_key(t, handle_proof, device_key, &members) {
+            match mint_fleet_key(t, handle_proof, device_key, &members, identity_seed) {
                 Ok((_, k)) => Ok(Some(k)),
-                Err(_) => recover_fleet_key(t, handle_proof, device_key, pair_secret_for),
+                Err(_) => recover_fleet_key(t, handle_proof, device_key, identity_seed),
             }
         }
     }
