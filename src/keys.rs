@@ -40,40 +40,11 @@ pub fn derive_device_keypair(fingerprint: &[u8]) -> Keypair {
     Keypair::from_seed(&seed)
 }
 
-/// HANDLES ARE BYTE-PRECISE (Nick's rule, restored 2026-08-18 after the folding crept in against it): `Zeno` ≠ `zeno`, `"   "` is a literal handle, and the ONLY validation anywhere is non-empty. Every derivation hashes the raw typed string as VSF x text — case, spacing, tabs, all of it is the human's choice and the human's entropy. The old case/space/camelCase folding (justified by the "double handle proof" fork) is deleted: a mistyped handle surfaces as a FRESH identity behind the permanence interstitial — a loud, human-decidable moment — never a silent rewrite of their input.
-///
-/// MIGRATION-EXPIRES: v58 — identities attested while the folding was live are keyed to their FOLDED string (e.g. an identity always typed `Adam` lives under `adam`). Until every affected person has re-learned or re-attested, photon's fresh-claim screen carries a hint about the old folding; that hint (and this note) go when the marker does.
-pub fn legacy_folded_handle(handle: &str) -> String {
-    let mut words: Vec<String> = Vec::new();
-    for token in handle.split_whitespace() {
-        let mut cur = String::new();
-        let mut prev_lower = false;
-        for c in token.chars() {
-            if c.is_uppercase() && prev_lower && !cur.is_empty() {
-                words.push(core::mem::take(&mut cur));
-            }
-            prev_lower = c.is_lowercase();
-            cur.extend(c.to_lowercase());
-        }
-        if !cur.is_empty() {
-            words.push(cur);
-        }
-    }
-    words.join(" ")
-}
+// HANDLES ARE BYTE-PRECISE (Nick's rule): every derivation hashes the raw typed string as VSF x text — case, spacing, tabs, control characters, all of it is the human's choice and the human's entropy. The ONLY validation anywhere is non-empty; the ONLY transform anywhere is NFC, inside the vsf `x` encoder. No fold, no trim, no filter, in any repo, ever.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The legacy folder still folds the way old builds did — it exists ONLY so the migration hint can name where a pre-2026-08-18 identity lives. It is NEVER applied to a derivation.
-    #[test]
-    fn legacy_folder_reproduces_the_old_folding() {
-        assert_eq!(legacy_folded_handle("FractalDecoder"), "fractal decoder");
-        assert_eq!(legacy_folded_handle(" Fractal  Decoder "), "fractal decoder");
-        assert_eq!(legacy_folded_handle("Adam"), "adam");
-        assert_eq!(legacy_folded_handle("NASA"), "nasa");
-    }
 
     #[test]
     fn device_keypair_known_answer() {
