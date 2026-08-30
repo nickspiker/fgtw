@@ -1,6 +1,6 @@
 [package]
 name = "fgtw"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
 description = "Fractal Gradient Trust Web — the client substrate for TOKEN identity: fleet membership, per-member fan-out of scoped keys, fleet-shared state, and the FGTW protocol. Shared by every TOKEN app (photon, calendar, …) and the FGTW worker."
@@ -29,7 +29,7 @@ client = ["fanout"]
 
 [dependencies]
 # vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.
-vsf = { path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
+vsf = { version = "0.9.3", path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
 blake3 = { version = "1", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 
