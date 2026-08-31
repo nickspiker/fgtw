@@ -118,6 +118,16 @@ pub fn bindreq_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], 
     v
 }
 
+/// The exact bytes a departure request signs: the device attests "I request removal from fleet `handle_proof`" at time `t`. Signed by the LEAVING device; the signature becomes the Remove op's `consent_sig`, countersigned (egg) by a surviving member — the exact mirror of Add's bilateral shape. Why bilateral: a unilateral self-remove lets whoever briefly holds one unlocked device sign it out — forcing a fleet-wide key rotation AND laundering the hardware into a clean re-attestable device for their own handle.
+pub fn departreq_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], t: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(19 + 64 + 8);
+    v.extend_from_slice(b"PHOTON_DEPARTREQ_v1");
+    v.extend_from_slice(handle_proof);
+    v.extend_from_slice(device_pubkey);
+    v.extend_from_slice(&t.to_le_bytes());
+    v
+}
+
 /// How far an Add's `eagle_time` may sit from its consent stamp: 1 hour — generous for a live ceremony (the request re-posts every ~3.5 min anyway), fatal for replaying a departed device's ancient consent.
 pub const CONSENT_WINDOW_OSC: i64 = 3600 * vsf::OSCILLATIONS_PER_SECOND as i64;
 
@@ -201,6 +211,16 @@ impl FleetOp {
             )
     }
 
+    /// Verify the REMOVE consent binding: `consent_sig` is the LEAVING device's own signature over its departure request — the subject signing its own exit, countersigned by the approver's egg. The mirror of [`FleetOp::verify_consent`].
+    fn verify_depart_consent(&self) -> bool {
+        self.consent_sig.len() == 64
+            && verify_ed25519(
+                &self.device_pubkey,
+                &departreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t),
+                &self.consent_sig,
+            )
+    }
+
     /// Verify every signature egg against `signer_pubkey`.
     /// v1 understands Ed25519; an op carrying an egg whose scheme this build doesn't implement is REJECTED (fail-closed — never silently accept an unverifiable op, the no-fork rule).
     /// An empty egg list is invalid.
@@ -257,6 +277,8 @@ pub enum FoldError {
     CheckpointOutOfSequence { index: usize },
     /// A Remove signed by anyone but the departing device itself — expulsion doesn't exist (self-signed departure only).
     RemoveNotSelfSigned { index: usize },
+    /// A consented Remove whose approver egg is the leaving device's own — the countersignature must come from a DIFFERENT surviving member (two devices, two signatures).
+    RemoveApproverIsLeaver { index: usize },
     /// An op carries a different `handle_proof` than the genesis — a spliced/transplanted chain.
     InconsistentHandleProof { index: usize },
     BrokenChain { index: usize },
@@ -301,7 +323,13 @@ impl MembershipBlob {
             if op.kind != OpKind::Genesis && (op.identity_pubkey != [0u8; 32] || !op.identity_sig.is_empty()) {
                 return Err(FoldError::StrayIdentityBinding { index: i });
             }
-            if op.kind != OpKind::Add && (op.consent_t != 0 || !op.consent_sig.is_empty()) {
+            // Consent rides Add (join request) AND Remove (departure request) — the two bilateral membership ops. Genesis/Checkpoint never carry it; a Remove carries BOTH halves or NEITHER (a lone stamp or lone sig is malformed).
+            if !matches!(op.kind, OpKind::Add | OpKind::Remove)
+                && (op.consent_t != 0 || !op.consent_sig.is_empty())
+            {
+                return Err(FoldError::StrayConsent { index: i });
+            }
+            if op.kind == OpKind::Remove && (op.consent_t != 0) != (!op.consent_sig.is_empty()) {
                 return Err(FoldError::StrayConsent { index: i });
             }
             if op.kind != OpKind::Checkpoint && (op.ckpt_k != 0 || op.ckpt_commit != [0u8; 32] || op.ckpt_fanout_epoch != 0) {
@@ -349,9 +377,22 @@ impl MembershipBlob {
                     if !members.contains(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
-                    // Self-signed departure ONLY — expulsion is not a verb this chain has; eviction lives at the key/provision layer.
-                    if op.signer_pubkey != op.device_pubkey {
-                        return Err(FoldError::RemoveNotSelfSigned { index: i });
+                    if op.consent_sig.is_empty() {
+                        // LEGACY self-signed departure (pre-consent chains keep folding). New bare departures are refused at the worker's publish gate — a unilateral sign-out lets a device thief launder the hardware into their own fleet.
+                        if op.signer_pubkey != op.device_pubkey {
+                            return Err(FoldError::RemoveNotSelfSigned { index: i });
+                        }
+                    } else {
+                        // CONSENTED removal — the mirror of Add: the leaving device signed its departure request (`consent_sig` over departreq bytes), a DIFFERENT surviving member's egg authorises it. Expulsion still doesn't exist: without the leaving device's request signature the op can't fold.
+                        if op.signer_pubkey == op.device_pubkey {
+                            return Err(FoldError::RemoveApproverIsLeaver { index: i });
+                        }
+                        if !op.verify_depart_consent() {
+                            return Err(FoldError::BadConsent { index: i });
+                        }
+                        if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
+                            return Err(FoldError::ConsentStale { index: i });
+                        }
                     }
                     let before = members.len();
                     members.retain(|m| m != &op.device_pubkey);
@@ -509,6 +550,25 @@ impl MembershipBlob {
             [0u8; 32],
             None,
             None,
+            None,
+        );
+        self.ops.push(op);
+    }
+
+    /// Append a CONSENTED removal: the approver `device_key` (a surviving member, never the leaver) signs, carrying the leaving device's departure-request signature — `(consent_t, consent_sig)` over [`departreq_signing_bytes`]. The exact mirror of [`MembershipBlob::add`]. Without valid consent the result won't fold; with `approver == leaving` it won't fold either.
+    pub fn remove_consented(&mut self, approver_key: &Keypair, leaving: [u8; 32], eagle_time: i64, consent_t: i64, consent_sig: Vec<u8>) {
+        let hp = self.handle_proof().unwrap_or([0u8; 32]);
+        let op = sign_op(
+            approver_key,
+            hp,
+            self.head(),
+            OpKind::Remove,
+            leaving,
+            eagle_time,
+            approver_key.public.to_bytes(),
+            [0u8; 32],
+            None,
+            Some((consent_t, consent_sig)),
             None,
         );
         self.ops.push(op);
@@ -805,6 +865,11 @@ fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
         values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
         values.push(VsfType::ge(op.consent_sig.clone()));
     }
+    // Consented Remove appends the same (e6 t, ge sig) pair; legacy self-departure appends nothing. The parser discriminates by TYPE at position 6 (the egg tail always begins with a `u` scheme, never an `e`), same trick as the genesis v1/v2 split.
+    if op.kind == OpKind::Remove && !op.consent_sig.is_empty() {
+        values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
+        values.push(VsfType::ge(op.consent_sig.clone()));
+    }
     if op.kind == OpKind::Checkpoint {
         values.push(VsfType::u(op.ckpt_k as usize, false));
         values.push(VsfType::hb(op.ckpt_commit.to_vec()));
@@ -871,6 +936,17 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
             _ => return Err("fleet op: add missing consent sig".into()),
         };
         i = 8;
+    }
+    if kind == OpKind::Remove {
+        // Consented form carries (e6 consent_t, ge consent_sig) before the egg tail; legacy self-departure goes straight to eggs. Type-discriminated: an `e` at 6 is the consent stamp, a `u` is the first egg's scheme.
+        if let Some(VsfType::e(et)) = values.get(6) {
+            consent_t = et_to_osc(et);
+            consent_sig = match values.get(7) {
+                Some(VsfType::ge(s)) => s.clone(),
+                _ => return Err("fleet op: consented remove missing consent sig".into()),
+            };
+            i = 8;
+        }
     }
     if kind == OpKind::Checkpoint {
         ckpt_k = take_u64(values.get(6).ok_or("fleet op: checkpoint missing k")?, "k")?;
@@ -991,6 +1067,52 @@ mod tests {
         assert_eq!(blob.fold().unwrap(), vec![pk(&b), pk(&c)]);
         assert!(!blob.is_member(&pk(&a)));
         assert!(blob.is_member(&pk(&c)));
+    }
+
+    #[test]
+    fn consented_removal_folds_and_round_trips() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t1, s1) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t1, s1);
+        // b requests removal (signs its departure request); a countersigns and appends.
+        let dt = 390i64;
+        let dsig = b.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        blob.remove_consented(&a, pk(&b), 400, dt, dsig);
+        assert_eq!(blob.fold().unwrap(), vec![pk(&a)]);
+        // Wire round-trip keeps the consent group intact.
+        let bytes = blob.to_vsf_bytes().unwrap();
+        let back = MembershipBlob::from_vsf_bytes(&bytes).unwrap();
+        assert_eq!(back.fold().unwrap(), vec![pk(&a)]);
+    }
+
+    #[test]
+    fn consented_removal_rejects_self_approval_and_forged_request() {
+        let a = key(1);
+        let b = key(2);
+        let mk = |a: &Keypair, b: &Keypair| {
+            let mut blob = MembershipBlob::genesis(a, HP, &SEED, 100);
+            let (t1, s1) = consent_for(b, 190);
+            blob.add(a, pk(b), 200, t1, s1);
+            blob
+        };
+        // The leaver approving its own consented removal — two signatures must be two devices.
+        let mut blob = mk(&a, &b);
+        let dt = 390i64;
+        let dsig = b.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        blob.remove_consented(&b, pk(&b), 400, dt, dsig);
+        assert_eq!(blob.fold(), Err(FoldError::RemoveApproverIsLeaver { index: 2 }));
+        // The approver forging the leaver's request signature — expulsion attempt.
+        let mut blob = mk(&a, &b);
+        let forged = a.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        blob.remove_consented(&a, pk(&b), 400, dt, forged);
+        assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 2 }));
+        // A stale request replayed past the window.
+        let mut blob = mk(&a, &b);
+        let dsig = b.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        blob.remove_consented(&a, pk(&b), dt + CONSENT_WINDOW_OSC + 1, dt, dsig);
+        assert_eq!(blob.fold(), Err(FoldError::ConsentStale { index: 2 }));
     }
 
     #[test]
