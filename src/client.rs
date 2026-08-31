@@ -355,6 +355,37 @@ pub fn depart_device<T: FgtwTransport>(
     Err("fleet depart: lost too many extension races".into())
 }
 
+/// APPROVER side of the bilateral removal (the mirror of the sponsor's Add): a SURVIVING member countersigns the leaving device's departure request and publishes the consented Remove. `consent_t`/`consent_sig` come off the leaver's depart_req frame (its signature over [`crate::fleet::departreq_signing_bytes`]). Idempotent: leaver already out = Ok. Bare self-departure is refused at the worker from the consent cutover on — this is the ONLY removal path a new chain can take.
+pub fn depart_device_consented<T: FgtwTransport>(
+    t: &T,
+    approver_key: &Keypair,
+    handle_proof: &[u8; 32],
+    leaving: &[u8; 32],
+    consent_t: i64,
+    consent_sig: &[u8],
+) -> Result<(), String> {
+    for _attempt in 0..4 {
+        let mut blob = fetch(t, handle_proof)?.ok_or("no fleet to remove from")?;
+        let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+        if !members.contains(leaving) {
+            return Ok(()); // already out — idempotent
+        }
+        blob.remove_consented(
+            approver_key,
+            *leaving,
+            vsf::eagle_time_oscillations(),
+            consent_t,
+            consent_sig.to_vec(),
+        );
+        match publish(t, &blob) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("stale") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("fleet consented remove: lost too many extension races".into())
+}
+
 // ── Binding-request registry (docs/pairing-v2.md): keyed per (hp, device), dual-signed at write, member-gated at read, author-withdrawn or stamp-lapsed — the worker NEVER consumes an entry. ──
 
 /// Build + POST a device-signed envelope (ke/ge header, canonical scheme) around `section` — the shape the worker's signature-gated ops verify.
