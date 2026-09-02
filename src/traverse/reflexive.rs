@@ -154,7 +154,7 @@ mod tests {
         let mut r = ReflexiveState::new();
         let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-        // Even "trusted" (a signature-verified friend's pong) must not get the sentinel through.
+        // Even "trusted" (a signature-verified friend's pong) must not get the sentinel thru.
         assert_eq!(
             r.record(sentinel, [1u8; 32], true),
             None,
