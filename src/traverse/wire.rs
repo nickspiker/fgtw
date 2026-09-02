@@ -1,25 +1,16 @@
 //! The punch wire format — the two messages traversal puts on the socket.
 //!
 //! This is the single encoder for both consumers. Photon's `FgtwMessage::PunchProbe` /
-//! `PunchProbeAck` arms delegate here rather than carrying their own copy, so the format
-//! cannot drift between the two implementations.
+//! `PunchProbeAck` arms delegate here rather than carrying their own copy, so the format cannot drift between the two implementations.
 //!
 //! # Why the golden-bytes tests exist
 //!
-//! Photon has a shipped fleet punching with this exact encoding right now. VSF headers carry
-//! a table of contents and a total length, so a reordered field or a renamed section shifts
-//! bytes in places you would not predict by reading the diff — and the failure mode is not a
-//! compile error, it is two deployed versions that silently stop being able to punch to each
-//! other. The fixtures below were captured from the pre-extraction encoder and pin the format
-//! byte-for-byte. **If you change this file and a golden test fails, you have broken
-//! compatibility with every deployed build — fix the code, do not update the fixture.**
+//! Photon has a shipped fleet punching with this exact encoding right now. VSF headers carry a table of contents and a total length, so a reordered field or a renamed section shifts bytes in places you would not predict by reading the diff — and the failure mode is not a compile error, it is two deployed versions that silently stop being able to punch to each other. The fixtures below were captured from the pre-extraction encoder and pin the format byte-for-byte. **If you change this file and a golden test fails, you have broken compatibility with every deployed build — fix the code, do not update the fixture.**
 //!
 //! # Shape
 //!
-//! Both messages carry their crypto in the VSF header (timestamp, signer pubkey, provenance
-//! hash, ed25519 signature). The probe is header-only — a name-only TOC entry with no body,
-//! the minimal wire form. The ack adds one `obs` field carrying the address the responder saw
-//! the probe arrive from, which is what makes an ack double as a reflexive-address echo.
+//! Both messages carry their crypto in the VSF header (timestamp, signer pubkey, provenance hash, ed25519 signature). The probe is header-only — a name-only TOC entry with no body,
+//! the minimal wire form. The ack adds one `obs` field carrying the address the responder saw the probe arrive from, which is what makes an ack double as a reflexive-address echo.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -46,9 +37,7 @@ pub enum PunchMessage {
         provenance_hash: [u8; 32],
         signature: [u8; 64],
     },
-    /// The reply to a [`PunchMessage::Probe`]. Echoes the probe's provenance so the prober can
-    /// match which candidate round-tripped, and carries `observed_addr` so the ack doubles as
-    /// a reflexive echo.
+    /// The reply to a [`PunchMessage::Probe`]. Echoes the probe's provenance so the prober can match which candidate round-tripped, and carries `observed_addr` so the ack doubles as a reflexive echo.
     ProbeAck {
         timestamp: i64,
         responder_pubkey: DevicePubkey,
@@ -95,9 +84,7 @@ impl PunchMessage {
         }
     }
 
-    /// Decode a punch message. `Ok(None)` means "a valid VSF file, but not one of ours" — the
-    /// caller should pass it to its own dispatch rather than treating it as an error, which is
-    /// what lets photon share one socket across several message families.
+    /// Decode a punch message. `Ok(None)` means "a valid VSF file, but not one of ours" — the caller should pass it to its own dispatch rather than treating it as an error, which is what lets photon share one socket across several message families.
     pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Option<Self>, String> {
         if bytes.len() < 4 || &bytes[0..3] != "RÅ".as_bytes() || bytes[3] != b'<' {
             return Err("not a VSF file (invalid magic)".to_string());
@@ -223,8 +210,7 @@ fn header_signature(header: &VsfHeader) -> Result<[u8; 64], String> {
 mod tests {
     use super::*;
 
-    // Captured from photon's FgtwMessage encoder BEFORE this module existed. These pin the
-    // format that every deployed photon build is punching with right now.
+    // Captured from photon's FgtwMessage encoder BEFORE this module existed. These pin the format that every deployed photon build is punching with right now.
     const GOLDEN_PROBE: &str = "52c3853c7a33097933096233b46c33b4653600000000000030396870331f09090909090909090909090909090909090909090909090909090909090909096b65331f07070707070707070707070707070707070707070707070707070707070707076765333f030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303036e33012864330570756e6368293e";
     const GOLDEN_ACK_V4: &str = "52c3853c7a33097933096233c46c33d9653600000000000030396870331f09090909090909090909090909090909090909090909090909090909090909096b65331f07070707070707070707070707070707070707070707070707070707070707076765333f030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303036e33012864330970756e63685f61636b3a6f33c42c6233152c6e3301293e5b286433036f62733a68623305cb007109111f295d";
     const GOLDEN_ACK_V6: &str = "52c3853c7a33097933096233c46c33e5653600000000000030396870331f09090909090909090909090909090909090909090909090909090909090909096b65331f07070707070707070707070707070707070707070707070707070707070707076765333f030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303036e33012864330970756e63685f61636b3a6f33c42c6233212c6e3301293e5b286433036f62733a6862331120010db8000000000000000000000001111f295d";
@@ -278,8 +264,7 @@ mod tests {
         assert!(probe().to_vsf_bytes().unwrap().starts_with(b"R\xC3\x85"));
     }
 
-    /// A valid VSF file that isn't a punch message is not an error — photon shares one socket
-    /// across several message families and must pass non-punch traffic to its own dispatch.
+    /// A valid VSF file that isn't a punch message is not an error — photon shares one socket across several message families and must pass non-punch traffic to its own dispatch.
     #[test]
     fn a_foreign_section_decodes_to_none_rather_than_erroring() {
         let other = VsfBuilder::new()

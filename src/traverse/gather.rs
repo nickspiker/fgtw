@@ -6,27 +6,20 @@
 //! - [`gather_own_candidates`] builds the set of *our* addresses to advertise to a peer so
 //!   they can punch back at us.
 //!
-//! The peer-side gather takes a plain [`PeerEndpoint`] slice rather than any caller's contact
-//! type. Photon's `Contact` and rustdesk's phonebook `Record` both flatten into that, so
-//! neither shape leaks in here — photon's two former entry points differed only in whether a
-//! peer's LAN address had to share our `/24`, which is now the explicit [`LanPolicy`].
+//! The peer-side gather takes a plain [`PeerEndpoint`] slice rather than any caller's contact type. Photon's `Contact` and rustdesk's phonebook `Record` both flatten into that, so neither shape leaks in here — photon's two former entry points differed only in whether a peer's LAN address had to share our `/24`, which is now the explicit [`LanPolicy`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::candidate::{Candidate, CandidateKind, CandidateSet};
 
-/// True for a LAN IPv4 worth trying at all — excludes loopback, link-local, the unspecified
-/// address, and the `192.0.0.0/24` service-continuity block (the 464XLAT CLAT address, which
-/// is never a reachable peer LAN address).
+/// True for a LAN IPv4 worth trying at all — excludes loopback, link-local, the unspecified address, and the `192.0.0.0/24` service-continuity block (the 464XLAT CLAT address, which is never a reachable peer LAN address).
 pub fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     let is_service_continuity = o[0] == 192 && o[1] == 0 && o[2] == 0; // 192.0.0.0/24
     !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() && !is_service_continuity
 }
 
-/// True for the RFC 1918 private ranges (10/8, 172.16/12, 192.168/16) — the addresses only
-/// reachable on a shared LAN. Decides whether a peer's v4 candidate is a routable public
-/// address (send freely) or a private one only worth trying on the SAME subnet (see
+/// True for the RFC 1918 private ranges (10/8, 172.16/12, 192.168/16) — the addresses only reachable on a shared LAN. Decides whether a peer's v4 candidate is a routable public address (send freely) or a private one only worth trying on the SAME subnet (see
 /// [`is_foreign_peer_lan`]).
 pub fn is_private_ipv4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
@@ -45,8 +38,7 @@ pub fn public_kind(addr: &SocketAddr) -> CandidateKind {
 
 /// True for an address that must NEVER enter the candidate set: the unspecified `0.0.0.0` /
 /// `::`, which is the relay sentinel a relayed message carries. If it leaks in, the punch
-/// "validates" a path to `0.0.0.0` (it round-trips locally), which then poisons all
-/// addressing: sends go nowhere while the path looks `Some`.
+/// "validates" a path to `0.0.0.0` (it round-trips locally), which then poisons all addressing: sends go nowhere while the path looks `Some`.
 pub fn is_bogus_addr(addr: &SocketAddr) -> bool {
     addr.ip().is_unspecified()
 }
@@ -60,14 +52,9 @@ pub fn is_wfd_subnet(v4: Ipv4Addr) -> bool {
 /// Would a peer's private IPv4 plausibly be reachable from us, given OUR own LAN v4?
 ///
 /// A peer's private address is only reachable when we share its subnet — otherwise it is a
-/// FOREIGN LAN address that we would retransmit into a black hole, wasting the direct-path
-/// budget and masking that the relay is the real path. This is common in practice because
-/// default home routers all hand out the same `192.168.0.*` block, so two unrelated peers
-/// routinely carry colliding-but-unreachable private addresses.
+/// FOREIGN LAN address that we would retransmit into a black hole, wasting the direct-path budget and masking that the relay is the real path. This is common in practice because default home routers all hand out the same `192.168.0.*` block, so two unrelated peers routinely carry colliding-but-unreachable private addresses.
 ///
-/// "Same subnet" is approximated as a shared `/24` — the common home-LAN mask. A wider real
-/// mask only makes us slightly conservative (fall back to public/relay), never sending to an
-/// unreachable address. With no known LAN of our own we can't vouch for any peer LAN.
+/// "Same subnet" is approximated as a shared `/24` — the common home-LAN mask. A wider real mask only makes us slightly conservative (fall back to public/relay), never sending to an unreachable address. With no known LAN of our own we can't vouch for any peer LAN.
 pub fn peer_lan_reachable(peer_v4: Ipv4Addr, our_v4: Option<Ipv4Addr>) -> bool {
     match our_v4 {
         Some(ours) => {
@@ -78,14 +65,10 @@ pub fn peer_lan_reachable(peer_v4: Ipv4Addr, our_v4: Option<Ipv4Addr>) -> bool {
     }
 }
 
-/// True if `peer` is a private IPv4 NOT on our `/24` (a foreign LAN we can't reach) — the
-/// exact address a caller holding our-LAN should refuse to send to directly. A public/global
-/// v4 is never foreign.
+/// True if `peer` is a private IPv4 NOT on our `/24` (a foreign LAN we can't reach) — the exact address a caller holding our-LAN should refuse to send to directly. A public/global v4 is never foreign.
 pub fn is_foreign_peer_lan(peer: &SocketAddr, our_v4: Option<Ipv4Addr>) -> bool {
     match peer.ip() {
-        // The reserved Wi-Fi Direct subnet: an address here only enters state via a live
-        // group-up (cleared at teardown), so it is vouched by group membership rather than by
-        // sharing our infra /24. Punch validation still gates actual path adoption.
+        // The reserved Wi-Fi Direct subnet: an address here only enters state via a live group-up (cleared at teardown), so it is vouched by group membership rather than by sharing our infra /24. Punch validation still gates actual path adoption.
         IpAddr::V4(v4) if is_wfd_subnet(v4) => false,
         IpAddr::V4(v4) if is_private_ipv4(v4) => !peer_lan_reachable(v4, our_v4),
         _ => false,
@@ -95,11 +78,9 @@ pub fn is_foreign_peer_lan(peer: &SocketAddr, our_v4: Option<Ipv4Addr>) -> bool 
 /// How strictly to admit a peer's LAN address as a candidate.
 #[derive(Debug, Clone, Copy)]
 pub enum LanPolicy {
-    /// Keep any usable LAN v4, without checking whether it is on our subnet. The right choice
-    /// when the caller has no our-LAN context; a foreign address merely fails to validate.
+    /// Keep any usable LAN v4, without checking whether it is on our subnet. The right choice when the caller has no our-LAN context; a foreign address merely fails to validate.
     AnyUsable,
-    /// Keep a peer LAN v4 only when it shares our `/24`. The right choice wherever the caller
-    /// does know our LAN, so we never burn the direct-path budget on a black hole.
+    /// Keep a peer LAN v4 only when it shares our `/24`. The right choice wherever the caller does know our LAN, so we never burn the direct-path budget on a black hole.
     SameSubnetAs(Option<Ipv4Addr>),
 }
 
@@ -115,8 +96,7 @@ impl LanPolicy {
     }
 }
 
-/// One place a peer might be reachable, as the directory knows it. Callers flatten their own
-/// contact/record type into these.
+/// One place a peer might be reachable, as the directory knows it. Callers flatten their own contact/record type into these.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerEndpoint {
     /// The peer's public/reflexive address (v4 punched, or a v6 host).
@@ -129,11 +109,9 @@ pub struct PeerEndpoint {
 /// [`CandidateSet::best_pair`]) the send order.
 ///
 /// Scanning every endpoint rather than just the active one is what surfaces a peer's global
-/// IPv6 when its active address happens to be v4 — so the v6 host, priority-first, is tried
-/// before a v4 LAN address that may be on a foreign network.
+/// IPv6 when its active address happens to be v4 — so the v6 host, priority-first, is tried before a v4 LAN address that may be on a foreign network.
 ///
-/// `p2p` is a live Wi-Fi Direct group address: group membership vouches reachability, so it
-/// bypasses the LAN policy entirely.
+/// `p2p` is a live Wi-Fi Direct group address: group membership vouches reachability, so it bypasses the LAN policy entirely.
 pub fn gather_peer_candidates(
     endpoints: &[PeerEndpoint],
     p2p: Option<SocketAddr>,
@@ -165,8 +143,7 @@ pub fn gather_peer_candidates(
     set
 }
 
-/// Our own addresses to advertise so a peer can punch back at us: our learned reflexive
-/// address (public, from peer-echoed reflection) and our LAN address on the port we listen on.
+/// Our own addresses to advertise so a peer can punch back at us: our learned reflexive address (public, from peer-echoed reflection) and our LAN address on the port we listen on.
 pub fn gather_own_candidates(
     our_reflexive: Option<SocketAddr>,
     local_v4: Option<Ipv4Addr>,
