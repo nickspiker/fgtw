@@ -107,6 +107,8 @@ pub const RD_MAGIC: [u8; 4] = *b"RDS1";
 pub const RD_FLAG_SYN: u8 = 1;
 /// Orderly close; no data after this frame.
 pub const RD_FLAG_FIN: u8 = 2;
+/// Retransmit request: `seq` names the frame the sender must send again, and `data` is empty. The relay is live-only with no mailbox, so a frame in flight while the recipient's pipe reconnects is simply dropped; the receiver notices the gap and asks for it rather than stalling on a byte stream that can never resync.
+pub const RD_FLAG_NACK: u8 = 4;
 /// Fixed header length.
 pub const RD_HEADER_LEN: usize = 4 + 16 + 8 + 1;
 
@@ -203,6 +205,7 @@ mod tests {
             (RD_FLAG_SYN, b"first bytes".to_vec()),
             (0, vec![0u8; 100_000]),
             (RD_FLAG_FIN, Vec::new()),
+            (RD_FLAG_NACK, Vec::new()),
         ] {
             let f = RdFrame { conn: [7u8; 16], seq: 42, flags, data };
             assert_eq!(RdFrame::decode(&f.encode()), Some(f));
