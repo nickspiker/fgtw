@@ -1,26 +1,17 @@
 //! The relay pipe — sans-io codec for the seed's live per-device WebSocket relay.
 //!
-//! A device opens `wss://<seed>/pipe?dev=<hex>[&svc=<tag>]` as its receive socket, and sends
-//! by pushing a signed relay envelope either up that same socket (full-duplex, the worker
-//! forwards it) or as an HTTPS POST. The envelope is a whole signed VSF — section `relay`
-//! `{recipient, payload[, svc]}`, signed by the sender's device key — so the receiver learns
-//! "via relay, from device X" from authenticated bytes.
+//! A device opens `wss://<seed>/pipe?dev=<hex>[&svc=<tag>]` as its receive socket, and sends by pushing a signed relay envelope either up that same socket (full-duplex, the worker forwards it) or as an HTTPS POST.
+//! The envelope is a whole signed VSF — section `relay` `{recipient, payload[, svc]}`, signed by the sender's device key — so the receiver learns "via relay, from device X" from authenticated bytes.
 //!
-//! **Service tags.** Two apps sharing one device key (photon and the rustdesk fork share the
-//! fleet identity on purpose) must not share a pipe: the worker names the hub `<hex>` for a
-//! svc-less pipe (photon, unchanged) and `<hex>:<svc>` otherwise, so the two pipes have
-//! independent lifecycles — closing photon to update it can never drop the rustdesk session
-//! doing the updating — and a frame addressed to a service can only land on that service's
-//! socket.
+//! **Service tags.** Two apps sharing one device key (photon and the rustdesk fork share the fleet identity on purpose) must not share a pipe: the worker names the hub `<hex>` for a svc-less pipe (photon, unchanged) and `<hex>:<svc>` otherwise, so the two pipes have independent lifecycles — closing photon to update it can never drop the rustdesk session doing the updating — and a frame addressed to a service can only land on that service's socket.
 //!
-//! **This module is sans-io** like [`crate::traverse`]: envelope build/peel and the stream
-//! frame codec live here with tests; the socket pump (tokio/tungstenite) is each app's
-//! concern, so `fgtw` stays free of async deps.
+//! **This module is sans-io** like [`crate::traverse`]: envelope build/peel and the stream frame codec live here with tests; the socket pump (tokio/tungstenite) is each app's concern, so `fgtw` stays free of async deps.
 
 use crate::keys::Keypair;
 use vsf::types::VsfType;
 
-/// The rustdesk fork's service tag. Worker rule: 1–8 chars, `[a-z0-9]`.
+/// The rustdesk fork's service tag.
+/// Worker rule: 1–8 chars, `[a-z0-9]`.
 pub const SVC_RUSTDESK: &str = "rd";
 
 /// The pipe URL for a device's receive socket on `seed_host` (e.g. `fgtw.org`).
@@ -38,10 +29,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Build a signed relay envelope addressed to `recipient` (optionally to its `svc` hub).
 ///
-/// Wire shape is the one the deployed worker verifies and photon already sends: header
-/// `signed_only(ke)` + canonical `sign_file`, section `relay` with `recipient` (`kx`),
-/// `payload` (`v'r'`), and — new, optional, ignored by pre-svc workers' HTTPS path and
-/// refused-if-garbled by current ones — `svc` (`d`).
+/// Wire shape is the one the deployed worker verifies and photon already sends: header `signed_only(ke)` + canonical `sign_file`, section `relay` with `recipient` (`kx`), `payload` (`v'r'`), and — new, optional, ignored by pre-svc workers' HTTPS path and refused-if-garbled by current ones — `svc` (`d`).
 pub fn build_relay_envelope(
     device_key: &Keypair,
     recipient: &[u8; 32],
@@ -67,16 +55,11 @@ pub fn build_relay_envelope(
     vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
 }
 
-/// Peel a relay envelope received over the pipe: verify the sender's whole-file signature,
-/// then return `(sender_device_key, inner_payload)`. `None` on any structural/parse/verify
-/// failure — a malformed or unsigned frame off the pipe is dropped, never injected.
+/// Peel a relay envelope received over the pipe: verify the sender's whole-file signature, then return `(sender_device_key, inner_payload)`.
+/// `None` on any structural/parse/verify failure — a malformed or unsigned frame off the pipe is dropped, never injected.
 ///
-/// Ported verbatim from photon (which now delegates here): `verify_file_signature`, NOT
-/// `read_verified` — the signature covers the entire file (authorship + integrity), only the
-/// content-hp self-attestation is waived, same as every CLUTCH/chat parser. And the section
-/// resolves via `primary_section`, not a bare body parse: the section NAME lives in the
-/// header TOC (near-form), so a body parse sees `name == ""` and a `== "relay"` check
-/// silently fails — the trap that black-holed the pipe data plane once already.
+/// Ported verbatim from photon (which now delegates here): `verify_file_signature`, NOT `read_verified` — the signature covers the entire file (authorship + integrity), only the content-hp self-attestation is waived, same as every CLUTCH/chat parser.
+/// And the section resolves via `primary_section`, not a bare body parse: the section NAME lives in the header TOC (near-form), so a body parse sees `name == ""` and a `== "relay"` check silently fails — the trap that black-holed the pipe data plane once already.
 pub fn peel_relay_envelope(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
     use vsf::file_format::VsfHeader;
 
@@ -109,21 +92,18 @@ pub fn peel_relay_envelope(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
 
 // ── the rustdesk stream frame ──
 //
-// The envelope's inner payload for SVC_RUSTDESK is a byte-stream segment, NOT a VSF file:
-// this is the per-video-frame hot path, the bytes are opaque to every relay hop (only the
-// two rustdesk ends read them, and rustdesk's own session encryption rides inside), so a
-// fixed 29-byte header beats a parse. Layout, all fixed offsets:
+// The envelope's inner payload for SVC_RUSTDESK is a byte-stream segment, NOT a VSF file: this is the per-video-frame hot path, the bytes are opaque to every relay hop (only the two rustdesk ends read them, and rustdesk's own session encryption rides inside), so a fixed 29-byte header beats a parse.
+// Layout, all fixed offsets:
 //
 //   "RDS1"  ‖  conn:16  ‖  seq:8 BE  ‖  flags:1  ‖  data…
 //
-// `conn` is a random per-connection id (the guest mints it; the host demuxes on it), `seq`
-// is a per-connection monotonic counter. The pipe preserves order end-to-end (WS ordered,
-// DO input gates serialize, WS ordered) — `seq` exists so the receiver can PROVE that and
-// heal/flag if it ever stops being true, not because reordering is expected.
+// `conn` is a random per-connection id (the guest mints it; the host demuxes on it), `seq` is a per-connection monotonic counter.
+// The pipe preserves order end-to-end (WS ordered, DO input gates serialize, WS ordered) — `seq` exists so the receiver can PROVE that and heal/flag if it ever stops being true, not because reordering is expected.
 
 /// Frame magic — "RDS1" (RustDesk Stream v1).
 pub const RD_MAGIC: [u8; 4] = *b"RDS1";
-/// First frame of a connection (guest → host). Carries the first data bytes too.
+/// First frame of a connection (guest → host).
+/// Carries the first data bytes too.
 pub const RD_FLAG_SYN: u8 = 1;
 /// Orderly close; no data after this frame.
 pub const RD_FLAG_FIN: u8 = 2;
