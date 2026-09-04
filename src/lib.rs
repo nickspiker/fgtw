@@ -68,6 +68,7 @@ pub mod pair;
 /// The phonebook — the peer registry as two hash-addressed registries (identity → device set, device → address) over one uniform fixed-stride keyspace. Base feature: the worker serves slices with the SAME codec clients write with, exactly as it folds chains with the same [`fleet`] code.
 pub mod phonebook;
 pub mod traverse;
+pub mod pipe;
 
 /// The FGTW wire protocol — the GENERIC messages: announce/challenge, fleet ops, avatar, blob.
 /// The photon-specific messages (chat, CLUTCH, PT) stay in photon; `protocol.rs` gets SPLIT.
