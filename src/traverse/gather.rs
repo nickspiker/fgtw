@@ -302,3 +302,99 @@ mod tests {
         assert!(set.is_empty());
     }
 }
+
+/// How a direct path reaches a peer, best first. One ladder shared by every app in the fleet,
+/// so a colour means the same thing in photon's presence ring and rustdesk's fleet tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathTier {
+    /// No router at all: a Wi-Fi Direct group or a link-local pair. Nothing in the middle.
+    NoRouter,
+    /// A local network — reachable without any internet, on the building's own wiring.
+    Lan,
+    /// Direct across the internet, e.g. a punched path.
+    Wan,
+    /// Frames ride the seed's pipe; every one pays a WAN round trip.
+    Relay,
+}
+
+/// Classify a validated direct path to `peer`, given our own LAN v4.
+///
+/// The same-subnet check is the whole point and cannot be skipped: judging "local" from the
+/// address SHAPE calls every RFC-1918 address same-room, and carrier CGNAT hands cellular
+/// devices 10.x — so a carrier-internal path to a peer hundreds of miles away rings LAN
+/// (photon field bug, 2026-08-30). Private-but-foreign is a real direct path, but it is WAN.
+pub fn classify_path(peer: &SocketAddr, our_v4: Option<Ipv4Addr>) -> PathTier {
+    match peer.ip() {
+        IpAddr::V4(v4) => {
+            // The reserved Wi-Fi Direct subnet is vouched by group membership, not by sharing
+            // our infra /24 — and CGNAT never hands it out, so the shape check is safe here.
+            if is_wfd_subnet(v4) || v4.is_link_local() {
+                PathTier::NoRouter
+            } else if is_private_ipv4(v4) && peer_lan_reachable(v4, our_v4) {
+                PathTier::Lan
+            } else {
+                PathTier::Wan
+            }
+        }
+        IpAddr::V6(v6) => {
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                PathTier::NoRouter // link-local: no router ever assigned this
+            } else if (v6.segments()[0] & 0xfe00) == 0xfc00 {
+                PathTier::Lan // ULA — site-local by construction
+            } else {
+                PathTier::Wan
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+    fn v4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn wfd_and_link_local_are_router_free() {
+        assert_eq!(classify_path(&sa("192.168.49.1:4383"), None), PathTier::NoRouter);
+        assert_eq!(classify_path(&sa("169.254.3.4:4383"), None), PathTier::NoRouter);
+    }
+
+    #[test]
+    fn private_on_our_subnet_is_lan() {
+        let ours = Some(v4("192.168.1.161"));
+        assert_eq!(classify_path(&sa("192.168.1.156:21118"), ours), PathTier::Lan);
+    }
+
+    /// The 2026-08-30 field bug: carrier CGNAT hands out 10.x, so a private address off our own
+    /// subnet is a real direct path but emphatically not "same room".
+    #[test]
+    fn private_but_foreign_is_wan_not_lan() {
+        let ours = Some(v4("192.168.1.161"));
+        assert_eq!(classify_path(&sa("10.172.215.102:4383"), ours), PathTier::Wan);
+    }
+
+    #[test]
+    fn without_our_lan_no_private_address_can_claim_same_room() {
+        assert_eq!(classify_path(&sa("192.168.1.156:21118"), None), PathTier::Wan);
+    }
+
+    #[test]
+    fn public_is_wan() {
+        let ours = Some(v4("192.168.1.161"));
+        assert_eq!(classify_path(&sa("203.0.113.7:4383"), ours), PathTier::Wan);
+    }
+
+    #[test]
+    fn a_better_tier_sorts_first() {
+        let mut v = vec![PathTier::Relay, PathTier::Wan, PathTier::NoRouter, PathTier::Lan];
+        v.sort();
+        assert_eq!(v[0], PathTier::NoRouter);
+        assert_eq!(v[3], PathTier::Relay);
+    }
+}
