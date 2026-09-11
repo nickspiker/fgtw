@@ -319,15 +319,11 @@ pub enum PathTier {
 
 /// Classify a validated direct path to `peer`, given our own LAN v4.
 ///
-/// The same-subnet check is the whole point and cannot be skipped: judging "local" from the
-/// address SHAPE calls every RFC-1918 address same-room, and carrier CGNAT hands cellular
-/// devices 10.x — so a carrier-internal path to a peer hundreds of miles away rings LAN
-/// (photon field bug, 2026-08-30). Private-but-foreign is a real direct path, but it is WAN.
+/// The same-subnet check is the whole point and cannot be skipped: judging "local" from the address SHAPE calls every RFC-1918 address same-room, and carrier CGNAT hands cellular devices 10.x — so a carrier-internal path to a peer hundreds of miles away rings LAN (photon field bug, 2026-08-30). Private-but-foreign is a real direct path, but it is WAN.
 pub fn classify_path(peer: &SocketAddr, our_v4: Option<Ipv4Addr>) -> PathTier {
     match peer.ip() {
         IpAddr::V4(v4) => {
-            // The reserved Wi-Fi Direct subnet is vouched by group membership, not by sharing
-            // our infra /24 — and CGNAT never hands it out, so the shape check is safe here.
+            // The reserved Wi-Fi Direct subnet is vouched by group membership, not by sharing our infra /24 — and CGNAT never hands it out, so the shape check is safe here.
             if is_wfd_subnet(v4) || v4.is_link_local() {
                 PathTier::NoRouter
             } else if is_private_ipv4(v4) && peer_lan_reachable(v4, our_v4) {
@@ -371,8 +367,7 @@ mod tier_tests {
         assert_eq!(classify_path(&sa("192.168.1.156:21118"), ours), PathTier::Lan);
     }
 
-    /// The 2026-08-30 field bug: carrier CGNAT hands out 10.x, so a private address off our own
-    /// subnet is a real direct path but emphatically not "same room".
+    /// The 2026-08-30 field bug: carrier CGNAT hands out 10.x, so a private address off our own subnet is a real direct path but emphatically not "same room".
     #[test]
     fn private_but_foreign_is_wan_not_lan() {
         let ours = Some(v4("192.168.1.161"));

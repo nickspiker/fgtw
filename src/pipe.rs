@@ -109,9 +109,7 @@ pub const RD_FLAG_SYN: u8 = 1;
 pub const RD_FLAG_FIN: u8 = 2;
 /// Retransmit request: `seq` names the frame the sender must send again, and `data` is empty. The relay is live-only with no mailbox, so a frame in flight while the recipient's pipe reconnects is simply dropped; the receiver notices the gap and asks for it rather than stalling on a byte stream that can never resync.
 pub const RD_FLAG_NACK: u8 = 4;
-/// The frame carries a [`CandidateOffer`], not stream bytes: the two ends telling each other
-/// where to aim a hole punch. Signalling rides the relay pipe because it is the one channel
-/// that already works before any direct path exists — which is exactly the bootstrap problem.
+/// The frame carries a [`CandidateOffer`], not stream bytes: the two ends telling each other where to aim a hole punch. Signalling rides the relay pipe because it is the one channel that already works before any direct path exists — which is exactly the bootstrap problem.
 pub const RD_FLAG_PUNCH: u8 = 8;
 /// Fixed header length.
 pub const RD_HEADER_LEN: usize = 4 + 16 + 8 + 1;
@@ -240,18 +238,14 @@ use std::net::SocketAddr;
 
 /// The addresses a peer can be punched at, offered over the relay pipe.
 ///
-/// Both ends send one as soon as a session starts, then probe every address the other listed.
-/// A probe's ack carries the responder's view of our source address, so the exchange doubles as
-/// reflexive discovery — no STUN server, and nothing the seed has to be able to do (Cloudflare
-/// Workers cannot speak UDP at all, so a worker-side echo was never an option).
+/// Both ends send one as soon as a session starts, then probe every address the other listed. A probe's ack carries the responder's view of our source address, so the exchange doubles as reflexive discovery — no STUN server, and nothing the seed has to be able to do (Cloudflare Workers cannot speak UDP at all, so a worker-side echo was never an option).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CandidateOffer {
     pub addrs: Vec<SocketAddr>,
 }
 
 impl CandidateOffer {
-    /// `count:u8 ‖ (len:u8 ‖ addr-bytes)*` — addresses use traverse's own encoding so the punch
-    /// path has exactly one address format end to end.
+    /// `count:u8 ‖ (len:u8 ‖ addr-bytes)*` — addresses use traverse's own encoding so the punch path has exactly one address format end to end.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + self.addrs.len() * 19);
         out.push(self.addrs.len().min(u8::MAX as usize) as u8);
@@ -263,8 +257,7 @@ impl CandidateOffer {
         out
     }
 
-    /// Decode an offer. `None` on any malformed input — a peer that cannot be parsed simply
-    /// gets no direct path, never a fault.
+    /// Decode an offer. `None` on any malformed input — a peer that cannot be parsed simply gets no direct path, never a fault.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&count, mut rest) = bytes.split_first()?;
         let mut addrs = Vec::with_capacity(count as usize);
