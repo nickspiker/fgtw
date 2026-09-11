@@ -122,7 +122,15 @@ pub fn gather_peer_candidates(
     for ep in endpoints {
         if let Some(pub_addr) = ep.public {
             if !is_bogus_addr(&pub_addr) {
-                set.add(Candidate::new(pub_addr, public_kind(&pub_addr)));
+                // A PRIVATE v4 in the public slot is a LAN address whatever column it arrived in — a device that learned its reflexive from a same-LAN observer publishes exactly this (field 2026-09-11: a phone on cellular aimed a wave at 192.168.1.163 because it sat in the peer's PUBLIC field). It joins only under the LAN policy, never as a public candidate.
+                match pub_addr.ip() {
+                    IpAddr::V4(v4) if is_private_ipv4(v4) => {
+                        if policy.admits(v4) {
+                            set.add(Candidate::new(pub_addr, CandidateKind::HostV4Lan));
+                        }
+                    }
+                    _ => set.add(Candidate::new(pub_addr, public_kind(&pub_addr))),
+                }
             }
         }
         if let Some(lan_addr) = ep.lan {
@@ -391,5 +399,29 @@ mod tier_tests {
         v.sort();
         assert_eq!(v[0], PathTier::NoRouter);
         assert_eq!(v[3], PathTier::Relay);
+    }
+}
+
+#[cfg(test)]
+mod public_slot_tests {
+    use super::*;
+
+    fn ep(public: &str) -> PeerEndpoint {
+        PeerEndpoint { public: Some(public.parse().unwrap()), lan: None }
+    }
+
+    /// A private v4 published as a "public" address is a LAN address in disguise: gated by the LAN policy like any other.
+    #[test]
+    fn a_private_v4_in_the_public_slot_obeys_the_lan_policy() {
+        let none = gather_peer_candidates(&[ep("192.168.1.163:4383")], None, LanPolicy::SameSubnetAs(None));
+        assert!(none.sorted().is_empty(), "off-LAN (our address unknown) it is no route at all");
+        let foreign = gather_peer_candidates(&[ep("192.168.1.163:4383")], None, LanPolicy::SameSubnetAs(Some("100.91.131.105".parse().unwrap())));
+        assert!(foreign.sorted().is_empty(), "a carrier-NAT phone cannot reach a home LAN");
+        let same = gather_peer_candidates(&[ep("192.168.1.163:4383")], None, LanPolicy::SameSubnetAs(Some("192.168.1.161".parse().unwrap())));
+        let got = same.sorted();
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0].kind, CandidateKind::HostV4Lan), "on the same /24 it is a LAN candidate, never a public one");
+        let public = gather_peer_candidates(&[ep("97.186.10.184:4383")], None, LanPolicy::SameSubnetAs(None));
+        assert_eq!(public.sorted().len(), 1, "a real public address is untouched by the policy");
     }
 }

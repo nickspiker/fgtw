@@ -86,6 +86,13 @@ impl ReflexiveState {
         Some(observed)
     }
 
+    /// Forget every adopted address and pending vote: the interface changed under us, so what the world observed before is about a network we have left. A stale PUBLIC address is the worse ghost now that a LAN observation can no longer unseat it.
+    pub fn clear(&mut self) {
+        self.v4 = None;
+        self.v6 = None;
+        self.votes.clear();
+    }
+
     pub fn v4(&self) -> Option<SocketAddr> {
         self.v4
     }
