@@ -109,6 +109,10 @@ pub const RD_FLAG_SYN: u8 = 1;
 pub const RD_FLAG_FIN: u8 = 2;
 /// Retransmit request: `seq` names the frame the sender must send again, and `data` is empty. The relay is live-only with no mailbox, so a frame in flight while the recipient's pipe reconnects is simply dropped; the receiver notices the gap and asks for it rather than stalling on a byte stream that can never resync.
 pub const RD_FLAG_NACK: u8 = 4;
+/// The frame carries a [`CandidateOffer`], not stream bytes: the two ends telling each other
+/// where to aim a hole punch. Signalling rides the relay pipe because it is the one channel
+/// that already works before any direct path exists — which is exactly the bootstrap problem.
+pub const RD_FLAG_PUNCH: u8 = 8;
 /// Fixed header length.
 pub const RD_HEADER_LEN: usize = 4 + 16 + 8 + 1;
 
@@ -228,5 +232,102 @@ mod tests {
         let env = build_relay_envelope(&sender, &[2u8; 32], Some(SVC_RUSTDESK), &frame.encode()).unwrap();
         let (_, inner) = peel_relay_envelope(&env).unwrap();
         assert_eq!(RdFrame::decode(&inner), Some(frame));
+    }
+}
+
+
+use std::net::SocketAddr;
+
+/// The addresses a peer can be punched at, offered over the relay pipe.
+///
+/// Both ends send one as soon as a session starts, then probe every address the other listed.
+/// A probe's ack carries the responder's view of our source address, so the exchange doubles as
+/// reflexive discovery — no STUN server, and nothing the seed has to be able to do (Cloudflare
+/// Workers cannot speak UDP at all, so a worker-side echo was never an option).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CandidateOffer {
+    pub addrs: Vec<SocketAddr>,
+}
+
+impl CandidateOffer {
+    /// `count:u8 ‖ (len:u8 ‖ addr-bytes)*` — addresses use traverse's own encoding so the punch
+    /// path has exactly one address format end to end.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.addrs.len() * 19);
+        out.push(self.addrs.len().min(u8::MAX as usize) as u8);
+        for a in self.addrs.iter().take(u8::MAX as usize) {
+            let b = crate::traverse::wire::socketaddr_to_bytes(a);
+            out.push(b.len() as u8);
+            out.extend_from_slice(&b);
+        }
+        out
+    }
+
+    /// Decode an offer. `None` on any malformed input — a peer that cannot be parsed simply
+    /// gets no direct path, never a fault.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&count, mut rest) = bytes.split_first()?;
+        let mut addrs = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let (&len, tail) = rest.split_first()?;
+            let len = len as usize;
+            if tail.len() < len {
+                return None;
+            }
+            let (body, tail) = tail.split_at(len);
+            addrs.push(crate::traverse::wire::bytes_to_socketaddr(body)?);
+            rest = tail;
+        }
+        Some(Self { addrs })
+    }
+}
+
+#[cfg(test)]
+mod candidate_offer_tests {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn round_trips_v4_and_v6() {
+        let offer = CandidateOffer {
+            addrs: vec![
+                sa("192.168.1.156:21118"),
+                sa("203.0.113.7:41234"),
+                sa("[2001:db8::1]:21118"),
+            ],
+        };
+        assert_eq!(CandidateOffer::decode(&offer.encode()), Some(offer));
+    }
+
+    #[test]
+    fn an_empty_offer_is_valid() {
+        let offer = CandidateOffer::default();
+        assert_eq!(CandidateOffer::decode(&offer.encode()), Some(offer));
+    }
+
+    #[test]
+    fn truncated_input_decodes_to_nothing_rather_than_panicking() {
+        let full = CandidateOffer { addrs: vec![sa("192.168.1.5:4383")] }.encode();
+        for cut in 0..full.len() {
+            let _ = CandidateOffer::decode(&full[..cut]); // must not panic
+        }
+        assert_eq!(CandidateOffer::decode(&[]), None);
+    }
+
+    #[test]
+    fn a_punch_frame_is_not_mistaken_for_stream_bytes() {
+        let offer = CandidateOffer { addrs: vec![sa("10.0.0.2:4383")] };
+        let frame = RdFrame {
+            conn: [7u8; 16],
+            seq: 0,
+            flags: RD_FLAG_PUNCH,
+            data: offer.encode(),
+        };
+        let decoded = RdFrame::decode(&frame.encode()).expect("decodes");
+        assert_eq!(decoded.flags & RD_FLAG_PUNCH, RD_FLAG_PUNCH);
+        assert_eq!(CandidateOffer::decode(&decoded.data), Some(offer));
     }
 }
