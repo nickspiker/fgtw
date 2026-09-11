@@ -35,6 +35,14 @@ impl ReflexiveState {
     /// Otherwise the address must be seen from [`QUORUM`] distinct sources before adoption (anti-poison).
     ///
     /// Returns `Some(addr)` when this observation *changed* the adopted address for its family (the caller should then update `PhotonApp.our_reflexive` and re-announce), else `None`.
+    /// Is this address one only a LAN can see? A same-LAN observer reports it; the internet never does.
+    fn is_lan_scope(addr: &SocketAddr) -> bool {
+        match addr.ip() {
+            IpAddr::V4(v4) => super::gather::is_private_ipv4(v4),
+            IpAddr::V6(v6) => v6.is_unique_local() || v6.is_unicast_link_local(),
+        }
+    }
+
     pub fn record(
         &mut self,
         observed: SocketAddr,
@@ -58,11 +66,17 @@ impl ReflexiveState {
             return None;
         }
 
+        // PUBLIC BEATS PRIVATE (field 2026-09-11): on a home LAN, the peers that echo our pings are on that same LAN, so what they observe is our LAN address — and adopting it as our REFLEXIVE address tells the whole fleet that our public address is 192.168.x. A phone on a carrier network then has nothing but a black hole to aim at, which is exactly how a wave could ring, answer, and carry no audio.
+        // A private observation is still worth keeping when we have nothing better (a LAN-only fleet with no internet must still publish something gossip can use), so it fills an empty slot but never displaces a public one.
+        let private = Self::is_lan_scope(&observed);
         let slot = if observed.is_ipv4() {
             &mut self.v4
         } else {
             &mut self.v6
         };
+        if private && slot.is_some_and(|held| !Self::is_lan_scope(&held)) {
+            return None; // a same-LAN observer cannot unseat the address the internet sees
+        }
         if *slot == Some(observed) {
             return None; // already adopted — no change, no re-announce
         }
@@ -83,6 +97,34 @@ impl ReflexiveState {
     /// This node's adopted public IP (prefers v4, falls back to v6). Currently informational; kept for candidate gathering and any future same-NAT/hairpin use (the old `Contact::best_addr` path was dead and removed — `race_addrs` already covers same-NAT by racing the LAN candidate).
     pub fn public_ip(&self) -> Option<IpAddr> {
         self.v4.map(|a| a.ip()).or_else(|| self.v6.map(|a| a.ip()))
+    }
+}
+
+#[cfg(test)]
+mod lan_scope_tests {
+    use super::*;
+
+    fn a(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A same-LAN observer must never unseat the address the internet sees (field 2026-09-11: a phone on a home LAN published 192.168.x as its public address, so a peer on a carrier network had only a black hole to aim at).
+    #[test]
+    fn a_public_reflexive_outranks_a_same_lan_observation() {
+        let mut r = ReflexiveState::new();
+        assert_eq!(r.record(a("97.186.10.184:4383"), [1u8; 32], true), Some(a("97.186.10.184:4383")));
+        assert_eq!(r.record(a("192.168.1.163:4383"), [2u8; 32], true), None, "a LAN observation cannot displace a public one");
+        assert_eq!(r.v4(), Some(a("97.186.10.184:4383")));
+    }
+
+    /// …but a LAN-only fleet still has something to publish: a private observation fills an empty slot, and a public one later replaces it.
+    #[test]
+    fn a_private_observation_fills_an_empty_slot_and_yields_to_a_public_one() {
+        let mut r = ReflexiveState::new();
+        assert_eq!(r.record(a("192.168.1.163:4383"), [2u8; 32], true), Some(a("192.168.1.163:4383")));
+        assert_eq!(r.v4(), Some(a("192.168.1.163:4383")));
+        assert_eq!(r.record(a("97.186.10.184:4383"), [1u8; 32], true), Some(a("97.186.10.184:4383")), "the internet's view takes over");
+        assert_eq!(r.v4(), Some(a("97.186.10.184:4383")));
     }
 }
 
