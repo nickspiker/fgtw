@@ -326,8 +326,8 @@ pub enum PathTier {
 }
 
 impl PathTier {
-    /// The stable string a UI keys its colour off. Shared so the same path never renders one
-    /// colour in one app and another elsewhere.
+    /// The stable string a UI keys its colour off.
+    /// Shared so the same path never renders one colour in one app and another elsewhere.
     pub fn tag(self) -> &'static str {
         match self {
             Self::NoRouter => "norouter",
