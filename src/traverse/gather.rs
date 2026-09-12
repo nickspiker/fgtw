@@ -325,6 +325,19 @@ pub enum PathTier {
     Relay,
 }
 
+impl PathTier {
+    /// The stable string a UI keys its colour off. Shared so the same path never renders one
+    /// colour in one app and another elsewhere.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NoRouter => "norouter",
+            Self::Lan => "lan",
+            Self::Wan => "wan",
+            Self::Relay => "relay",
+        }
+    }
+}
+
 /// Classify a validated direct path to `peer`, given our own LAN v4.
 ///
 /// The same-subnet check is the whole point and cannot be skipped: judging "local" from the address SHAPE calls every RFC-1918 address same-room, and carrier CGNAT hands cellular devices 10.x — so a carrier-internal path to a peer hundreds of miles away rings LAN (photon field bug, 2026-08-30). Private-but-foreign is a real direct path, but it is WAN.
