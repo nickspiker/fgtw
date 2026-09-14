@@ -23,7 +23,8 @@ pub fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
 /// [`is_foreign_peer_lan`]).
 pub fn is_private_ipv4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+    // RFC 6598 shared address space, 100.64.0.0/10: the carrier-NAT side of a cellular interface (field 2026-09-14, Nick on cellular: his phone published 100.89.95.206 as its public address, the peer aimed media there, nothing could ever arrive). LAN-scope like the RFC 1918 blocks — never a public candidate.
+    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) || (o[0] == 100 && (64..=127).contains(&o[1]))
 }
 
 /// Classify a peer public address: a v6 public address is a direct host (no NAT rewriting v6,
