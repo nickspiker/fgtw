@@ -37,10 +37,29 @@ use vsf::VsfType;
 
 /// Signature-scheme tag (the egg label). Wire-stable: append, never renumber.
 pub mod scheme {
+    /// Elliptic-curve family (ECDLP). The device key itself, so EVERY device can always produce this one.
     pub const ED25519: u8 = 0;
-    // Reserved for the additive PQ eggs:
-    // pub const FALCON512: u8 = 1;
-    // pub const SPHINCS_PLUS: u8 = 2;
+    /// Lattice family (NTRU/SIS). 897 B key, 666 B signature.
+    pub const FALCON512: u8 = 1;
+    /// Hash family (preimage resistance) — the backstop if curves and lattices both fall. 32 B key, 7856 B signature.
+    pub const SPHINCS_PLUS: u8 = 2;
+
+    /// A set of schemes as a bitmask, bit N = scheme N. The currency of the fleet's capability floor.
+    pub type Mask = u16;
+
+    /// The mask every device satisfies unconditionally — its device key IS an Ed25519 key, so a member that has declared nothing still honestly has this much.
+    pub const MASK_BASE: Mask = 1 << ED25519;
+
+    /// All three families. What a fully-upgraded fleet reaches.
+    pub const MASK_ALL: Mask = (1 << ED25519) | (1 << FALCON512) | (1 << SPHINCS_PLUS);
+
+    /// `true` if `mask` contains every scheme in `required`.
+    pub fn covers(mask: Mask, required: Mask) -> bool {
+        mask & required == required
+    }
+
+    /// Schemes this build knows how to verify. An op demanding anything outside this is rejected rather than skipped — a verifier must never silently treat an unknown scheme as satisfied.
+    pub const MASK_KNOWN: Mask = MASK_ALL;
 }
 
 /// One signature egg: which scheme, and the signature bytes.
@@ -58,6 +77,8 @@ pub enum OpKind {
     Add = 1,
     Remove = 2,
     Checkpoint = 3,
+    /// A member publishes its own key bundle, raising what it can sign with. Self-signed only — you may declare your keys and nobody else's. The transition instrument: existing members declare to lift the fleet's floor, while devices joining afterwards carry their bundle on the Add itself.
+    Declare = 4,
 }
 
 impl OpKind {
@@ -67,6 +88,7 @@ impl OpKind {
             1 => Some(OpKind::Add),
             2 => Some(OpKind::Remove),
             3 => Some(OpKind::Checkpoint),
+            4 => Some(OpKind::Declare),
             _ => None,
         }
     }
@@ -105,6 +127,10 @@ pub struct FleetOp {
     pub sigs: Vec<Egg>,
     /// Which preimage rule this op's signatures were made under — see [`OpVersion`]. Absent on the wire for every op written before the egg work, which decodes as `V1` and is what keeps existing chains folding.
     pub version: OpVersion,
+    /// ADD and DECLARE only: `BLAKE3` over the subject device's full public-key bundle, in scheme-tag order. 32 bytes regardless of how many schemes the bundle holds, so the chain never grows with the scheme count — the bundle itself travels at verification time and is checked against this. Zero when the device has declared nothing.
+    pub bundle_commit: [u8; 32],
+    /// ADD and DECLARE only: which schemes [`bundle_commit`](FleetOp::bundle_commit) covers, as a [`scheme::Mask`]. Zero elsewhere; a member that has never declared counts as [`scheme::MASK_BASE`].
+    pub schemes: scheme::Mask,
 }
 
 /// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove).
@@ -236,6 +262,11 @@ impl FleetOp {
             b.extend_from_slice(&self.ckpt_commit);
             b.extend_from_slice(&self.ckpt_fanout_epoch.to_le_bytes());
         }
+        // The key-bundle declaration, bound in so a device's advertised capability can't be edited under its own signature. Kind-gated like the checkpoint triple, and v2-only because no v1 op ever carried it.
+        if self.version == OpVersion::V2 && matches!(self.kind, OpKind::Add | OpKind::Declare) {
+            b.extend_from_slice(&self.bundle_commit);
+            b.extend_from_slice(&self.schemes.to_le_bytes());
+        }
         b
     }
 
@@ -347,6 +378,16 @@ pub enum FoldError {
     CheckpointMalformed { index: usize },
     /// A Checkpoint whose `k` is not exactly the previous checkpoint's `k + 1` (first is 1) — a skipped or replayed epoch index.
     CheckpointOutOfSequence { index: usize },
+    /// Bundle fields on an op kind that never carries them — only Add and Declare do.
+    StrayBundle { index: usize },
+    /// A declared scheme mask that is internally impossible: missing Ed25519 (every device has it), naming a scheme this build cannot verify, or claiming schemes with no commitment to the keys behind them.
+    BadBundle { index: usize },
+    /// A Declare signed by somebody other than its subject. A device may raise its OWN capability and nobody else's.
+    DeclareNotSelfSigned { index: usize },
+    /// A Declare that drops a scheme the device had already proved. Capability is monotonic per device, or renouncing would be a way to lower the fleet floor without adding anyone.
+    CapabilityRegression { index: usize },
+    /// An Add whose device cannot sign with everything the fleet already requires. THE RATCHET: admitting it would lower the floor, so it does not fold at all.
+    BelowFloor { index: usize },
     /// A Remove signed by anyone but the departing device itself — expulsion doesn't exist (self-signed departure only).
     RemoveNotSelfSigned { index: usize },
     /// A consented Remove whose approver egg is the leaving device's own — the countersignature must come from a DIFFERENT surviving member (two devices, two signatures).
@@ -376,10 +417,19 @@ impl MembershipBlob {
     /// This is the heart of the design and the part FGTW must mirror exactly: each op must (1) link to the prior op by hash, (2) carry valid signature(s), and (3) be signed by a device that was a member *before* this op (genesis excepted — it's self-signed into an empty set).
     /// Returns the live device pubkeys in insertion order, or the first rule it violated.
     pub fn fold(&self) -> Result<Vec<[u8; 32]>, FoldError> {
+        self.fold_inner().map(|(members, _)| members)
+    }
+
+    /// The single chain walk behind [`fold`](MembershipBlob::fold) and [`scheme_floor`](MembershipBlob::scheme_floor) — one traversal, both answers, so the two can never disagree about the same chain.
+    fn fold_inner(&self) -> Result<(Vec<[u8; 32]>, scheme::Mask), FoldError> {
         if self.ops.is_empty() {
             return Err(FoldError::Empty);
         }
         let mut members: Vec<[u8; 32]> = Vec::new();
+        // What each member has declared it can sign with. Absent = `scheme::MASK_BASE`: no special "undeclared" state, because every device genuinely holds an Ed25519 key.
+        let mut declared: Vec<([u8; 32], scheme::Mask)> = Vec::new();
+        // The fleet's capability floor, RATCHETED. It only ever rises, so a device joining with less cannot drag the fleet back to single-egg — that op simply does not fold.
+        let mut floor: scheme::Mask = scheme::MASK_BASE;
         let mut expected_prev = [0u8; 32];
         let mut last_ckpt_k = 0u64;
         let identity = self.ops[0].handle_proof;
@@ -407,6 +457,18 @@ impl MembershipBlob {
             if op.kind != OpKind::Checkpoint && (op.ckpt_k != 0 || op.ckpt_commit != [0u8; 32] || op.ckpt_fanout_epoch != 0) {
                 return Err(FoldError::StrayCheckpoint { index: i });
             }
+            if !matches!(op.kind, OpKind::Add | OpKind::Declare) && (op.bundle_commit != [0u8; 32] || op.schemes != 0) {
+                return Err(FoldError::StrayBundle { index: i });
+            }
+            // A declared mask must be self-consistent and knowable: it always contains Ed25519, it never claims a scheme this build cannot verify, and it comes with a commitment to the keys it names.
+            if matches!(op.kind, OpKind::Add | OpKind::Declare) && op.schemes != 0 {
+                if !scheme::covers(op.schemes, scheme::MASK_BASE)
+                    || !scheme::covers(scheme::MASK_KNOWN, op.schemes)
+                    || op.bundle_commit == [0u8; 32]
+                {
+                    return Err(FoldError::BadBundle { index: i });
+                }
+            }
             if !op.verify_sigs() {
                 return Err(FoldError::BadSignature { index: i });
             }
@@ -428,6 +490,25 @@ impl MembershipBlob {
                     }
                     members.push(op.device_pubkey);
                 }
+                OpKind::Declare => {
+                    // Self-declaration only: a device may raise what IT can sign with, never what another device claims.
+                    if op.signer_pubkey != op.device_pubkey {
+                        return Err(FoldError::DeclareNotSelfSigned { index: i });
+                    }
+                    if !members.contains(&op.device_pubkey) {
+                        return Err(FoldError::SignerNotMember { index: i });
+                    }
+                    let mask = op.schemes.max(scheme::MASK_BASE);
+                    // Capability is monotonic per device too — a device cannot quietly renounce a scheme it already proved, which would otherwise be the way to drag the floor down without adding anybody.
+                    if let Some(slot) = declared.iter_mut().find(|(d, _)| *d == op.device_pubkey) {
+                        if !scheme::covers(mask, slot.1) {
+                            return Err(FoldError::CapabilityRegression { index: i });
+                        }
+                        slot.1 = mask;
+                    } else {
+                        declared.push((op.device_pubkey, mask));
+                    }
+                }
                 OpKind::Add => {
                     if !members.contains(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
@@ -443,7 +524,13 @@ impl MembershipBlob {
                     if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
                         return Err(FoldError::ConsentStale { index: i });
                     }
+                    // THE RATCHET. A device joining below the fleet's established floor would lower it, so it is refused outright rather than admitted and tolerated. This is what stops a single-egg device silently undoing a completed upgrade.
+                    let mask = op.schemes.max(scheme::MASK_BASE);
+                    if !scheme::covers(mask, floor) {
+                        return Err(FoldError::BelowFloor { index: i });
+                    }
                     members.push(op.device_pubkey);
+                    declared.push((op.device_pubkey, mask));
                 }
                 OpKind::Remove => {
                     if !members.contains(&op.signer_pubkey) {
@@ -486,9 +573,29 @@ impl MembershipBlob {
                     last_ckpt_k = op.ckpt_k;
                 }
             }
+            // Recompute the floor from the CURRENT membership after every op, then ratchet: the AND across members is what the whole fleet can do, and `max` with the running value is what stops a departure or a fresh fold from lowering it.
+            let live = members
+                .iter()
+                .map(|m| declared.iter().find(|(d, _)| d == m).map(|(_, k)| *k).unwrap_or(scheme::MASK_BASE))
+                .fold(scheme::MASK_ALL, |a, b| a & b);
+            floor |= live;
             expected_prev = op.chain_hash();
         }
-        Ok(members)
+        Ok((members, floor))
+    }
+
+    /// The fleet's signature-capability FLOOR: the schemes every current member has proved it can sign with.
+    ///
+    /// Derived, never stored. Two devices reaching the same conclusion at the same moment is not a race, a truncated chain cannot understate it any more than it can understate membership (the same tip monotonicity guards both), and there is no flag to forge — lifting the floor means producing a [`OpKind::Declare`] op, which needs the device key.
+    ///
+    /// This is the automatic promotion: when the LAST member declares a scheme, the AND across members gains that bit and the whole fleet is at the higher floor with nothing published to announce it. Ratcheted inside [`MembershipBlob::fold`], so it never falls.
+    pub fn scheme_floor(&self) -> Result<scheme::Mask, FoldError> {
+        self.fold_full().map(|(_, floor)| floor)
+    }
+
+    /// [`MembershipBlob::fold`] plus the ratcheted [`scheme_floor`](MembershipBlob::scheme_floor), for callers that want both without folding twice.
+    pub fn fold_full(&self) -> Result<(Vec<[u8; 32]>, scheme::Mask), FoldError> {
+        self.fold_inner()
     }
 
     /// Fold to the current member set AND return the tip op's eagle time (the timestamp of the last applied op). `(members, tip_et)`. The freshness signal a consumer uses to never regress to a stale (pre-removal) view of someone's membership: a fold with an older tip than one already adopted is ignored. `tip_et` is 0 only for the impossible empty-but-Ok case (fold errors on empty).
@@ -558,8 +665,32 @@ impl MembershipBlob {
             Some(&identity_key),
             None,
             None,
+            None,
         );
         MembershipBlob { ops: vec![op] }
+    }
+
+    /// A member publishes its own key bundle, raising what it can sign with.
+    ///
+    /// Self-signed by construction: `sign_op` is handed the declaring device's key as both signer and subject, so a device can only ever raise its OWN capability. When the last member declares a scheme, [`scheme_floor`](MembershipBlob::scheme_floor) gains that bit on its own — that is the whole promotion, with nothing published to announce it.
+    pub fn declare(&mut self, device_key: &Keypair, eagle_time: i64, bundle_commit: [u8; 32], schemes: scheme::Mask) {
+        let hp = self.ops[0].handle_proof;
+        let pk = device_key.public.to_bytes();
+        let op = sign_op(
+            device_key,
+            hp,
+            self.head(),
+            OpKind::Declare,
+            pk,
+            eagle_time,
+            pk,
+            [0u8; 32],
+            None,
+            None,
+            None,
+            Some((bundle_commit, schemes)),
+        );
+        self.ops.push(op);
     }
 
     /// Start a brand-new **v2** fleet (docs/identity-succession.md): identical to [`genesis`] except the genesis carries NO `identity_sig` — only the `identity_pubkey` the bindreq anti-spam gate keys off. The inert self-cosignature (which proved only handle-string knowledge, never ownership — docs/fleet-identity-remediation.md) is gone from the wire. `signing_bytes` is unchanged (the device egg still commits to `identity_pubkey`), and `chain_hash` naturally excludes the now-empty `identity_sig` (blake3 over zero bytes is a no-op), so a v2 genesis links exactly like a v1 one minus that field. `fold` accepts it. This is what new fleets found under.
@@ -584,6 +715,7 @@ impl MembershipBlob {
             None, // v2: embed the pubkey, do NOT sign the inert identity_sig
             None,
             None,
+            None,
         );
         MembershipBlob { ops: vec![op] }
     }
@@ -603,6 +735,7 @@ impl MembershipBlob {
             None,
             Some((consent_t, consent_sig)),
             None,
+            None,
         );
         self.ops.push(op);
     }
@@ -620,6 +753,7 @@ impl MembershipBlob {
             eagle_time,
             pk,
             [0u8; 32],
+            None,
             None,
             None,
             None,
@@ -642,6 +776,7 @@ impl MembershipBlob {
             None,
             Some((consent_t, consent_sig)),
             None,
+            None,
         );
         self.ops.push(op);
     }
@@ -662,6 +797,7 @@ impl MembershipBlob {
             None,
             None,
             Some((k, commit, fanout_epoch)),
+            None,
         );
         self.ops.push(op);
     }
@@ -885,13 +1021,18 @@ fn sign_op(
     identity_signer: Option<&ed25519_dalek::SigningKey>,
     consent: Option<(i64, Vec<u8>)>,
     checkpoint: Option<(u64, [u8; 32], u64)>,
+    // `bundle`: ADD / DECLARE carry the subject's key-bundle commitment and the schemes it covers. None everywhere else, and on an Add whose device has declared nothing yet.
+    bundle: Option<([u8; 32], scheme::Mask)>,
 ) -> FleetOp {
     use ed25519_dalek::Signer;
     let (consent_t, consent_sig) = consent.unwrap_or((0, Vec::new()));
     let (ckpt_k, ckpt_commit, ckpt_fanout_epoch) = checkpoint.unwrap_or((0, [0u8; 32], 0));
+    let (bundle_commit, schemes) = bundle.unwrap_or(([0u8; 32], 0));
     let mut op = FleetOp {
         // Newly minted ops are v2 — framed preimages, the shape multi-scheme eggs need. Existing ops keep whatever version they were written under.
         version: OpVersion::V2,
+        bundle_commit,
+        schemes,
         handle_proof,
         prev_hash,
         kind,
@@ -953,6 +1094,11 @@ fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
         values.push(VsfType::u(op.ckpt_k as usize, false));
         values.push(VsfType::hb(op.ckpt_commit.to_vec()));
         values.push(VsfType::u(op.ckpt_fanout_epoch as usize, false));
+    }
+    // ADD / DECLARE: the key-bundle commitment and the schemes it covers. `hb` here discriminates from the egg tail, which always starts with a `u` scheme — the same type trick the genesis and consented-remove splits use. Omitted when nothing is declared, so an Add from an undeclared device encodes byte-identically to before.
+    if matches!(op.kind, OpKind::Add | OpKind::Declare) && op.schemes != 0 {
+        values.push(VsfType::hb(op.bundle_commit.to_vec()));
+        values.push(VsfType::u(op.schemes as usize, false));
     }
     for egg in &op.sigs {
         values.push(VsfType::u(egg.scheme as usize, false));
@@ -1048,6 +1194,17 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
         i = 9;
     }
 
+    // ADD / DECLARE may carry the bundle pair here, discriminated by `hb` against the egg tail's leading `u`.
+    let mut bundle_commit = [0u8; 32];
+    let mut schemes: scheme::Mask = 0;
+    if matches!(kind, OpKind::Add | OpKind::Declare) {
+        if let Some(VsfType::hb(_)) = values.get(i) {
+            bundle_commit = take_hb32(&values[i], "bundle commit")?;
+            schemes = take_u64(values.get(i + 1).ok_or("fleet op: bundle missing scheme mask")?, "scheme mask")? as scheme::Mask;
+            i += 2;
+        }
+    }
+
     // Remaining values are (scheme:u, sig:ge) egg pairs.
     let mut sigs = Vec::new();
     while i + 1 < values.len() {
@@ -1067,6 +1224,8 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     }
     Ok(FleetOp {
         version,
+        bundle_commit,
+        schemes,
         handle_proof,
         prev_hash,
         kind,
@@ -1255,7 +1414,7 @@ mod tests {
         let (t, s) = consent_for(&b, 190);
         blob.add(&a, pk(&b), 200, t, s);
         // a tries to expel b — expulsion doesn't exist.
-        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), [0u8; 32], None, None, None);
+        let expel = sign_op(&a, HP, blob.head(), OpKind::Remove, pk(&b), 300, pk(&a), [0u8; 32], None, None, None, None);
         blob.ops.push(expel);
         assert_eq!(blob.fold(), Err(FoldError::RemoveNotSelfSigned { index: 2 }));
     }
@@ -1265,7 +1424,7 @@ mod tests {
         let a = key(1);
         let b = key(2);
         // A genesis whose signer != device is forged.
-        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), [0u8; 32], None, None, None);
+        let forged = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&b), 100, pk(&a), [0u8; 32], None, None, None, None);
         let blob = MembershipBlob { ops: vec![forged] };
         assert_eq!(blob.fold(), Err(FoldError::GenesisNotSelfSigned));
     }
@@ -1286,7 +1445,7 @@ mod tests {
         // Re-sign the tampered op correctly but leave its prev_hash stale → chain breaks instead.
         let a2 = key(1);
         let (t7, s7) = consent_for(&key(7), 190);
-        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), [0u8; 32], None, Some((t7, s7)), None);
+        blob.ops[1] = sign_op(&a2, HP, [1u8; 32], OpKind::Add, pk(&key(7)), 200, pk(&a2), [0u8; 32], None, Some((t7, s7)), None, None);
         assert_eq!(blob.fold(), Err(FoldError::BrokenChain { index: 1 }));
 
         // Swap the consent under the sponsor's egg — consent is in signing_bytes, so the egg breaks.
@@ -1345,6 +1504,84 @@ mod tests {
 
     /// A real chain written by the PRE-egg build (2026-08-12): genesis a, add b, b departs. Carries no version field, so it parses as v1 and must fold under v1 rules forever. Shared by the two tests that guard the migration.
     const PINNED_HEX: &str = "52c3853c7a330979330962337e6c3404136536237edeb2824c5c006870331f4d0baa0b8e1566fe11128f43a2a4e9483f82a5af4acd27a94e6df043bdc6a37f6862331f4f3f5a57908e2951a9b7d385510994b16ae44ba669157fc37af6b0d700a4f93b6e330128643305666c6565743a6f337e2c623403952c6e3303293e5b286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f00000000000000000000000000000000000000000000000000000000000000002c7533002c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000642c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c6b65331ffc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a272c6765333f39148ed5a51baf7f765600b277f8ac2fddf445b55ed8c261d3a8eca449a7286614d00939188337bd07f1248654b86bc5c6659f14f9d504ce0fc5fded4b3d30092c7533002c6765333feb2b722e7d441cec833a63f76026ae7aadb29316d0164bfb61d4c2f34866bf3a4e53c5c6d628f12f32613316cabece5e32a53c4b4ff3bb147ccecfd9cc2e580b29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f934c5a5c68855e63a020b9a8da384f37b3cb0ccf7d6a090c56130cbad4a90d912c7533012c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c653600000000000000c82c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000be2c6765333f0d5b6753187a455f5f2ae54016ecbc96b082e5d58f2bc768ebe6686baf21f18ad5527b359610eeda8ac917e04f4d92ddc242ed26bbd7bf4cb0f210e7ea292b082c7533002c6765333f1aa37898dea850c91e4c57c133fa3ef49f648f62b96d55b768adba460a463db2a031e1d92e1b923c2490e61ff237490227cc795ce61ae1969f7ee9a3047f240e29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331fbb1daf28635b791d0c66592c912d78bd71ade425974d947601464709b16c65712c7533022c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c6536000000000000012c2c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c7533002c6765333f75b772ee48e506047eca02a0db47b81d9bb708caa6478172a001eb5cbb8f3cee45de3fcc818477127f87142ced6f4c89fa008d3ca19aa4e4923347a3e7699b09295d";
+
+    /// The promotion is automatic: the floor rises the moment the LAST member declares, with nothing published to announce it.
+    #[test]
+    fn floor_rises_when_the_last_member_declares() {
+        const FALCON: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+
+        // Nobody has declared: every device honestly holds an Ed25519 key and nothing more is proved.
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_BASE);
+
+        // One of two declares — the fleet is NOT promoted, because the other member still cannot sign that way.
+        blob.declare(&a, 300, [0xA1; 32], FALCON);
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_BASE, "a partial upgrade must not promote the fleet");
+
+        // The last one declares, and the floor rises by itself.
+        blob.declare(&b, 400, [0xB2; 32], FALCON);
+        assert_eq!(blob.scheme_floor().unwrap(), FALCON, "the floor is the AND across members");
+    }
+
+    /// The ratchet: once promoted, a fleet cannot be dragged back to single-egg by admitting a device that cannot keep up.
+    #[test]
+    fn a_device_below_the_floor_cannot_join() {
+        const FALCON: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.declare(&a, 200, [0xA1; 32], FALCON);
+        assert_eq!(blob.scheme_floor().unwrap(), FALCON);
+
+        // b joins declaring nothing — it would lower the floor, so the op does not fold at all.
+        let (t, s) = consent_for(&b, 290);
+        blob.add(&a, pk(&b), 300, t, s);
+        assert_eq!(blob.fold(), Err(FoldError::BelowFloor { index: 2 }));
+    }
+
+    /// A member cannot renounce a scheme it already proved — the other route to lowering the floor.
+    #[test]
+    fn capability_cannot_regress() {
+        const FALCON: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
+        let a = key(1);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.declare(&a, 200, [0xA1; 32], FALCON);
+        blob.declare(&a, 300, [0xA1; 32], scheme::MASK_BASE);
+        assert_eq!(blob.fold(), Err(FoldError::CapabilityRegression { index: 2 }));
+    }
+
+    /// A device may raise its own capability and nobody else's.
+    #[test]
+    fn declare_must_be_self_signed() {
+        const FALCON: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        // a signs a declaration whose SUBJECT is b — vouching for capability b never proved.
+        let forged = sign_op(&a, HP, blob.head(), OpKind::Declare, pk(&b), 300, pk(&a), [0u8; 32], None, None, None, Some(([0xB2; 32], FALCON)));
+        blob.ops.push(forged);
+        assert_eq!(blob.fold(), Err(FoldError::DeclareNotSelfSigned { index: 2 }));
+    }
+
+    /// A declared mask must be self-consistent, and it must name only schemes this build can actually verify — an unknown scheme is rejected, never treated as satisfied.
+    #[test]
+    fn impossible_bundles_are_rejected() {
+        let a = key(1);
+        // Claims a scheme that does not exist in this build.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.declare(&a, 200, [0xA1; 32], scheme::MASK_BASE | (1 << 9));
+        assert_eq!(blob.fold(), Err(FoldError::BadBundle { index: 1 }));
+        // Claims schemes with no commitment to the keys behind them.
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        blob.declare(&a, 200, [0u8; 32], scheme::MASK_ALL);
+        assert_eq!(blob.fold(), Err(FoldError::BadBundle { index: 1 }));
+    }
 
     /// The migration itself: a v1 chain EXTENDS with v2 ops rather than being replaced.
     ///
@@ -1520,7 +1757,7 @@ mod tests {
     fn genesis_without_identity_pubkey_is_rejected() {
         // A genesis validly device-signed but carrying NO identity_pubkey (degenerate) — the bindreq gate would have no key, so fold refuses it. Built via sign_op directly (no public builder makes one).
         let a = key(1);
-        let op = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&a), 100, pk(&a), [0u8; 32], None, None, None);
+        let op = sign_op(&a, HP, [0u8; 32], OpKind::Genesis, pk(&a), 100, pk(&a), [0u8; 32], None, None, None, None);
         let blob = MembershipBlob { ops: vec![op] };
         assert_eq!(blob.fold(), Err(FoldError::BadIdentityBinding));
     }
@@ -1697,7 +1934,7 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::CheckpointMalformed { index: 1 }));
         // A checkpoint whose device field names someone other than its signer is void (the minter speaks for itself only).
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        let op = sign_op(&a, HP, blob.head(), OpKind::Checkpoint, pk(&key(7)), 200, pk(&a), [0u8; 32], None, None, Some((1, [0x11; 32], 1)));
+        let op = sign_op(&a, HP, blob.head(), OpKind::Checkpoint, pk(&key(7)), 200, pk(&a), [0u8; 32], None, None, Some((1, [0x11; 32], 1)), None);
         blob.ops.push(op);
         assert_eq!(blob.fold(), Err(FoldError::CheckpointMalformed { index: 1 }));
     }
