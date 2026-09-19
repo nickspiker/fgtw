@@ -105,8 +105,22 @@ pub struct FleetOp {
     pub sigs: Vec<Egg>,
 }
 
-/// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove) — flag-day, v0 chains don't fold.
-const SIGNING_DOMAIN: &[u8] = b"PHOTON_FLEET_OP_v1";
+/// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove). v2 = LENGTH-FRAMED preimages (see [`frame_into`]) — flag-day, v0/v1 chains don't fold.
+const SIGNING_DOMAIN: &[u8] = b"PHOTON_FLEET_OP_v2";
+
+/// Append a variable-length element to a preimage as `u32 LE length ‖ bytes`.
+///
+/// EVERY variable-length element in a signature or chain-hash preimage must go through this. Unframed concatenation is injective only while every element has one fixed width — true while Ed25519 was the only scheme, since a run of `scheme ‖ 64-byte sig` parses back apart unambiguously. With a second scheme of a different length it is not: one Falcon egg (666 B) is byte-identical to a crafted run of shorter eggs, so two DIFFERENT signature sets can produce the same [`FleetOp::chain_hash`] — and that hash is `prev_hash`, the generation id, and `head()`. The same hazard applies to the trailing `consent_sig` in [`FleetOp::signing_bytes`].
+fn frame_into(v: &mut Vec<u8>, bytes: &[u8]) {
+    v.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    v.extend_from_slice(bytes);
+}
+
+/// [`frame_into`] for a hasher — same framing rule, same reason.
+fn frame_hash(h: &mut blake3::Hasher, bytes: &[u8]) {
+    h.update(&(bytes.len() as u32).to_le_bytes());
+    h.update(bytes);
+}
 
 /// The exact bytes a binding request signs: the device attests "I consent to join fleet `handle_proof`" at time `t`. Signed TWICE at the registry (device key + `Ed25519(identity_seed)` — the write gate), and the device signature is re-verified forever after as the Add op's `consent_sig` (the fold gate). Lives here rather than `pair` because the worker folds chains without the `fanout` feature.
 pub fn bindreq_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], t: i64) -> Vec<u8> {
@@ -171,7 +185,7 @@ impl FleetOp {
         b.extend_from_slice(&self.signer_pubkey);
         b.extend_from_slice(&self.identity_pubkey); // bound in so the device sig also commits to the identity key (it can't be swapped)
         b.extend_from_slice(&self.consent_t.to_le_bytes());
-        b.extend_from_slice(&self.consent_sig); // bound in so the consent can't be swapped under the sponsor's egg
+        frame_into(&mut b, &self.consent_sig); // bound in so the consent can't be swapped under the sponsor's egg; FRAMED because it is variable-length (see `frame_into`)
         // Checkpoint fields append KIND-GATED: every pre-checkpoint op kind keeps byte-identical signing bytes, so chains signed by pre-2026-08-12 builds still verify — an unconditional append would break every deployed fleet's signatures at once.
         if self.kind == OpKind::Checkpoint {
             b.extend_from_slice(&self.ckpt_k.to_le_bytes());
@@ -182,14 +196,17 @@ impl FleetOp {
     }
 
     /// The chain link for the NEXT op's `prev_hash`: a hash over the signed content AND every signature, so the whole op (including who signed it and how) is immutable once chained.
+    ///
+    /// The egg count is committed before the eggs themselves, and each signature is length-framed. Without both, a chain hash does not uniquely determine the signature set it covers once schemes of differing lengths exist — see [`frame_into`].
     pub fn chain_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&self.signing_bytes());
+        h.update(&(self.sigs.len() as u32).to_le_bytes());
         for egg in &self.sigs {
             h.update(&[egg.scheme]);
-            h.update(&egg.sig);
+            frame_hash(&mut h, &egg.sig);
         }
-        h.update(&self.identity_sig);
+        frame_hash(&mut h, &self.identity_sig);
         *h.finalize().as_bytes()
     }
 
@@ -1249,6 +1266,45 @@ mod tests {
         assert_eq!(parsed.fold().unwrap(), vec![pk(&a)]);
     }
 
+    /// The preimages must stay injective once signatures of differing lengths exist.
+    ///
+    /// Before framing, `chain_hash` appended `scheme ‖ sig` with no length, so a single long egg hashed identically to a crafted run of shorter ones — two different signature SETS, one chain hash, and that hash is `prev_hash`. Splitting one egg's payload across two eggs is the cheapest witness: unframed, both spellings feed the hasher the same bytes.
+    #[test]
+    fn chain_hash_distinguishes_egg_boundaries() {
+        let a = key(1);
+        let base = MembershipBlob::genesis(&a, HP, &SEED, 100);
+
+        let mut one_long = base.clone();
+        one_long.ops[0].sigs.push(Egg { scheme: 7, sig: vec![0xAB; 64] });
+
+        let mut two_short = base.clone();
+        two_short.ops[0].sigs.push(Egg { scheme: 7, sig: vec![0xAB; 32] });
+        two_short.ops[0].sigs.push(Egg { scheme: 0xAB, sig: vec![0xAB; 31] });
+
+        assert_ne!(
+            one_long.ops[0].chain_hash(),
+            two_short.ops[0].chain_hash(),
+            "one long egg must not hash the same as a run of shorter eggs"
+        );
+    }
+
+    /// Same property for `signing_bytes`, whose trailing `consent_sig` is the other variable-length tail. A shorter consent plus attacker-chosen trailing content must not reproduce a longer consent's preimage.
+    #[test]
+    fn signing_bytes_frames_the_consent_tail() {
+        let a = key(1);
+        let mut short = MembershipBlob::genesis(&a, HP, &SEED, 100).ops[0].clone();
+        let mut long = short.clone();
+        short.consent_sig = vec![0xCD; 32];
+        long.consent_sig = vec![0xCD; 64];
+        assert_ne!(short.signing_bytes(), long.signing_bytes());
+        // And the framed length is what separates them, not just the byte count.
+        assert_ne!(
+            short.signing_bytes().len(),
+            long.signing_bytes().len(),
+            "framing must carry the length explicitly"
+        );
+    }
+
     #[test]
     fn unknown_scheme_egg_fails_closed() {
         let a = key(1);
@@ -1462,10 +1518,12 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::StrayConsent { index: 2 }));
     }
 
-    /// The signature-stability guard for the Checkpoint flag-day: these bytes were generated by the PRE-checkpoint build (2026-08-12, before kind 3 existed). Genesis/Add/Remove signing bytes are kind-gated to exclude the checkpoint fields precisely so this chain — and every fleet chain deployed in the field — keeps verifying. If this test fails, deployed fleets brick on update.
+    /// Determinism guard: a fixed chain's bytes must keep parsing and folding to a fixed member set.
+    ///
+    /// RE-PINNED at the egg flag day. The previous vector was generated by the pre-checkpoint build (2026-08-12) and guarded the opposite property — that field chains keep verifying across an update. Length-framing the preimages (see `frame_into`) deliberately breaks exactly that, because an unframed preimage is not injective once signature lengths vary, so v1 chains cannot be allowed to fold. These bytes are the v2 equivalent; from here the guarantee resumes, and a failure means an unintended signing-bytes or codec drift rather than a planned break.
     #[test]
     fn pinned_pre_checkpoint_chain_still_parses_and_folds() {
-        const PINNED_HEX: &str = "52c3853c7a330979330962337e6c3404136536237edeb2824c5c006870331f4d0baa0b8e1566fe11128f43a2a4e9483f82a5af4acd27a94e6df043bdc6a37f6862331f4f3f5a57908e2951a9b7d385510994b16ae44ba669157fc37af6b0d700a4f93b6e330128643305666c6565743a6f337e2c623403952c6e3303293e5b286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f00000000000000000000000000000000000000000000000000000000000000002c7533002c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000642c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c6b65331ffc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a272c6765333f39148ed5a51baf7f765600b277f8ac2fddf445b55ed8c261d3a8eca449a7286614d00939188337bd07f1248654b86bc5c6659f14f9d504ce0fc5fded4b3d30092c7533002c6765333feb2b722e7d441cec833a63f76026ae7aadb29316d0164bfb61d4c2f34866bf3a4e53c5c6d628f12f32613316cabece5e32a53c4b4ff3bb147ccecfd9cc2e580b29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f934c5a5c68855e63a020b9a8da384f37b3cb0ccf7d6a090c56130cbad4a90d912c7533012c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c653600000000000000c82c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000be2c6765333f0d5b6753187a455f5f2ae54016ecbc96b082e5d58f2bc768ebe6686baf21f18ad5527b359610eeda8ac917e04f4d92ddc242ed26bbd7bf4cb0f210e7ea292b082c7533002c6765333f1aa37898dea850c91e4c57c133fa3ef49f648f62b96d55b768adba460a463db2a031e1d92e1b923c2490e61ff237490227cc795ce61ae1969f7ee9a3047f240e29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331fbb1daf28635b791d0c66592c912d78bd71ade425974d947601464709b16c65712c7533022c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c6536000000000000012c2c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c7533002c6765333f75b772ee48e506047eca02a0db47b81d9bb708caa6478172a001eb5cbb8f3cee45de3fcc818477127f87142ced6f4c89fa008d3ca19aa4e4923347a3e7699b09295d";
+        const PINNED_HEX: &str = "52c3853c7a330979330962337e6c3404136536238f577e118260006870331f346f246beebfb4e466b9f49819cbbc26f0e83b14682d3a1e459fd45608c6724a6862331fdd559e00e904c85b67af8c9b37586066314a20a75d7caa68fcf00bde126abca46e330128643305666c6565743a6f337e2c623403952c6e3303293e5b286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f00000000000000000000000000000000000000000000000000000000000000002c7533002c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000642c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c6b65331ffc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a272c6765333ffba227a608c99bdec56c0a6abff94d282a76ffef0bf084a89753e8c51c710ebcaa27d2124e018b252bb96be9013493924d5d613771d9c7068b14b7894851cc0c2c7533002c6765333f0376b73927c3ee336bac8c0414159fdca53dbbb14f8f8282f632b8d9078c4f06ed9dc20a0fa75c86702c7a45dbdf346aaaa42e25fa3e7bc0ad2632be0c0a3f0329286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f8014e5dc1e369e1443d8aab8ca92b4efcc58e02796e6c02f0d33b2d664fd6cb52c7533012c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c653600000000000000c82c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000be2c6765333f0d5b6753187a455f5f2ae54016ecbc96b082e5d58f2bc768ebe6686baf21f18ad5527b359610eeda8ac917e04f4d92ddc242ed26bbd7bf4cb0f210e7ea292b082c7533002c6765333fc460db95156e74e1c1dec65d77ed8c4c2be4b11f0fcc61defe469dfb0b0fb1375f68f5a96e4ac097dc65f192cbf45636d83ad1357abfe4e282c66e26de8d540729286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f3092be05f46bca85419622800983372ae69195c143c19cce5e44d589ddd9a9802c7533022c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c6536000000000000012c2c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c7533002c6765333f15a7ec60829a602ff13cea19d2ae46304e09e92d637952082d08af30afe75b1f0a04637882b8e8cc8eb600028be845f5326429cd2de73c4ffa2d0a1d5eb00008295d";
         let bytes: Vec<u8> = (0..PINNED_HEX.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&PINNED_HEX[i..i + 2], 16).unwrap())
@@ -1586,4 +1644,5 @@ mod tests {
         assert!(!stale.verify(&HP, &identity_pubkey));
     }
 }
+
 
