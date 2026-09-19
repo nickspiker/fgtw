@@ -237,6 +237,35 @@ pub fn push_checkpoint<T: FgtwTransport>(
     }
 }
 
+/// Publish this device's key bundle to its fleet chain — the op that lifts the fleet's scheme floor once every member has done it. Fetch-then-sign like every chain write: refetch and retry on a stale head, up to a few times, since siblings extend the chain concurrently.
+///
+/// Signs with the bundle's full scheme set (a Declare proves possession of every key it names). A bare `Keypair` signer declares the Ed25519-only bundle, which is legal and a no-op for the floor. Idempotent when the chain already holds an equal-or-greater bundle for this device.
+pub fn declare_device<T: FgtwTransport>(
+    t: &T,
+    signer: &impl crate::pq::FleetSigner,
+    handle_proof: &[u8; 32],
+) -> Result<(), String> {
+    let me = signer.keypair().public.to_bytes();
+    let want = signer.bundle().map(|b| b.mask()).unwrap_or(crate::fleet::scheme::MASK_BASE);
+    for _attempt in 0..4 {
+        let mut blob = fetch(t, handle_proof)?.ok_or("no fleet chain to declare into")?;
+        let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+        if !members.contains(&me) {
+            return Err("this device is not a current member, so it cannot declare".into());
+        }
+        if crate::fleet::scheme::covers(blob.declared_mask(&me), want) {
+            return Ok(()); // already declared at least this much — idempotent
+        }
+        blob.declare(signer, vsf::eagle_time_oscillations());
+        match publish(t, &blob) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("stale") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("fleet: declare kept racing a concurrent chain extension".into())
+}
+
 /// [`recover_fleet_key`], keeping the fan-out revision alongside the key — the epoch spine folds the fleet key AND needs to name the publish it came from, so recovery callers that feed derivation want the pair.
 pub fn recover_fleet_key_with_epoch<T: FgtwTransport>(
     t: &T,

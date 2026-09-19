@@ -609,6 +609,13 @@ impl MembershipBlob {
         Ok((members, floor, bundles))
     }
 
+    /// The public-key bundle the chain holds for `device` — what any consent, vouch or handshake from that device is verified against. `None` if it has never declared, which means Ed25519 alone (the device key the chain already names).
+    pub fn declared_bundle(&self, device: &[u8; 32]) -> Option<crate::pq::KeyBundle> {
+        self.fold_inner()
+            .ok()
+            .and_then(|(_, _, bundles)| bundles.into_iter().find(|(d, _)| d == device).map(|(_, b)| b))
+    }
+
     /// Which schemes the chain knows `device` can sign with — its declared bundle's mask, or Ed25519 alone if it has never declared. What a builder signs the device's next op under. Falls back to Ed25519 on a chain that does not fold, which then fails at the fold anyway.
     pub fn declared_mask(&self, device: &[u8; 32]) -> scheme::Mask {
         self.fold_inner()
