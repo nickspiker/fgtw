@@ -25,13 +25,17 @@ default = ["client"]
 # `fanout` pulls the fan-out crypto + roster codec + pairing words and their deps; a wasm signer can enable it without `client`. The worker enables neither (base = fleet fold/verify only), so none of these deps reach its wasm surface.
 # vsf/text-encode is here for the fstate codec's published_name (`x` is Huffman text; the tables are ~9 MB, so this must never ride into the worker — and can't, fstate is cfg'd behind this feature).
 fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand", "dep:voca", "dep:num-bigint", "vsf/text-encode"]
-client = ["fanout"]
+# `client` also pulls the PQ SIGNING halves (`fn-dsa` keygen+sign, fips205's RNG). Base carries only the verify-only crates, so the worker can check a three-egg chain without ever holding a signing key or an RNG.
+client = ["fanout", "dep:fn-dsa", "fips205/default-rng"]
 
 [dependencies]
 # vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.
 vsf = { version = "0.9.3", path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
 blake3 = { version = "1", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# The two post-quantum egg families, VERIFY side — base, because the worker folds chains with the same code clients sign with. Both pure Rust, no build.rs, no C. `fn-dsa-vrfy` is the verify-only crate and declares no RNG; fips205 needs none to verify, so `default-rng` (which is what drags in getrandom) stays off here and is enabled by `client`.
+fn-dsa-vrfy = { version = "0.4", default-features = false }
+fips205 = { version = "0.4", default-features = false, features = ["slh_dsa_sha2_128s"] }
 
 # fanout-only. Versions match photon's so the feature union shares one crate copy (not a second).
 x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
@@ -39,3 +43,17 @@ chacha20poly1305 = { version = "0.11.0-rc.2", optional = true }
 rand = { version = "0.8", optional = true }
 voca = { version = "0.0.0", optional = true }
 num-bigint = { version = "0.4", optional = true }
+# client-only: the PQ signing halves. Deterministic keygen seeds a `rand::StdRng` from the machine fingerprint, exactly as the Ed25519 device key derives — so PQ keys re-derive on the same hardware too, and the stateless-host story holds for every scheme, not just one.
+fn-dsa = { version = "0.4", default-features = false, optional = true }
+
+# The PQ crates are slow unoptimised — SLH-DSA-128s signing takes tens of seconds in a debug build and under a second in release — so tests and dev builds optimise just these. Per-package, so the rest of the tree stays debuggable. Applies only when this crate is the build root; photon and rustdesk carry the same override for their own builds.
+[profile.dev.package.fips205]
+opt-level = 3
+[profile.dev.package.fn-dsa-sign]
+opt-level = 3
+[profile.dev.package.fn-dsa-vrfy]
+opt-level = 3
+[profile.dev.package.fn-dsa-kgen]
+opt-level = 3
+[profile.dev.package.fn-dsa-comm]
+opt-level = 3

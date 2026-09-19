@@ -35,6 +35,8 @@ pub mod keys;
 /// The authority: valid signature + hash-chain link + signer-was-a-prior-member.
 /// The one source of truth shared by the worker (verify) and clients (fetch-then-sign).
 pub mod fleet;
+/// Multi-scheme signing: key bundles, scheme-dispatched verification (base), and the deterministic signing side (`client`). The worker verifies three-egg chains with this.
+pub mod pq;
 
 /// The epoch of any fan-out blob, readable WITHOUT the `fanout` feature — the worker's monotonic guard needs it but compiles none of the fan-out crypto.
 /// Version-agnostic on purpose: the 3-byte magic leads and the big-endian epoch sits at 4..12 in every layout (the 4th byte was the ASCII '0' of the original tag, now a binary version numeral), so a reader can order blobs whose BODY it cannot parse. That is what lets a new-format rotation step over an old-format blob instead of proposing epoch 1 and being refused as stale forever.
