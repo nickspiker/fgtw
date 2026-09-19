@@ -254,7 +254,8 @@ mod signing {
 
     /// One device's secret keys across every scheme it can sign with.
     ///
-    /// Derived, never generated at random: see [`derive`](Self::derive). Holds the Falcon and SPHINCS+ secrets as opaque byte forms and re-decodes them per signature, so nothing here has a lifetime tied to a library-internal type.
+    /// `Clone` because apps hold it beside a cloned `Keypair`. Derived, never generated at random: see [`derive`](Self::derive). Holds the Falcon and SPHINCS+ secrets as opaque byte forms and re-decodes them per signature, so nothing here has a lifetime tied to a library-internal type.
+    #[derive(Clone)]
     pub struct SigningBundle {
         ed: Keypair,
         falcon_sk: Vec<u8>,
