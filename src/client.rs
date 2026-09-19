@@ -307,11 +307,11 @@ pub fn current_members_full<T: FgtwTransport>(
 /// Existing-device side of device-ADD: bind the device a verified binding request names, signed by this (member) device and carrying the request's device signature as the consent egg. `req` must have been screened by the matcher (full word match + `BindRequest::verify`) — the fold re-verifies the consent regardless, so a garbage request can't enter the chain even if a caller skips the screen.
 pub fn bind_device<T: FgtwTransport>(
     t: &T,
-    member_key: &Keypair,
+    member_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     req: &BindRequest,
 ) -> Result<(), String> {
-    let me = member_key.public.to_bytes();
+    let me = member_key.keypair().public.to_bytes();
     for _attempt in 0..4 {
         let mut blob = fetch(t, handle_proof)?
             .ok_or("no fleet to add to — attest this identity first")?;
@@ -322,7 +322,11 @@ pub fn bind_device<T: FgtwTransport>(
         if members.contains(&req.device_pubkey) {
             return Ok(()); // already in — idempotent
         }
-        blob.add(member_key, req.device_pubkey, vsf::eagle_time_oscillations(), req.t, req.device_sig.clone());
+        // A joiner that posted a bundle is added declared — the only join a promoted fleet accepts.
+        match &req.bundle {
+            Some(b) => blob.add_declared(member_key, req.device_pubkey, vsf::eagle_time_oscillations(), req.t, req.device_sig.clone(), b.clone()),
+            None => blob.add(member_key, req.device_pubkey, vsf::eagle_time_oscillations(), req.t, req.device_sig.clone()),
+        }
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue, // someone else extended; re-fetch + retry
@@ -358,12 +362,14 @@ pub fn depart_device<T: FgtwTransport>(
 /// APPROVER side of the bilateral removal (the mirror of the sponsor's Add): a SURVIVING member countersigns the leaving device's departure request and publishes the consented Remove. `consent_t`/`consent_sig` come off the leaver's depart_req frame (its signature over [`crate::fleet::departreq_signing_bytes`]). Idempotent: leaver already out = Ok. Bare self-departure is refused at the worker from the consent cutover on — this is the ONLY removal path a new chain can take.
 pub fn depart_device_consented<T: FgtwTransport>(
     t: &T,
-    approver_key: &Keypair,
+    approver_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     leaving: &[u8; 32],
     consent_t: i64,
+    // The leaver's consent as it arrived on the wire: an egg-list blob (`pq::eggs_to_bytes`), signed with every scheme the leaver declared.
     consent_sig: &[u8],
 ) -> Result<(), String> {
+    let consent = crate::pq::eggs_from_bytes(consent_sig).map_err(|e| format!("departure consent: {e}"))?;
     for _attempt in 0..4 {
         let mut blob = fetch(t, handle_proof)?.ok_or("no fleet to remove from")?;
         let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
@@ -375,7 +381,7 @@ pub fn depart_device_consented<T: FgtwTransport>(
             *leaving,
             vsf::eagle_time_oscillations(),
             consent_t,
-            consent_sig.to_vec(),
+            consent.clone(),
         );
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
@@ -405,14 +411,14 @@ fn signed_req<T: FgtwTransport>(t: &T, device_key: &Keypair, section: vsf::VsfSe
 /// Returns the `eagle_time` (oscillations) this call stamped and published — the SAME value the sponsor reads back in [`bindreq_list`], so the caller can derive the proximity beacon ([`beacon_id`]) from the exact published offer state.
 pub fn bindreq_put<T: FgtwTransport>(
     t: &T,
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     identity_seed: &[u8; 32],
     handle_proof: &[u8; 32],
     nfc_secret: &[u8; 32],
 ) -> Result<i64, String> {
     use ed25519_dalek::Signer;
     let now = vsf::eagle_time_oscillations();
-    let me = device_key.public.to_bytes();
+    let me = device_key.keypair().public.to_bytes();
     // NFC commitment computed HERE because it binds the stamp this call mints (all-zero secret = no NFC offered → zero hash).
     let nfc_hash = if *nfc_secret == [0u8; 32] {
         [0u8; 32]
@@ -425,8 +431,14 @@ pub fn bindreq_put<T: FgtwTransport>(
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     section.add_field("dk", VsfType::ke(me.to_vec()));
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(now)));
-    section.add_field("ds", VsfType::ge(device_key.sign(&msg).to_bytes().to_vec()));
+    // The consent, one egg per scheme the joiner holds: posting a request IS proving every key it declares. The bundle rides beside it so the sponsor can add the device declared and the worker can verify the PQ eggs at the door.
+    let bundle = device_key.bundle();
+    let mask = bundle.as_ref().map(|b| b.mask()).unwrap_or(crate::fleet::scheme::MASK_BASE);
+    section.add_field("ds", VsfType::ge(crate::pq::eggs_to_bytes(&device_key.eggs(&msg, mask))));
     section.add_field("is", VsfType::ge(identity_key.sign(&msg).to_bytes().to_vec()));
+    if let Some(b) = &bundle {
+        section.add_field("kb", VsfType::ge(b.to_bytes()));
+    }
     // NFC commitment (all-zero = none) — outside the signing bytes by design (see BindRequest::nfc_hash).
     section.add_field("nh", VsfType::hb(nfc_hash.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -564,7 +576,17 @@ pub fn bindreq_list<T: FgtwTransport>(
             Some(VsfType::hb(h)) if h.len() == 32 => h.as_slice().try_into().unwrap(),
             _ => [0u8; 32],
         };
-        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig: ds.clone(), identity_sig: is.clone(), nfc_hash };
+        // The consent is an egg-list blob; a request whose consent does not parse is malformed and skipped, never treated as consented.
+        let Ok(device_sig) = crate::pq::eggs_from_bytes(ds) else { continue };
+        // Positional 5 (optional): the joiner's key bundle.
+        let bundle = match v.get(5) {
+            Some(VsfType::ge(b)) => match crate::pq::KeyBundle::from_bytes(b) {
+                Ok(k) => Some(k),
+                Err(_) => continue,
+            },
+            _ => None,
+        };
+        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig, identity_sig: is.clone(), nfc_hash, bundle };
         if (now - req.t).abs() > BINDREQ_FRESH_OSC {
             continue; // lapsed — expiry is the only deletion pending records get
         }

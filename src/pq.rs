@@ -157,6 +157,63 @@ pub fn verify_egg(scheme_tag: u8, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool
     }
 }
 
+/// Wire form of an egg list, for any signature slot that must carry several schemes: `u8 count`, then per egg `u8 scheme ‖ u32 LE len ‖ sig`. Every element framed. This is ONE primitive — the fleet chain's consent, the bindreq registry, the RustDesk handshake and the phonebook egg blob all use it — so "egg-list shaped from day one" is a single codec, not four.
+pub fn eggs_to_bytes(eggs: &[Egg]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + eggs.iter().map(|e| 5 + e.sig.len()).sum::<usize>());
+    v.push(eggs.len() as u8);
+    for e in eggs {
+        v.push(e.scheme);
+        v.extend_from_slice(&(e.sig.len() as u32).to_le_bytes());
+        v.extend_from_slice(&e.sig);
+    }
+    v
+}
+
+/// Inverse of [`eggs_to_bytes`]. Rejects an empty list (a slot with no signature is not a signed slot), duplicate schemes, and trailing bytes.
+pub fn eggs_from_bytes(b: &[u8]) -> Result<Vec<Egg>, &'static str> {
+    let Some((&count, mut rest)) = b.split_first() else {
+        return Err("egg list: empty");
+    };
+    if count == 0 {
+        return Err("egg list: no eggs");
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if rest.len() < 5 {
+            return Err("egg list: truncated egg");
+        }
+        let scheme_tag = rest[0];
+        let n = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+        rest = &rest[5..];
+        if rest.len() < n {
+            return Err("egg list: truncated signature");
+        }
+        if out.iter().any(|e: &Egg| e.scheme == scheme_tag) {
+            return Err("egg list: duplicate scheme");
+        }
+        out.push(Egg { scheme: scheme_tag, sig: rest[..n].to_vec() });
+        rest = &rest[n..];
+    }
+    if !rest.is_empty() {
+        return Err("egg list: trailing bytes");
+    }
+    Ok(out)
+}
+
+/// The one rule for a consent, a vouch, or a handshake: every listed egg verifies against `bundle`, AND the listed set covers `required`. An egg for a scheme the bundle lacks fails closed; a list that is short of `required` fails even if everything in it is valid.
+pub fn verify_eggs(eggs: &[Egg], bundle: &KeyBundle, msg: &[u8], required: scheme::Mask) -> bool {
+    if eggs.is_empty() {
+        return false;
+    }
+    for e in eggs {
+        let Some(pk) = bundle.pubkey(e.scheme) else { return false };
+        if !verify_egg(e.scheme, pk, msg, &e.sig) {
+            return false;
+        }
+    }
+    scheme::covers(egg_mask(eggs), required)
+}
+
 /// The mask of schemes an egg list actually carries — what an op PROVED, as opposed to what its signer declared.
 pub fn egg_mask(eggs: &[Egg]) -> scheme::Mask {
     eggs.iter().fold(0, |m, e| if (e.scheme as usize) < 16 { m | (1 << e.scheme) } else { m })
@@ -322,6 +379,21 @@ mod tests {
         let mut bytes = KeyBundle::ed25519_only(&[2u8; 32]).to_bytes();
         bytes.push(0);
         assert!(KeyBundle::from_bytes(&bytes).is_err(), "trailing bytes");
+    }
+
+    #[test]
+    fn egg_list_blob_round_trips_and_rejects_malformed() {
+        let eggs = vec![Egg { scheme: scheme::ED25519, sig: vec![1u8; 64] }, Egg { scheme: scheme::FALCON512, sig: vec![2u8; 666] }];
+        let b = eggs_to_bytes(&eggs);
+        assert_eq!(eggs_from_bytes(&b).unwrap(), eggs);
+        assert!(eggs_from_bytes(&[]).is_err(), "empty");
+        assert!(eggs_from_bytes(&[0]).is_err(), "no eggs");
+        let mut dup = eggs.clone();
+        dup.push(Egg { scheme: scheme::ED25519, sig: vec![3u8; 64] });
+        assert!(eggs_from_bytes(&eggs_to_bytes(&dup)).is_err(), "duplicate scheme");
+        let mut trailing = b.clone();
+        trailing.push(0);
+        assert!(eggs_from_bytes(&trailing).is_err(), "trailing bytes");
     }
 
     #[test]

@@ -31,7 +31,6 @@
 //! - **Remove is self-signed departure ONLY**: `signer == device`, no exceptions. Nobody can be expelled; eviction is withholding (re-key around the device), never erasure.
 //! - Consent freshness: `|eagle_time − consent_t| ≤` [`CONSENT_WINDOW_OSC`], so a departed device's ancient consent can't be replayed to re-add it.
 
-use crate::keys::Keypair;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use vsf::VsfType;
 
@@ -115,8 +114,8 @@ pub struct FleetOp {
     pub identity_sig: Vec<u8>,
     /// ADD ONLY: the eagle-time stamp of the binding request whose signature rides `consent_sig`. 0 elsewhere.
     pub consent_t: i64,
-    /// ADD ONLY: the added device's OWN signature over [`bindreq_signing_bytes`]`(handle_proof, device_pubkey, consent_t)` — the subject consenting to its membership (bilateral add; the sovereign-records rule). NOT a signature over this op's signing bytes, so it's data the sponsor's egg commits to, like the genesis identity binding. Empty on genesis/remove ops.
-    pub consent_sig: Vec<u8>,
+    /// ADD and consented REMOVE: the subject device's OWN eggs over [`bindreq_signing_bytes`] / [`departreq_signing_bytes`] — the subject consenting to its membership or its exit (bilateral; the sovereign-records rule). NOT signatures over this op's signing bytes, so they are data the sponsor's egg commits to. On an Add the consent must cover every scheme in the joiner's bundle: this is where a joiner PROVES the keys it declares, since the Add itself is signed by the sponsor. Empty on genesis/checkpoint/declare and on a legacy self-departure. v1 ops carry exactly one Ed25519 egg.
+    pub consent: Vec<Egg>,
     /// CHECKPOINT ONLY: the monotonic checkpoint sequence number, strictly prev+1 starting at 1 — the epoch index `k` the fleet's key schedule advances on. 0 elsewhere.
     pub ckpt_k: u64,
     /// CHECKPOINT ONLY: blake3 commitment to the SECRET settled-root (the merkle root over the fleet's settled message rows) — the chain carries only this preimage-hiding commitment, never the root. `[0; 32]` elsewhere.
@@ -217,8 +216,10 @@ pub struct BindRequest {
     pub device_pubkey: [u8; 32],
     /// Eagle-time stamp — freshness at the registry, and the `consent_t` the Add op carries.
     pub t: i64,
-    /// The device key's signature over [`bindreq_signing_bytes`] — the consent (becomes `consent_sig`).
-    pub device_sig: Vec<u8>,
+    /// The device's eggs over [`bindreq_signing_bytes`] — the consent (becomes the Add op's `consent`). One per scheme in `bundle`, so posting a request IS proving possession of every key it declares.
+    pub device_sig: Vec<Egg>,
+    /// The joiner's public-key bundle, if it has one beyond Ed25519. Rides the registry so the sponsor can put it on the Add (`add_declared`) and so the worker can verify the PQ consent eggs at the door. `None` = Ed25519 alone, which a promoted fleet will refuse as `BelowFloor` at bind time.
+    pub bundle: Option<crate::pq::KeyBundle>,
     /// `Ed25519(identity_seed)`'s signature over the same bytes — an ANTI-SPAM gate on the pending-request slot: posting requires knowing the handle STRING, which `handle_proof` (public, it is the slot key) does not. NOTE: this is NOT "only the owner can enter the set" — `identity_seed = BLAKE3(handle)` is public-derivable, and entering the member set still requires a member sponsor's Add. Checked against the chain's genesis identity pubkey; never enters the chain itself. See docs/fleet-identity-remediation.md.
     pub identity_sig: Vec<u8>,
     /// NFC instant-add commitment: `pair::nfc_secret_hash(S, device_pubkey, t)` where `S` is the 32-byte random secret the joiner serves over the NFC tap. All-zero = no NFC offered. DELIBERATELY OUTSIDE `bindreq_signing_bytes` — those bytes are the chain's consent verification forever (every future fold re-checks consent_sig against them), so a new field there is a protocol-wide flag-day; the binding lives inside the keyed hash instead (recomputed per candidate with ITS pubkey+t), so a tampered/transplanted hash simply never matches — fail-closed, never wrong-device.
@@ -229,7 +230,10 @@ impl BindRequest {
     /// Verify both signatures: the device's own consent, and the identity co-signature under `identity_pubkey`. NOTE: the identity co-signature is a handle-knowledge ANTI-SPAM gate, NOT an ownership/membership gate (see the `identity_sig` field doc and docs/fleet-identity-remediation.md). The worker screens writes with this; the old device re-checks at list time. Actual membership still requires a member sponsor's Add.
     pub fn verify(&self, handle_proof: &[u8; 32], identity_pubkey: &[u8; 32]) -> bool {
         let msg = bindreq_signing_bytes(handle_proof, &self.device_pubkey, self.t);
-        verify_ed25519(&self.device_pubkey, &msg, &self.device_sig)
+        let subject = self.bundle.clone().unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&self.device_pubkey));
+        // The bundle must be this device's, and the consent must cover every scheme in it — declaring a key is proving it.
+        subject.ed25519() == self.device_pubkey
+            && crate::pq::verify_eggs(&self.device_sig, &subject, &msg, subject.mask())
             && verify_ed25519(identity_pubkey, &msg, &self.identity_sig)
     }
 }
@@ -239,7 +243,7 @@ impl FleetOp {
     /// Excludes the sigs themselves (you can't sign the signature) — but INCLUDES `consent_sig`, which is a signature over DIFFERENT bytes (the binding request), so the sponsor's egg commits to the exact consent it saw.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let domain = self.version.domain();
-        let mut b = Vec::with_capacity(domain.len() + 32 + 32 + 1 + 32 + 8 + 32 + 32 + 8 + 4 + self.consent_sig.len());
+        let mut b = Vec::with_capacity(domain.len() + 32 + 32 + 1 + 32 + 8 + 32 + 32 + 8 + 4 + self.consent.iter().map(|e| 5 + e.sig.len()).sum::<usize>());
         b.extend_from_slice(domain);
         b.extend_from_slice(&self.handle_proof);
         b.extend_from_slice(&self.prev_hash);
@@ -249,10 +253,10 @@ impl FleetOp {
         b.extend_from_slice(&self.signer_pubkey);
         b.extend_from_slice(&self.identity_pubkey); // bound in so the device sig also commits to the identity key (it can't be swapped)
         b.extend_from_slice(&self.consent_t.to_le_bytes());
-        // Bound in so the consent can't be swapped under the sponsor's egg. FRAMED from v2 on, because an unframed variable-length tail is ambiguous (see `frame_into`); v1 ops keep the bare append so their signatures stay byte-identical.
+        // Bound in so the consent can't be swapped under the sponsor's egg. v1 appends the single Ed25519 signature bare, so v1 preimages stay byte-identical; v2 frames the egg-list blob (see `frame_into`).
         match self.version {
-            OpVersion::V1 => b.extend_from_slice(&self.consent_sig),
-            OpVersion::V2 => frame_into(&mut b, &self.consent_sig),
+            OpVersion::V1 => b.extend_from_slice(self.consent.first().map(|e| e.sig.as_slice()).unwrap_or(&[])),
+            OpVersion::V2 => frame_into(&mut b, &crate::pq::eggs_to_bytes(&self.consent)),
         }
         // Checkpoint fields append KIND-GATED: every pre-checkpoint op kind keeps byte-identical signing bytes, so chains signed by pre-2026-08-12 builds still verify — an unconditional append would break every deployed fleet's signatures at once.
         if self.kind == OpKind::Checkpoint {
@@ -303,23 +307,15 @@ impl FleetOp {
     }
 
     /// Verify the ADD consent binding: `consent_sig` is the ADDED device's own signature over its binding request — the subject signing its own membership. Forging it requires the device's private key, which is what makes conscription (and the ownership squat) impossible.
-    fn verify_consent(&self) -> bool {
-        self.consent_sig.len() == 64
-            && verify_ed25519(
-                &self.device_pubkey,
-                &bindreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t),
-                &self.consent_sig,
-            )
+    fn verify_consent(&self, subject: &crate::pq::KeyBundle, required: scheme::Mask) -> bool {
+        let msg = bindreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t);
+        crate::pq::verify_eggs(&self.consent, subject, &msg, required)
     }
 
     /// Verify the REMOVE consent binding: `consent_sig` is the LEAVING device's own signature over its departure request — the subject signing its own exit, countersigned by the approver's egg. The mirror of [`FleetOp::verify_consent`].
-    fn verify_depart_consent(&self) -> bool {
-        self.consent_sig.len() == 64
-            && verify_ed25519(
-                &self.device_pubkey,
-                &departreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t),
-                &self.consent_sig,
-            )
+    fn verify_depart_consent(&self, subject: &crate::pq::KeyBundle, required: scheme::Mask) -> bool {
+        let msg = departreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t);
+        crate::pq::verify_eggs(&self.consent, subject, &msg, required)
     }
 
     /// Verify every signature egg against `signer_pubkey`.
@@ -455,11 +451,11 @@ impl MembershipBlob {
             }
             // Consent rides Add (join request) AND Remove (departure request) — the two bilateral membership ops. Genesis/Checkpoint never carry it; a Remove carries BOTH halves or NEITHER (a lone stamp or lone sig is malformed).
             if !matches!(op.kind, OpKind::Add | OpKind::Remove)
-                && (op.consent_t != 0 || !op.consent_sig.is_empty())
+                && (op.consent_t != 0 || !op.consent.is_empty())
             {
                 return Err(FoldError::StrayConsent { index: i });
             }
-            if op.kind == OpKind::Remove && (op.consent_t != 0) != (!op.consent_sig.is_empty()) {
+            if op.kind == OpKind::Remove && (op.consent_t != 0) != (!op.consent.is_empty()) {
                 return Err(FoldError::StrayConsent { index: i });
             }
             if op.kind != OpKind::Checkpoint && (op.ckpt_k != 0 || op.ckpt_commit != [0u8; 32] || op.ckpt_fanout_epoch != 0) {
@@ -540,20 +536,19 @@ impl MembershipBlob {
                     if members.contains(&op.device_pubkey) {
                         return Err(FoldError::AddExistingMember { index: i });
                     }
-                    // Bilateral: the added device must have consented with its own key (the subject signs — sovereign records).
-                    if !op.verify_consent() {
+                    // THE RATCHET. A device joining below the fleet's established floor would lower it, so it is refused outright rather than admitted and tolerated. This is what stops a single-egg device silently undoing a completed upgrade.
+                    let joined = op.bundle.clone().unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&op.device_pubkey));
+                    if !scheme::covers(joined.mask(), floor) {
+                        return Err(FoldError::BelowFloor { index: i });
+                    }
+                    // Bilateral, and the joiner's proof of possession: the added device consented with its OWN keys — every scheme in the bundle it is being added with, plus whatever the floor demands. The Add op itself is the sponsor's signature, so this consent is the only place the joiner signs, which makes it the only place its declared PQ keys can be proved. A bundle nobody can sign for never enters the chain.
+                    if !op.verify_consent(&joined, joined.mask() | floor) {
                         return Err(FoldError::BadConsent { index: i });
                     }
                     // The consent must be from THIS ceremony, not a departed device's replayed past.
                     if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
                         return Err(FoldError::ConsentStale { index: i });
                     }
-                    // THE RATCHET. A device joining below the fleet's established floor would lower it, so it is refused outright rather than admitted and tolerated. This is what stops a single-egg device silently undoing a completed upgrade.
-                    let joined = op.bundle.clone().unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&op.device_pubkey));
-                    if !scheme::covers(joined.mask(), floor) {
-                        return Err(FoldError::BelowFloor { index: i });
-                    }
-                    // The bundle on an Add is DECLARED by the sponsor, not yet PROVED by the joiner — its consent signature is Ed25519 alone. The joiner proves possession with its first own op, which the floor then demands. Worst case for a bogus bundle is a stuck newcomer, never a weakened fleet: an unprovable key can only ever fail to verify.
                     members.push(op.device_pubkey);
                     bundles.push((op.device_pubkey, joined));
                 }
@@ -561,17 +556,22 @@ impl MembershipBlob {
                     if !members.contains(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
-                    if op.consent_sig.is_empty() {
+                    if op.consent.is_empty() {
                         // LEGACY self-signed departure (pre-consent chains keep folding). New bare departures are refused at the worker's publish gate — a unilateral sign-out lets a device thief launder the hardware into their own fleet.
                         if op.signer_pubkey != op.device_pubkey {
                             return Err(FoldError::RemoveNotSelfSigned { index: i });
                         }
                     } else {
-                        // CONSENTED removal — the mirror of Add: the leaving device signed its departure request (`consent_sig` over departreq bytes), a DIFFERENT surviving member's egg authorises it. Expulsion still doesn't exist: without the leaving device's request signature the op can't fold.
+                        // CONSENTED removal — the mirror of Add: the leaving device signed its departure request with its own eggs (at least the floor's schemes, against the bundle it declared), a DIFFERENT surviving member's egg authorises it. Expulsion still doesn't exist: without the leaving device's request signature the op can't fold.
                         if op.signer_pubkey == op.device_pubkey {
                             return Err(FoldError::RemoveApproverIsLeaver { index: i });
                         }
-                        if !op.verify_depart_consent() {
+                        let leaver = bundles
+                            .iter()
+                            .find(|(d, _)| *d == op.device_pubkey)
+                            .map(|(_, b)| b.clone())
+                            .unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&op.device_pubkey));
+                        if !op.verify_depart_consent(&leaver, floor) {
                             return Err(FoldError::BadConsent { index: i });
                         }
                         if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
@@ -705,8 +705,8 @@ impl MembershipBlob {
         MembershipBlob { ops: vec![op] }
     }
 
-    /// Add `new_device` carrying its public key bundle — the join a promoted fleet requires, since `add` (no bundle) is refused as `BelowFloor` once the floor has risen. The sponsor declares the bundle on the newcomer's behalf; possession is proved by the newcomer's first own op, which the floor then demands.
-    pub fn add_declared(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent_sig: Vec<u8>, bundle: crate::pq::KeyBundle) {
+    /// Add `new_device` carrying its public key bundle — the join a promoted fleet requires, since `add` (no bundle) is refused as `BelowFloor` once the floor has risen. The `consent` must be signed with every scheme in `bundle`: that is the joiner proving it holds the keys the sponsor is adding it with.
+    pub fn add_declared(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent: Vec<Egg>, bundle: crate::pq::KeyBundle) {
         let sign_with: scheme::Mask = self.declared_mask(&device_key.keypair().public.to_bytes());
         let hp = self.handle_proof().unwrap_or([0u8; 32]);
         let op = sign_op(
@@ -719,7 +719,7 @@ impl MembershipBlob {
             device_key.keypair().public.to_bytes(),
             [0u8; 32],
             None,
-            Some((consent_t, consent_sig)),
+            Some((consent_t, consent)),
             None,
             Some(bundle),
             sign_with,
@@ -784,7 +784,7 @@ impl MembershipBlob {
     }
 
     /// Append an Add: the sponsor `device_key` (a current member) signs, carrying the added device's consent — `(consent_t, consent_sig)` straight off its binding request. Without valid consent the result won't fold.
-    pub fn add(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent_sig: Vec<u8>) {
+    pub fn add(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent: Vec<Egg>) {
         let sign_with: scheme::Mask = self.declared_mask(&device_key.keypair().public.to_bytes());
         let hp = self.handle_proof().unwrap_or([0u8; 32]);
         let op = sign_op(
@@ -797,7 +797,7 @@ impl MembershipBlob {
             device_key.keypair().public.to_bytes(),
             [0u8; 32],
             None,
-            Some((consent_t, consent_sig)),
+            Some((consent_t, consent)),
             None,
             None,
             sign_with,
@@ -829,7 +829,7 @@ impl MembershipBlob {
     }
 
     /// Append a CONSENTED removal: the approver `device_key` (a surviving member, never the leaver) signs, carrying the leaving device's departure-request signature — `(consent_t, consent_sig)` over [`departreq_signing_bytes`]. The exact mirror of [`MembershipBlob::add`]. Without valid consent the result won't fold; with `approver == leaving` it won't fold either.
-    pub fn remove_consented(&mut self, approver_key: &impl crate::pq::FleetSigner, leaving: [u8; 32], eagle_time: i64, consent_t: i64, consent_sig: Vec<u8>) {
+    pub fn remove_consented(&mut self, approver_key: &impl crate::pq::FleetSigner, leaving: [u8; 32], eagle_time: i64, consent_t: i64, consent: Vec<Egg>) {
         let sign_with: scheme::Mask = self.declared_mask(&approver_key.keypair().public.to_bytes());
         let hp = self.handle_proof().unwrap_or([0u8; 32]);
         let op = sign_op(
@@ -842,7 +842,7 @@ impl MembershipBlob {
             approver_key.keypair().public.to_bytes(),
             [0u8; 32],
             None,
-            Some((consent_t, consent_sig)),
+            Some((consent_t, consent)),
             None,
             None,
             sign_with,
@@ -956,23 +956,23 @@ pub struct SuccessorRecord {
 
 impl SuccessorRecord {
     /// Build a successor: each device in `signers` (members of BOTH the old and new chains) signs a continuity egg over `(handle_proof, predecessor.genesis_hash, new_genesis_hash)`. Signing with every current device maximises the chance a contact matches one against the predecessor set.
-    pub fn new(
+    pub fn new<S: crate::pq::FleetSigner>(
         predecessor: MembershipBlob,
         new_genesis_hash: [u8; 32],
         handle_proof: [u8; 32],
-        signers: &[&Keypair],
+        signers: &[&S],
     ) -> Result<Self, String> {
-        use ed25519_dalek::Signer;
         let old_gh = predecessor.genesis_hash().ok_or("predecessor has no genesis")?;
         let msg = succession_signing_bytes(&handle_proof, &old_gh, &new_genesis_hash);
-        let continuity_eggs = signers
-            .iter()
-            .map(|kp| ContinuityEgg {
-                device_pubkey: kp.public.to_bytes(),
-                scheme: scheme::ED25519,
-                sig: kp.secret.sign(&msg).to_bytes().to_vec(),
-            })
-            .collect();
+        // Each voucher signs with what the PREDECESSOR chain knows it holds — that is what a contact verifies against, and it is what makes a vouch as strong as the old fleet's floor rather than as weak as Ed25519 alone.
+        let mut continuity_eggs = Vec::new();
+        for s in signers {
+            let pk = s.keypair().public.to_bytes();
+            let mask = predecessor.declared_mask(&pk);
+            for egg in s.eggs(&msg, mask) {
+                continuity_eggs.push(ContinuityEgg { device_pubkey: pk, scheme: egg.scheme, sig: egg.sig });
+            }
+        }
         Ok(Self { handle_proof, new_genesis_hash, predecessor, continuity_eggs })
     }
 
@@ -982,9 +982,9 @@ impl SuccessorRecord {
     /// FROM where the contact is, so a replay can't walk them backward), (3) it is for this
     /// `handle_proof`, and (4) at least one continuity egg is signed by a PREDECESSOR MEMBER over the exact transition. (4) is load-bearing: only a holder of an old-chain device secret can produce it, so a handle-only attacker cannot forge a re-pin.
     pub fn verify_for_pin(&self, pinned_genesis: &[u8; 32]) -> Result<(), String> {
-        let pred_members = self
+        let (pred_members, pred_floor, pred_bundles) = self
             .predecessor
-            .fold()
+            .fold_inner()
             .map_err(|e| format!("successor predecessor invalid: {e:?}"))?;
         let old_gh = self.predecessor.genesis_hash().ok_or("successor predecessor has no genesis")?;
         if &old_gh != pinned_genesis {
@@ -994,13 +994,33 @@ impl SuccessorRecord {
             return Err("successor handle_proof does not match its predecessor".into());
         }
         let msg = succession_signing_bytes(&self.handle_proof, &old_gh, &self.new_genesis_hash);
-        let vouched = self.continuity_eggs.iter().any(|egg| {
-            pred_members.contains(&egg.device_pubkey)
-                && egg.scheme == scheme::ED25519
-                && verify_ed25519(&egg.device_pubkey, &msg, &egg.sig)
+        // An egg naming a scheme this build cannot verify is a hard reject, never a skip. Succession re-founds the identity; silently ignoring what cannot be checked is exactly the gap a forged vouch would walk through.
+        if self.continuity_eggs.iter().any(|e| !scheme::covers(scheme::MASK_KNOWN, 1 << e.scheme.min(15))) {
+            return Err("continuity egg names an unknown scheme".into());
+        }
+        // ANY predecessor member may vouch, but a device's vouch is ALL of its eggs: they verify against the bundle the old chain holds for it and cover the old fleet's floor. A single Ed25519 vouch from a fleet that had reached three schemes is not a vouch — it is what a curve break would let an attacker forge.
+        let mut devices: Vec<[u8; 32]> = self.continuity_eggs.iter().map(|e| e.device_pubkey).collect();
+        devices.sort();
+        devices.dedup();
+        let vouched = devices.iter().any(|d| {
+            if !pred_members.contains(d) {
+                return false;
+            }
+            let bundle = pred_bundles
+                .iter()
+                .find(|(p, _)| p == d)
+                .map(|(_, b)| b.clone())
+                .unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(d));
+            let eggs: Vec<Egg> = self
+                .continuity_eggs
+                .iter()
+                .filter(|e| e.device_pubkey == *d)
+                .map(|e| Egg { scheme: e.scheme, sig: e.sig.clone() })
+                .collect();
+            crate::pq::verify_eggs(&eggs, &bundle, &msg, pred_floor)
         });
         if !vouched {
-            return Err("no valid continuity egg from a predecessor member".into());
+            return Err("no valid continuity vouch from a predecessor member at the predecessor's floor".into());
         }
         Ok(())
     }
@@ -1090,7 +1110,7 @@ fn sign_op(
     // GENESIS identity binding: `identity_pubkey` is the canonical `Ed25519(identity_seed)` embedded in the op (and in signing_bytes, so the device egg commits to it — the bindreq anti-spam gate keys off it). `identity_signer` is Some ONLY for a v1 genesis, where it also produces the `identity_sig` self-cosignature; a v2 genesis passes the pubkey with `None` (empty identity_sig, docs/identity-succession.md); non-genesis ops pass `[0;32]` + `None`.
     identity_pubkey: [u8; 32],
     identity_signer: Option<&ed25519_dalek::SigningKey>,
-    consent: Option<(i64, Vec<u8>)>,
+    consent: Option<(i64, Vec<Egg>)>,
     checkpoint: Option<(u64, [u8; 32], u64)>,
     // `bundle`: ADD / DECLARE carry the subject's public-key bundle. None everywhere else, and on an Add whose device has declared nothing yet.
     bundle: Option<crate::pq::KeyBundle>,
@@ -1098,7 +1118,7 @@ fn sign_op(
     sign_with: scheme::Mask,
 ) -> FleetOp {
     use ed25519_dalek::Signer;
-    let (consent_t, consent_sig) = consent.unwrap_or((0, Vec::new()));
+    let (consent_t, consent) = consent.unwrap_or((0, Vec::new()));
     let (ckpt_k, ckpt_commit, ckpt_fanout_epoch) = checkpoint.unwrap_or((0, [0u8; 32], 0));
     let mut op = FleetOp {
         // Newly minted ops are v2 — framed preimages, the shape multi-scheme eggs need. Existing ops keep whatever version they were written under.
@@ -1113,7 +1133,7 @@ fn sign_op(
         identity_pubkey,
         identity_sig: Vec::new(),
         consent_t,
-        consent_sig,
+        consent,
         ckpt_k,
         ckpt_commit,
         ckpt_fanout_epoch,
@@ -1125,6 +1145,22 @@ fn sign_op(
         op.identity_sig = idk.sign(&msg).to_bytes().to_vec();
     }
     op
+}
+
+/// The consent as it rides the wire: a v1 op carries its single Ed25519 signature bare (so existing bytes are untouched); a v2 op carries the framed egg-list blob.
+fn consent_to_wire(op: &FleetOp) -> Vec<u8> {
+    match op.version {
+        OpVersion::V1 => op.consent.first().map(|e| e.sig.clone()).unwrap_or_default(),
+        OpVersion::V2 => crate::pq::eggs_to_bytes(&op.consent),
+    }
+}
+
+/// Inverse of [`consent_to_wire`], keyed on the op's version.
+fn consent_from_wire(version: OpVersion, bytes: &[u8]) -> Result<Vec<Egg>, String> {
+    match version {
+        OpVersion::V1 => Ok(vec![Egg { scheme: scheme::ED25519, sig: bytes.to_vec() }]),
+        OpVersion::V2 => crate::pq::eggs_from_bytes(bytes).map_err(|e| format!("fleet op: consent {e}")),
+    }
 }
 
 /// Encode one op to its positional "op" field values (the exact layout [`parse_op`] reads). Shared by the fleet chain codec and the succession record (which embeds a predecessor chain's ops verbatim).
@@ -1151,12 +1187,12 @@ fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
     }
     if op.kind == OpKind::Add {
         values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
-        values.push(VsfType::ge(op.consent_sig.clone()));
+        values.push(VsfType::ge(consent_to_wire(op)));
     }
     // Consented Remove appends the same (e6 t, ge sig) pair; legacy self-departure appends nothing. The parser discriminates by TYPE at position 6 (the egg tail always begins with a `u` scheme, never an `e`), same trick as the genesis v1/v2 split.
-    if op.kind == OpKind::Remove && !op.consent_sig.is_empty() {
+    if op.kind == OpKind::Remove && !op.consent.is_empty() {
         values.push(VsfType::e(vsf::types::EtType::e6(op.consent_t)));
-        values.push(VsfType::ge(op.consent_sig.clone()));
+        values.push(VsfType::ge(consent_to_wire(op)));
     }
     if op.kind == OpKind::Checkpoint {
         values.push(VsfType::u(op.ckpt_k as usize, false));
@@ -1215,7 +1251,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     let mut identity_pubkey = [0u8; 32];
     let mut identity_sig = Vec::new();
     let mut consent_t = 0i64;
-    let mut consent_sig = Vec::new();
+    let mut consent: Vec<Egg> = Vec::new();
     let mut ckpt_k = 0u64;
     let mut ckpt_commit = [0u8; 32];
     let mut ckpt_fanout_epoch = 0u64;
@@ -1237,8 +1273,8 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
             Some(VsfType::e(et)) => et_to_osc(et),
             _ => return Err("fleet op: add missing consent time".into()),
         };
-        consent_sig = match values.get(7) {
-            Some(VsfType::ge(s)) => s.clone(),
+        consent = match values.get(7) {
+            Some(VsfType::ge(s)) => consent_from_wire(version, s)?,
             _ => return Err("fleet op: add missing consent sig".into()),
         };
         i = 8;
@@ -1247,8 +1283,8 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
         // Consented form carries (e6 consent_t, ge consent_sig) before the egg tail; legacy self-departure goes straight to eggs. Type-discriminated: an `e` at 6 is the consent stamp, a `u` is the first egg's scheme.
         if let Some(VsfType::e(et)) = values.get(6) {
             consent_t = et_to_osc(et);
-            consent_sig = match values.get(7) {
-                Some(VsfType::ge(s)) => s.clone(),
+            consent = match values.get(7) {
+                Some(VsfType::ge(s)) => consent_from_wire(version, s)?,
                 _ => return Err("fleet op: consented remove missing consent sig".into()),
             };
             i = 8;
@@ -1299,7 +1335,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
         identity_pubkey,
         identity_sig,
         consent_t,
-        consent_sig,
+        consent,
         ckpt_k,
         ckpt_commit,
         ckpt_fanout_epoch,
@@ -1350,6 +1386,7 @@ pub fn et_to_osc(et: &vsf::types::EtType) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::Keypair;
     use crate::pq::{FleetSigner, KeyBundle, SigningBundle};
 
     const HP: [u8; 32] = [0xab; 32];
@@ -1362,8 +1399,16 @@ mod tests {
         k.public.to_bytes()
     }
     /// The added device signs its own binding request — the consent every Add must carry.
-    fn consent_for(device: &Keypair, t: i64) -> (i64, Vec<u8>) {
-        (t, device.sign(&bindreq_signing_bytes(&HP, &device.public.to_bytes(), t)).to_bytes().to_vec())
+    /// A joiner's consent: its eggs over the bindreq bytes, with every scheme it holds — so a `SigningBundle` consents three-deep and proves its bundle, and a bare `Keypair` consents with Ed25519 alone.
+    fn consent_for(device: &impl FleetSigner, t: i64) -> (i64, Vec<Egg>) {
+        let pk = device.keypair().public.to_bytes();
+        let mask = device.bundle().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE);
+        (t, device.eggs(&bindreq_signing_bytes(&HP, &pk, t), mask))
+    }
+
+    /// A leaver's consent over its departure request, Ed25519 alone (the departure tests use bare keypairs).
+    fn depart_consent(device: &Keypair, t: i64) -> Vec<Egg> {
+        device.eggs(&departreq_signing_bytes(&HP, &device.public.to_bytes(), t), scheme::MASK_BASE)
     }
 
     #[test]
@@ -1396,7 +1441,7 @@ mod tests {
         blob.add(&a, pk(&b), 200, t1, s1);
         // b requests removal (signs its departure request); a countersigns and appends.
         let dt = 390i64;
-        let dsig = b.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        let dsig = depart_consent(&b, dt);
         blob.remove_consented(&a, pk(&b), 400, dt, dsig);
         assert_eq!(blob.fold().unwrap(), vec![pk(&a)]);
         // Wire round-trip keeps the consent group intact.
@@ -1418,17 +1463,17 @@ mod tests {
         // The leaver approving its own consented removal — two signatures must be two devices.
         let mut blob = mk(&a, &b);
         let dt = 390i64;
-        let dsig = b.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        let dsig = depart_consent(&b, dt);
         blob.remove_consented(&b, pk(&b), 400, dt, dsig);
         assert_eq!(blob.fold(), Err(FoldError::RemoveApproverIsLeaver { index: 2 }));
         // The approver forging the leaver's request signature — expulsion attempt.
         let mut blob = mk(&a, &b);
-        let forged = a.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        let forged = depart_consent(&a, dt);
         blob.remove_consented(&a, pk(&b), 400, dt, forged);
         assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 2 }));
         // A stale request replayed past the window.
         let mut blob = mk(&a, &b);
-        let dsig = b.sign(&departreq_signing_bytes(&HP, &pk(&b), dt)).to_bytes().to_vec();
+        let dsig = depart_consent(&b, dt);
         blob.remove_consented(&a, pk(&b), dt + CONSENT_WINDOW_OSC + 1, dt, dsig);
         assert_eq!(blob.fold(), Err(FoldError::ConsentStale { index: 2 }));
     }
@@ -1455,7 +1500,7 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 1 }));
         // Consent signed by the WRONG key (the sponsor forging on the victim's behalf).
         let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
-        let forged = a.sign(&bindreq_signing_bytes(&HP, &pk(&victim), 190)).to_bytes().to_vec();
+        let forged = a.eggs(&bindreq_signing_bytes(&HP, &pk(&victim), 190), scheme::MASK_BASE);
         blob.add(&a, pk(&victim), 200, 190, forged);
         assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 1 }));
     }
@@ -1519,7 +1564,7 @@ mod tests {
         blob.add(&a, pk(&b), 200, t, s);
         let (t2, s2) = consent_for(&b, 195);
         blob.ops[1].consent_t = t2;
-        blob.ops[1].consent_sig = s2;
+        blob.ops[1].consent = s2;
         assert_eq!(blob.fold(), Err(FoldError::BadSignature { index: 1 }));
     }
 
@@ -1635,8 +1680,8 @@ mod tests {
         bare.add(&a, pk(&c), 300, t, sig);
         assert_eq!(bare.fold(), Err(FoldError::BelowFloor { index: 2 }));
 
-        // b joins WITH its bundle: admitted, and the floor holds.
-        let (t, sig) = consent_for(b.keypair(), 290);
+        // b joins WITH its bundle and a consent signed by all three of its keys: admitted, and the floor holds.
+        let (t, sig) = consent_for(&b, 290);
         blob.add_declared(&a, pk(b.keypair()), 300, t, sig, b.public());
         assert_eq!(blob.fold().unwrap(), vec![pk(a.keypair()), pk(b.keypair())]);
         assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_ALL);
@@ -1711,6 +1756,61 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::BadSignature { index: 2 }));
     }
 
+    /// Declaring on an Add is proving: a consent that does not cover the bundle the joiner is added with does not fold.
+    #[test]
+    fn add_consent_must_prove_the_declared_bundle() {
+        let (a, b) = bundles();
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        // b's full bundle on the Add, but b consented with Ed25519 only — the claim outruns the proof.
+        let (t, sig) = consent_for(b.keypair(), 190);
+        blob.add_declared(&a, pk(b.keypair()), 200, t, sig, b.public());
+        assert_eq!(blob.fold(), Err(FoldError::BadConsent { index: 1 }));
+    }
+
+    /// A departure from a promoted fleet is consented at the floor: the leaver signs with everything it declared.
+    #[test]
+    fn departure_consent_is_held_to_the_floor() {
+        let (a, b) = bundles();
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, sig) = consent_for(&b, 190);
+        blob.add_declared(&a, pk(b.keypair()), 200, t, sig, b.public());
+        blob.declare(&a, 300);
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_ALL);
+        let msg = departreq_signing_bytes(&HP, &pk(b.keypair()), 390);
+        // Ed25519-only departure consent on a three-scheme fleet: refused.
+        let mut short = blob.clone();
+        short.remove_consented(&a, pk(b.keypair()), 400, 390, b.keypair().eggs(&msg, scheme::MASK_BASE));
+        assert_eq!(short.fold(), Err(FoldError::BadConsent { index: 3 }));
+        // Full consent: b leaves, a remains.
+        blob.remove_consented(&a, pk(b.keypair()), 400, 390, b.eggs(&msg, scheme::MASK_ALL));
+        assert_eq!(blob.fold().unwrap(), vec![pk(a.keypair())]);
+    }
+
+    /// Succession is a re-founding, so a vouch is held to the predecessor's floor: from a three-scheme fleet, an Ed25519-only vouch is exactly what a curve break would let an attacker forge, and it is refused.
+    #[test]
+    fn succession_vouch_is_held_to_the_predecessor_floor() {
+        let (a, b) = bundles();
+        let mut pred = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, sig) = consent_for(&b, 190);
+        pred.add_declared(&a, pk(b.keypair()), 200, t, sig, b.public());
+        pred.declare(&a, 300);
+        assert_eq!(pred.scheme_floor().unwrap(), scheme::MASK_ALL);
+        let pinned = pred.genesis_hash().unwrap();
+        let new = MembershipBlob::genesis_v2(&a, HP, &SEED, 1000);
+        let new_gh = new.genesis_hash().unwrap();
+
+        // Vouched with everything a declared: accepted.
+        let good = SuccessorRecord::new(pred.clone(), new_gh, HP, &[&a]).unwrap();
+        assert!(good.verify_for_pin(&pinned).is_ok());
+        // Same device, Ed25519 alone: below the predecessor's floor, refused.
+        let weak = SuccessorRecord::new(pred.clone(), new_gh, HP, &[a.keypair()]).unwrap();
+        assert!(weak.verify_for_pin(&pinned).is_err());
+        // An egg naming a scheme this build cannot verify is a hard reject, not a skip.
+        let mut unknown = good.clone();
+        unknown.continuity_eggs.push(ContinuityEgg { device_pubkey: pk(a.keypair()), scheme: 200, sig: vec![0u8; 64] });
+        assert!(unknown.verify_for_pin(&pinned).is_err());
+    }
+
     /// The migration itself: a v1 chain EXTENDS with v2 ops rather than being replaced.
     ///
     /// This is the property that removes the wipe. The genesis hash is the fleet's generation id and every friend TOFU-pins it, so it must survive the egg work byte-for-byte while new ops still get the framed preimages multi-scheme eggs need. Both halves are asserted here: the pinned pre-egg genesis keeps its exact hash, and an op appended today folds on top of it.
@@ -1769,8 +1869,8 @@ mod tests {
         let a = key(1);
         let mut short = MembershipBlob::genesis(&a, HP, &SEED, 100).ops[0].clone();
         let mut long = short.clone();
-        short.consent_sig = vec![0xCD; 32];
-        long.consent_sig = vec![0xCD; 64];
+        short.consent = vec![Egg { scheme: scheme::ED25519, sig: vec![0xCD; 32] }];
+        long.consent = vec![Egg { scheme: scheme::ED25519, sig: vec![0xCD; 64] }];
         assert_ne!(short.signing_bytes(), long.signing_bytes());
         // And the framed length is what separates them, not just the byte count.
         assert_ne!(
@@ -2094,6 +2194,35 @@ mod tests {
         assert_eq!(parsed.latest_checkpoint(), Some((1, [0x33; 32], 9)));
     }
 
+    /// The registry door applies the same rule as the fold: a request that declares a bundle must consent with every scheme in it. This is what lets the worker refuse an unprovable bundle before a sponsor ever sees it.
+    #[test]
+    fn bindreq_with_a_bundle_must_consent_with_every_declared_scheme() {
+        let (b, _) = bundles();
+        let identity_key = ed25519_dalek::SigningKey::from_bytes(&SEED);
+        let identity_pubkey = identity_key.verifying_key().to_bytes();
+        let t = 12345i64;
+        let msg = bindreq_signing_bytes(&HP, &pk(b.keypair()), t);
+        use ed25519_dalek::Signer;
+        let full = BindRequest {
+            device_pubkey: pk(b.keypair()),
+            t,
+            device_sig: b.eggs(&msg, scheme::MASK_ALL),
+            identity_sig: identity_key.sign(&msg).to_bytes().to_vec(),
+            nfc_hash: [0u8; 32],
+            bundle: Some(b.public()),
+        };
+        assert!(full.verify(&HP, &identity_pubkey), "three eggs over a three-scheme bundle");
+        // Same bundle, Ed25519-only consent: the claim outruns the proof.
+        let mut short = full.clone();
+        short.device_sig = b.keypair().eggs(&msg, scheme::MASK_BASE);
+        assert!(!short.verify(&HP, &identity_pubkey));
+        // Somebody else's bundle under this device's key: refused before any signature is checked.
+        let (_, other) = bundles();
+        let mut theirs = full.clone();
+        theirs.bundle = Some(other.public());
+        assert!(!theirs.verify(&HP, &identity_pubkey));
+    }
+
     #[test]
     fn bindreq_verifies_both_signatures() {
         let device = key(6);
@@ -2105,9 +2234,10 @@ mod tests {
         let req = BindRequest {
             device_pubkey: pk(&device),
             t,
-            device_sig: device.sign(&msg).to_bytes().to_vec(),
+            device_sig: device.eggs(&msg, scheme::MASK_BASE),
             identity_sig: identity_key.sign(&msg).to_bytes().to_vec(),
             nfc_hash: [0u8; 32],
+            bundle: None,
         };
         assert!(req.verify(&HP, &identity_pubkey));
         // Wrong fleet, wrong identity key, tampered stamp — each leg fails.
