@@ -103,10 +103,49 @@ pub struct FleetOp {
     pub ckpt_fanout_epoch: u64,
     /// Signature eggs over [`FleetOp::signing_bytes`]; every listed egg must verify (the egg-list rule).
     pub sigs: Vec<Egg>,
+    /// Which preimage rule this op's signatures were made under — see [`OpVersion`]. Absent on the wire for every op written before the egg work, which decodes as `V1` and is what keeps existing chains folding.
+    pub version: OpVersion,
 }
 
-/// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove). v2 = LENGTH-FRAMED preimages (see [`frame_into`]) — flag-day, v0/v1 chains don't fold.
-const SIGNING_DOMAIN: &[u8] = b"PHOTON_FLEET_OP_v2";
+/// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove).
+const SIGNING_DOMAIN_V1: &[u8] = b"PHOTON_FLEET_OP_v1";
+
+/// v2 = LENGTH-FRAMED preimages (see [`frame_into`]), the prerequisite for eggs of differing lengths.
+const SIGNING_DOMAIN_V2: &[u8] = b"PHOTON_FLEET_OP_v2";
+
+/// Which preimage rule an op's signatures were made under. A PER-OP property, never a global one.
+///
+/// The genesis op's [`FleetOp::chain_hash`] is the fleet's generation id, and every friend TOFU-pins it (docs/lifecycle.md — "free must not mean inheritable"). Recomputing it under a new rule changes that hash, so every friend would see a stranger and refuse the fold. Gating per op keeps v1 ops byte-identical forever: the genesis hash a friend pinned still equals what today's code computes, and the chain extends rather than restarts.
+///
+/// This mirrors the rule the checkpoint fields already follow in [`FleetOp::signing_bytes`] — kind-gated precisely so pre-checkpoint ops keep byte-identical signing bytes. An unconditional change breaks every deployed fleet's signatures at once.
+///
+/// Safe to trust off the wire: the version is the FIRST thing in the preimage, so relabelling an op changes its preimage and the signature simply fails to verify. Forging a downgrade needs the signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum OpVersion {
+    /// Unframed preimages, Ed25519-only. Every op written before the egg work. The default when an op carries no version field, which is how existing chains keep folding.
+    #[default]
+    V1 = 1,
+    /// Length-framed preimages; the shape eggs of differing lengths require.
+    V2 = 2,
+}
+
+impl OpVersion {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            OpVersion::V1 => SIGNING_DOMAIN_V1,
+            OpVersion::V2 => SIGNING_DOMAIN_V2,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(OpVersion::V1),
+            2 => Some(OpVersion::V2),
+            _ => None,
+        }
+    }
+}
 
 /// Append a variable-length element to a preimage as `u32 LE length ‖ bytes`.
 ///
@@ -175,8 +214,9 @@ impl FleetOp {
     /// The exact bytes every egg signs: domain + all content fields, fixed-width and deterministic.
     /// Excludes the sigs themselves (you can't sign the signature) — but INCLUDES `consent_sig`, which is a signature over DIFFERENT bytes (the binding request), so the sponsor's egg commits to the exact consent it saw.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(SIGNING_DOMAIN.len() + 32 + 32 + 1 + 32 + 8 + 32 + 32 + 8 + self.consent_sig.len());
-        b.extend_from_slice(SIGNING_DOMAIN);
+        let domain = self.version.domain();
+        let mut b = Vec::with_capacity(domain.len() + 32 + 32 + 1 + 32 + 8 + 32 + 32 + 8 + 4 + self.consent_sig.len());
+        b.extend_from_slice(domain);
         b.extend_from_slice(&self.handle_proof);
         b.extend_from_slice(&self.prev_hash);
         b.push(self.kind as u8);
@@ -185,7 +225,11 @@ impl FleetOp {
         b.extend_from_slice(&self.signer_pubkey);
         b.extend_from_slice(&self.identity_pubkey); // bound in so the device sig also commits to the identity key (it can't be swapped)
         b.extend_from_slice(&self.consent_t.to_le_bytes());
-        frame_into(&mut b, &self.consent_sig); // bound in so the consent can't be swapped under the sponsor's egg; FRAMED because it is variable-length (see `frame_into`)
+        // Bound in so the consent can't be swapped under the sponsor's egg. FRAMED from v2 on, because an unframed variable-length tail is ambiguous (see `frame_into`); v1 ops keep the bare append so their signatures stay byte-identical.
+        match self.version {
+            OpVersion::V1 => b.extend_from_slice(&self.consent_sig),
+            OpVersion::V2 => frame_into(&mut b, &self.consent_sig),
+        }
         // Checkpoint fields append KIND-GATED: every pre-checkpoint op kind keeps byte-identical signing bytes, so chains signed by pre-2026-08-12 builds still verify — an unconditional append would break every deployed fleet's signatures at once.
         if self.kind == OpKind::Checkpoint {
             b.extend_from_slice(&self.ckpt_k.to_le_bytes());
@@ -197,16 +241,27 @@ impl FleetOp {
 
     /// The chain link for the NEXT op's `prev_hash`: a hash over the signed content AND every signature, so the whole op (including who signed it and how) is immutable once chained.
     ///
-    /// The egg count is committed before the eggs themselves, and each signature is length-framed. Without both, a chain hash does not uniquely determine the signature set it covers once schemes of differing lengths exist — see [`frame_into`].
+    /// From v2 the egg count is committed before the eggs themselves and each signature is length-framed. Without both, a chain hash does not uniquely determine the signature set it covers once schemes of differing lengths exist — see [`frame_into`]. v1 keeps the bare concatenation, which is unambiguous there because Ed25519 is its only scheme, and which MUST NOT change: this hash is the generation id every friend pinned.
     pub fn chain_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&self.signing_bytes());
-        h.update(&(self.sigs.len() as u32).to_le_bytes());
-        for egg in &self.sigs {
-            h.update(&[egg.scheme]);
-            frame_hash(&mut h, &egg.sig);
+        match self.version {
+            OpVersion::V1 => {
+                for egg in &self.sigs {
+                    h.update(&[egg.scheme]);
+                    h.update(&egg.sig);
+                }
+                h.update(&self.identity_sig);
+            }
+            OpVersion::V2 => {
+                h.update(&(self.sigs.len() as u32).to_le_bytes());
+                for egg in &self.sigs {
+                    h.update(&[egg.scheme]);
+                    frame_hash(&mut h, &egg.sig);
+                }
+                frame_hash(&mut h, &self.identity_sig);
+            }
         }
-        frame_hash(&mut h, &self.identity_sig);
         *h.finalize().as_bytes()
     }
 
@@ -835,6 +890,8 @@ fn sign_op(
     let (consent_t, consent_sig) = consent.unwrap_or((0, Vec::new()));
     let (ckpt_k, ckpt_commit, ckpt_fanout_epoch) = checkpoint.unwrap_or((0, [0u8; 32], 0));
     let mut op = FleetOp {
+        // Newly minted ops are v2 — framed preimages, the shape multi-scheme eggs need. Existing ops keep whatever version they were written under.
+        version: OpVersion::V2,
         handle_proof,
         prev_hash,
         kind,
@@ -863,14 +920,19 @@ fn sign_op(
 
 /// Encode one op to its positional "op" field values (the exact layout [`parse_op`] reads). Shared by the fleet chain codec and the succession record (which embeds a predecessor chain's ops verbatim).
 fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
-    let mut values = vec![
+    let mut values = Vec::new();
+    // A v1 op begins with `hP(handle_proof)`; every later version begins with `u(version)`. The TYPE at position 0 is what tells them apart, so a v1 op's bytes stay exactly as they were written and its chain_hash — the generation id every friend pinned — never moves.
+    if op.version != OpVersion::V1 {
+        values.push(VsfType::u(op.version as usize, false));
+    }
+    values.extend([
         VsfType::hP(op.handle_proof.to_vec()),
         VsfType::hb(op.prev_hash.to_vec()),
         VsfType::u(op.kind as usize, false),
         VsfType::ke(op.device_pubkey.to_vec()),
         VsfType::e(vsf::types::EtType::e6(op.eagle_time)),
         VsfType::ke(op.signer_pubkey.to_vec()),
-    ];
+    ]);
     if op.kind == OpKind::Genesis {
         values.push(VsfType::ke(op.identity_pubkey.to_vec()));
         // v1 carries the identity self-cosignature; v2 (docs/identity-succession.md) OMITS it. The `ge` type stores `len-1`, so a zero-length value is unrepresentable — we don't emit it. The egg tail always begins with a `u` scheme (never a `ge`), so the parser discriminates the two layouts by type at this position.
@@ -900,7 +962,21 @@ fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
 }
 
 /// Decode one positional "op" field's values back into a [`FleetOp`].
-fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
+fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
+    if all.is_empty() {
+        return Err("fleet op: no values".into());
+    }
+    // Mirror of `op_field_values`: `hP` at position 0 means a v1 op written before the version field existed, anything else is the version itself. Defaulting to v1 rather than rejecting is what lets every chain already in the field keep folding.
+    let (version, base) = match &all[0] {
+        VsfType::hP(_) => (OpVersion::V1, 0usize),
+        other => {
+            use vsf::schema::FromVsfType;
+            let v = u8::from_vsf_type(other).map_err(|_| "fleet op: bad version type".to_string())?;
+            let ver = OpVersion::from_byte(v).ok_or_else(|| format!("fleet op: unknown version {v}"))?;
+            (ver, 1usize)
+        }
+    };
+    let values = &all[base..];
     if values.len() < 6 {
         return Err(format!("fleet op: need >=6 values, got {}", values.len()));
     }
@@ -990,6 +1066,7 @@ fn parse_op(values: &[VsfType]) -> Result<FleetOp, String> {
         i += 2;
     }
     Ok(FleetOp {
+        version,
         handle_proof,
         prev_hash,
         kind,
@@ -1266,6 +1343,38 @@ mod tests {
         assert_eq!(parsed.fold().unwrap(), vec![pk(&a)]);
     }
 
+    /// A real chain written by the PRE-egg build (2026-08-12): genesis a, add b, b departs. Carries no version field, so it parses as v1 and must fold under v1 rules forever. Shared by the two tests that guard the migration.
+    const PINNED_HEX: &str = "52c3853c7a330979330962337e6c3404136536237edeb2824c5c006870331f4d0baa0b8e1566fe11128f43a2a4e9483f82a5af4acd27a94e6df043bdc6a37f6862331f4f3f5a57908e2951a9b7d385510994b16ae44ba669157fc37af6b0d700a4f93b6e330128643305666c6565743a6f337e2c623403952c6e3303293e5b286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f00000000000000000000000000000000000000000000000000000000000000002c7533002c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000642c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c6b65331ffc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a272c6765333f39148ed5a51baf7f765600b277f8ac2fddf445b55ed8c261d3a8eca449a7286614d00939188337bd07f1248654b86bc5c6659f14f9d504ce0fc5fded4b3d30092c7533002c6765333feb2b722e7d441cec833a63f76026ae7aadb29316d0164bfb61d4c2f34866bf3a4e53c5c6d628f12f32613316cabece5e32a53c4b4ff3bb147ccecfd9cc2e580b29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f934c5a5c68855e63a020b9a8da384f37b3cb0ccf7d6a090c56130cbad4a90d912c7533012c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c653600000000000000c82c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000be2c6765333f0d5b6753187a455f5f2ae54016ecbc96b082e5d58f2bc768ebe6686baf21f18ad5527b359610eeda8ac917e04f4d92ddc242ed26bbd7bf4cb0f210e7ea292b082c7533002c6765333f1aa37898dea850c91e4c57c133fa3ef49f648f62b96d55b768adba460a463db2a031e1d92e1b923c2490e61ff237490227cc795ce61ae1969f7ee9a3047f240e29286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331fbb1daf28635b791d0c66592c912d78bd71ade425974d947601464709b16c65712c7533022c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c6536000000000000012c2c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c7533002c6765333f75b772ee48e506047eca02a0db47b81d9bb708caa6478172a001eb5cbb8f3cee45de3fcc818477127f87142ced6f4c89fa008d3ca19aa4e4923347a3e7699b09295d";
+
+    /// The migration itself: a v1 chain EXTENDS with v2 ops rather than being replaced.
+    ///
+    /// This is the property that removes the wipe. The genesis hash is the fleet's generation id and every friend TOFU-pins it, so it must survive the egg work byte-for-byte while new ops still get the framed preimages multi-scheme eggs need. Both halves are asserted here: the pinned pre-egg genesis keeps its exact hash, and an op appended today folds on top of it.
+    #[test]
+    fn v1_chain_extends_with_v2_ops_and_keeps_its_genesis() {
+        let bytes: Vec<u8> = (0..PINNED_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PINNED_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        let mut blob = MembershipBlob::from_vsf_bytes(&bytes).expect("v1 chain must parse");
+        assert_eq!(blob.ops[0].version, OpVersion::V1, "a chain with no version field is v1");
+        let genesis_before = blob.genesis_hash();
+
+        // Append under today's rules — sign_op mints v2.
+        let a = key(1);
+        let c = key(3);
+        let (t, s) = consent_for(&c, 390);
+        blob.add(&a, pk(&c), 400, t, s);
+        assert_eq!(blob.ops.last().unwrap().version, OpVersion::V2, "new ops are framed");
+
+        assert_eq!(blob.genesis_hash(), genesis_before, "the pinned generation id must not move");
+        assert_eq!(blob.fold().expect("mixed-version chain must fold"), vec![pk(&a), pk(&c)]);
+
+        // And it survives the wire in both directions.
+        let round = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(round, blob);
+        assert_eq!(round.genesis_hash(), genesis_before);
+    }
+
     /// The preimages must stay injective once signatures of differing lengths exist.
     ///
     /// Before framing, `chain_hash` appended `scheme ‖ sig` with no length, so a single long egg hashed identically to a crafted run of shorter ones — two different signature SETS, one chain hash, and that hash is `prev_hash`. Splitting one egg's payload across two eggs is the cheapest witness: unframed, both spellings feed the hasher the same bytes.
@@ -1518,12 +1627,11 @@ mod tests {
         assert_eq!(blob.fold(), Err(FoldError::StrayConsent { index: 2 }));
     }
 
-    /// Determinism guard: a fixed chain's bytes must keep parsing and folding to a fixed member set.
+    /// The signature-stability guard, now doing double duty. These bytes were generated by the PRE-checkpoint build (2026-08-12, before kind 3 existed) and carry NO version field, so they parse as `OpVersion::V1` and must fold under v1 rules — unframed preimages, bare `consent_sig` tail, Ed25519 only.
     ///
-    /// RE-PINNED at the egg flag day. The previous vector was generated by the pre-checkpoint build (2026-08-12) and guarded the opposite property — that field chains keep verifying across an update. Length-framing the preimages (see `frame_into`) deliberately breaks exactly that, because an unframed preimage is not injective once signature lengths vary, so v1 chains cannot be allowed to fold. These bytes are the v2 equivalent; from here the guarantee resumes, and a failure means an unintended signing-bytes or codec drift rather than a planned break.
+    /// This is the test that proves the egg work did not strand the field. A fleet's genesis `chain_hash` is its generation id and every friend TOFU-pins it; if framing were applied unconditionally that hash would move and every friendship would render as a stranger. Folding this vector unchanged is what says it did not.
     #[test]
     fn pinned_pre_checkpoint_chain_still_parses_and_folds() {
-        const PINNED_HEX: &str = "52c3853c7a330979330962337e6c3404136536238f577e118260006870331f346f246beebfb4e466b9f49819cbbc26f0e83b14682d3a1e459fd45608c6724a6862331fdd559e00e904c85b67af8c9b37586066314a20a75d7caa68fcf00bde126abca46e330128643305666c6565743a6f337e2c623403952c6e3303293e5b286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f00000000000000000000000000000000000000000000000000000000000000002c7533002c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000642c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c6b65331ffc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a272c6765333ffba227a608c99bdec56c0a6abff94d282a76ffef0bf084a89753e8c51c710ebcaa27d2124e018b252bb96be9013493924d5d613771d9c7068b14b7894851cc0c2c7533002c6765333f0376b73927c3ee336bac8c0414159fdca53dbbb14f8f8282f632b8d9078c4f06ed9dc20a0fa75c86702c7a45dbdf346aaaa42e25fa3e7bc0ad2632be0c0a3f0329286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f8014e5dc1e369e1443d8aab8ca92b4efcc58e02796e6c02f0d33b2d664fd6cb52c7533012c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c653600000000000000c82c6b65331f8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c2c653600000000000000be2c6765333f0d5b6753187a455f5f2ae54016ecbc96b082e5d58f2bc768ebe6686baf21f18ad5527b359610eeda8ac917e04f4d92ddc242ed26bbd7bf4cb0f210e7ea292b082c7533002c6765333fc460db95156e74e1c1dec65d77ed8c4c2be4b11f0fcc61defe469dfb0b0fb1375f68f5a96e4ac097dc65f192cbf45636d83ad1357abfe4e282c66e26de8d540729286433026f703a6850331fabababababababababababababababababababababababababababababababab2c6862331f3092be05f46bca85419622800983372ae69195c143c19cce5e44d589ddd9a9802c7533022c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c6536000000000000012c2c6b65331f8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3942c7533002c6765333f15a7ec60829a602ff13cea19d2ae46304e09e92d637952082d08af30afe75b1f0a04637882b8e8cc8eb600028be845f5326429cd2de73c4ffa2d0a1d5eb00008295d";
         let bytes: Vec<u8> = (0..PINNED_HEX.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&PINNED_HEX[i..i + 2], 16).unwrap())
