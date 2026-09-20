@@ -37,11 +37,12 @@ use vsf::VsfType;
 /// Signature-scheme tag (the egg label). Wire-stable: append, never renumber.
 pub mod scheme {
     /// Elliptic-curve family (ECDLP). The device key itself, so EVERY device can always produce this one.
-    pub const ED25519: u8 = 0;
+    pub const ED25519: u8 = vsf::eggs::SCHEME_ED25519;
     /// Lattice family (NTRU/SIS). 897 B key, 666 B signature.
-    pub const FALCON512: u8 = 1;
+    pub const FALCON512: u8 = vsf::eggs::SCHEME_FALCON512;
     /// Hash family (preimage resistance) — the backstop if curves and lattices both fall. 32 B key, 7856 B signature.
-    pub const SPHINCS_PLUS: u8 = 2;
+    pub const SPHINCS_PLUS: u8 = vsf::eggs::SCHEME_SPHINCS_PLUS;
+    // The tags are vsf's: the egg codec, the `gm` basket and the single-egg `ge`/`gf`/`gs` types all name a scheme by the same number, and `vsf::eggs::algo_letter` is the one place that maps it to a type letter.
 
     /// A set of schemes as a bitmask, bit N = scheme N. The currency of the fleet's capability floor.
     pub type Mask = u16;
