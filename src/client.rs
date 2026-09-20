@@ -266,6 +266,45 @@ pub fn declare_device<T: FgtwTransport>(
     Err("fleet: declare kept racing a concurrent chain extension".into())
 }
 
+/// Lock `device` out of the fleet ON THE CHAIN — the companion of [`device_lock`] (the worker's own refusal, which survives a wipe). The chain op is what lifts the floor: a locked device stops holding the fleet at its capability, and signs nothing that folds. `signer` must be a current, unlocked member other than `device`. Idempotent: already locked = Ok.
+pub fn lock_device_chain<T: FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, handle_proof: &[u8; 32], device: &[u8; 32]) -> Result<(), String> {
+    lock_op_chain(t, signer, handle_proof, device, true)
+}
+
+/// Reverse [`lock_device_chain`]. Idempotent: not locked = Ok.
+pub fn unlock_device_chain<T: FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, handle_proof: &[u8; 32], device: &[u8; 32]) -> Result<(), String> {
+    lock_op_chain(t, signer, handle_proof, device, false)
+}
+
+fn lock_op_chain<T: FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, handle_proof: &[u8; 32], device: &[u8; 32], lock: bool) -> Result<(), String> {
+    let me = signer.keypair().public.to_bytes();
+    for _attempt in 0..4 {
+        let mut blob = fetch(t, handle_proof)?.ok_or("no fleet chain to lock into")?;
+        let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+        if !members.contains(&me) {
+            return Err("this device is not a current member, so it cannot lock or unlock".into());
+        }
+        let locked = blob.locked_out().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+        if locked.contains(&me) {
+            return Err("this device is locked out and holds no authority over the chain".into());
+        }
+        if locked.contains(device) == lock {
+            return Ok(()); // already in the wanted state
+        }
+        if lock {
+            blob.lock(signer, *device, vsf::eagle_time_oscillations());
+        } else {
+            blob.unlock(signer, *device, vsf::eagle_time_oscillations());
+        }
+        match publish(t, &blob) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("stale") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("fleet: lock kept racing a concurrent chain extension".into())
+}
+
 /// [`recover_fleet_key`], keeping the fan-out revision alongside the key — the epoch spine folds the fleet key AND needs to name the publish it came from, so recovery callers that feed derivation want the pair.
 pub fn recover_fleet_key_with_epoch<T: FgtwTransport>(
     t: &T,

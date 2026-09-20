@@ -75,6 +75,10 @@ pub enum OpKind {
     Checkpoint = 3,
     /// A member publishes its own key bundle, raising what it can sign with. Self-signed only — you may declare your keys and nobody else's. The transition instrument: existing members declare to lift the fleet's floor, while devices joining afterwards carry their bundle on the Add itself.
     Declare = 4,
+    /// A current member marks `device_pubkey` LOCKED OUT (treat-as-stolen). Membership is untouched — a device leaves the chain by its own hand only, and a lost one never will — but a locked device is dropped from the fleet's capability floor and may sign no later op. Without this a device at the bottom of the ocean (2026-09-20) pins every fleet it was in at Ed25519 forever.
+    Lock = 5,
+    /// The owner's deliberate reversal of a `Lock`, by a current unlocked member. The device counts toward the floor and may sign again.
+    Unlock = 6,
 }
 
 impl OpKind {
@@ -85,6 +89,8 @@ impl OpKind {
             2 => Some(OpKind::Remove),
             3 => Some(OpKind::Checkpoint),
             4 => Some(OpKind::Declare),
+            5 => Some(OpKind::Lock),
+            6 => Some(OpKind::Unlock),
             _ => None,
         }
     }
@@ -351,6 +357,14 @@ fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
     vk.verify(msg, &Signature::from_bytes(&sig_arr)).is_ok()
 }
 
+/// Everything one chain walk yields — one traversal, every answer, so no two accessors can disagree about the same chain.
+struct FoldState {
+    members: Vec<[u8; 32]>,
+    floor: scheme::Mask,
+    bundles: Vec<([u8; 32], crate::pq::KeyBundle)>,
+    locked: Vec<[u8; 32]>,
+}
+
 /// Why a blob failed to fold. Surfaced so the UI/logs can say *what* was wrong, not just "invalid".
 #[derive(Debug, PartialEq)]
 pub enum FoldError {
@@ -398,6 +412,10 @@ pub enum FoldError {
     BrokenChain { index: usize },
     BadSignature { index: usize },
     SignerNotMember { index: usize },
+    /// The op's signer is locked out — a locked device holds no authority over the chain, least of all the authority to unlock itself.
+    SignerLocked { index: usize },
+    /// A Lock names a non-member, an already-locked device, or the signer itself; an Unlock names a device that is not locked.
+    LockMalformed { index: usize },
     AddExistingMember { index: usize },
     RemoveNonMember { index: usize },
 }
@@ -418,15 +436,17 @@ impl MembershipBlob {
     /// This is the heart of the design and the part FGTW must mirror exactly: each op must (1) link to the prior op by hash, (2) carry valid signature(s), and (3) be signed by a device that was a member *before* this op (genesis excepted — it's self-signed into an empty set).
     /// Returns the live device pubkeys in insertion order, or the first rule it violated.
     pub fn fold(&self) -> Result<Vec<[u8; 32]>, FoldError> {
-        self.fold_inner().map(|(members, _, _)| members)
+        self.fold_inner().map(|f| f.members)
     }
 
     /// The single chain walk behind [`fold`](MembershipBlob::fold) and [`scheme_floor`](MembershipBlob::scheme_floor) — one traversal, both answers, so the two can never disagree about the same chain.
-    fn fold_inner(&self) -> Result<(Vec<[u8; 32]>, scheme::Mask, Vec<([u8; 32], crate::pq::KeyBundle)>), FoldError> {
+    fn fold_inner(&self) -> Result<FoldState, FoldError> {
         if self.ops.is_empty() {
             return Err(FoldError::Empty);
         }
         let mut members: Vec<[u8; 32]> = Vec::new();
+        // Members the fleet has locked out. Still members — still hosts — but they carry no authority and the floor stops waiting on them.
+        let mut locked: Vec<[u8; 32]> = Vec::new();
         // What each member has declared it can sign with — the full public bundle, so later ops by that device can be verified against it. Absent = Ed25519 alone: no special "undeclared" state, because every device genuinely holds an Ed25519 key.
         let mut bundles: Vec<([u8; 32], crate::pq::KeyBundle)> = Vec::new();
         // The fleet's capability floor, RATCHETED. It only ever rises, so a device joining with less cannot drag the fleet back to single-egg — that op simply does not fold.
@@ -466,6 +486,10 @@ impl MembershipBlob {
                 if b.ed25519() != op.device_pubkey {
                     return Err(FoldError::BundleMismatch { index: i });
                 }
+            }
+            // A locked device signs nothing that folds — not a Declare, not an Add, not its own Unlock. Only the healthy fleet holds the chain. Checked before the floor so the refusal names the real reason: a locked device is usually below the floor too, and "not enough eggs" would hide the lock.
+            if locked.contains(&op.signer_pubkey) {
+                return Err(FoldError::SignerLocked { index: i });
             }
             // THE FLOOR AS THE REQUIRED SET. Before checking any signature, the op must CARRY every scheme the fleet had reached by the previous op. Read off the chain the verifier is already folding, so unlike a version pin in the payload it cannot be stripped — dropping the Falcon egg from a post-promotion op leaves it short, and it does not fold.
             if !scheme::covers(crate::pq::egg_mask(&op.sigs), floor) {
@@ -580,6 +604,27 @@ impl MembershipBlob {
                     if members.len() == before {
                         return Err(FoldError::RemoveNonMember { index: i });
                     }
+                    locked.retain(|m| m != &op.device_pubkey);
+                }
+                OpKind::Lock => {
+                    if !members.contains(&op.signer_pubkey) {
+                        return Err(FoldError::SignerNotMember { index: i });
+                    }
+                    // The subject is a member, not the signer, not already locked.
+                    if !members.contains(&op.device_pubkey) || op.device_pubkey == op.signer_pubkey || locked.contains(&op.device_pubkey) {
+                        return Err(FoldError::LockMalformed { index: i });
+                    }
+                    locked.push(op.device_pubkey);
+                }
+                OpKind::Unlock => {
+                    if !members.contains(&op.signer_pubkey) {
+                        return Err(FoldError::SignerNotMember { index: i });
+                    }
+                    let before = locked.len();
+                    locked.retain(|m| m != &op.device_pubkey);
+                    if locked.len() == before {
+                        return Err(FoldError::LockMalformed { index: i });
+                    }
                 }
                 OpKind::Checkpoint => {
                     // Membership is untouched; the op only pins the epoch spine, so the gates are: a current member signed it, the fields are non-void, and k advances by exactly one.
@@ -596,28 +641,35 @@ impl MembershipBlob {
                 }
             }
             // Recompute the floor from the CURRENT membership after every op, then ratchet: the AND across members is what the whole fleet can do, and `max` with the running value is what stops a departure or a fresh fold from lowering it.
+            // Locked-out members are left out of the AND: a device the fleet has written off must not be the one thing holding everyone else at Ed25519. It is not a downgrade route — an unlock puts the device back in the AND, but the ratchet keeps the floor where it was, and the device then has to declare up to it before its next op folds.
             let live = members
                 .iter()
+                .filter(|m| !locked.contains(m))
                 .map(|m| bundles.iter().find(|(d, _)| d == m).map(|(_, b)| b.mask()).unwrap_or(scheme::MASK_BASE))
                 .fold(scheme::MASK_ALL, |a, b| a & b);
             floor |= live;
             expected_prev = op.chain_hash();
         }
-        Ok((members, floor, bundles))
+        Ok(FoldState { members, floor, bundles, locked })
+    }
+
+    /// The devices the chain has LOCKED OUT: still members, but excluded from the floor and from signing. What a host checks beside the epoch proof, and what a fleet UI shows as "locked".
+    pub fn locked_out(&self) -> Result<Vec<[u8; 32]>, FoldError> {
+        self.fold_inner().map(|f| f.locked)
     }
 
     /// The public-key bundle the chain holds for `device` — what any consent, vouch or handshake from that device is verified against. `None` if it has never declared, which means Ed25519 alone (the device key the chain already names).
     pub fn declared_bundle(&self, device: &[u8; 32]) -> Option<crate::pq::KeyBundle> {
         self.fold_inner()
             .ok()
-            .and_then(|(_, _, bundles)| bundles.into_iter().find(|(d, _)| d == device).map(|(_, b)| b))
+            .and_then(|f| f.bundles.into_iter().find(|(d, _)| d == device).map(|(_, b)| b))
     }
 
     /// Which schemes the chain knows `device` can sign with — its declared bundle's mask, or Ed25519 alone if it has never declared. What a builder signs the device's next op under. Falls back to Ed25519 on a chain that does not fold, which then fails at the fold anyway.
     pub fn declared_mask(&self, device: &[u8; 32]) -> scheme::Mask {
         self.fold_inner()
             .ok()
-            .and_then(|(_, _, bundles)| bundles.into_iter().find(|(d, _)| d == device).map(|(_, b)| b.mask()))
+            .and_then(|f| f.bundles.into_iter().find(|(d, _)| d == device).map(|(_, b)| b.mask()))
             .unwrap_or(scheme::MASK_BASE)
     }
 
@@ -632,7 +684,7 @@ impl MembershipBlob {
 
     /// [`MembershipBlob::fold`] plus the ratcheted [`scheme_floor`](MembershipBlob::scheme_floor), for callers that want both without folding twice.
     pub fn fold_full(&self) -> Result<(Vec<[u8; 32]>, scheme::Mask), FoldError> {
-        self.fold_inner().map(|(members, floor, _)| (members, floor))
+        self.fold_inner().map(|f| (f.members, f.floor))
     }
 
     /// Fold to the current member set AND return the tip op's eagle time (the timestamp of the last applied op). `(members, tip_et)`. The freshness signal a consumer uses to never regress to a stale (pre-removal) view of someone's membership: a fold with an older tip than one already adopted is ignored. `tip_et` is 0 only for the impossible empty-but-Ok case (fold errors on empty).
@@ -755,6 +807,24 @@ impl MembershipBlob {
             Some(bundle),
             sign_with,
         );
+        self.ops.push(op);
+    }
+
+    /// Lock `device` out (treat-as-stolen), signed by `signer` — a current, unlocked member other than the device. See [`OpKind::Lock`]. Signs at the signer's chain-declared mask.
+    pub fn lock(&mut self, signer: &impl crate::pq::FleetSigner, device: [u8; 32], eagle_time: i64) {
+        self.lock_op(signer, device, eagle_time, OpKind::Lock);
+    }
+
+    /// Reverse a [`lock`](Self::lock). See [`OpKind::Unlock`].
+    pub fn unlock(&mut self, signer: &impl crate::pq::FleetSigner, device: [u8; 32], eagle_time: i64) {
+        self.lock_op(signer, device, eagle_time, OpKind::Unlock);
+    }
+
+    fn lock_op(&mut self, signer: &impl crate::pq::FleetSigner, device: [u8; 32], eagle_time: i64, kind: OpKind) {
+        let hp = self.ops[0].handle_proof;
+        let me = signer.keypair().public.to_bytes();
+        let sign_with = self.declared_mask(&me);
+        let op = sign_op(signer, hp, self.head(), kind, device, eagle_time, me, [0u8; 32], None, None, None, None, sign_with);
         self.ops.push(op);
     }
 
@@ -986,10 +1056,11 @@ impl SuccessorRecord {
     /// FROM where the contact is, so a replay can't walk them backward), (3) it is for this
     /// `handle_proof`, and (4) at least one continuity egg is signed by a PREDECESSOR MEMBER over the exact transition. (4) is load-bearing: only a holder of an old-chain device secret can produce it, so a handle-only attacker cannot forge a re-pin.
     pub fn verify_for_pin(&self, pinned_genesis: &[u8; 32]) -> Result<(), String> {
-        let (pred_members, pred_floor, pred_bundles) = self
+        let pred = self
             .predecessor
             .fold_inner()
             .map_err(|e| format!("successor predecessor invalid: {e:?}"))?;
+        let (pred_members, pred_floor, pred_bundles) = (pred.members, pred.floor, pred.bundles);
         let old_gh = self.predecessor.genesis_hash().ok_or("successor predecessor has no genesis")?;
         if &old_gh != pinned_genesis {
             return Err("successor predecessor does not match the pinned genesis".into());
@@ -1649,6 +1720,69 @@ mod tests {
     }
 
     /// The floor IS the required set: once promoted, an op carrying fewer schemes does not fold, whoever signed it.
+    /// A locked-out member is still a member but no longer holds the floor down: with the last undeclared device locked, the fleet promotes; an unlock puts it back in the AND without lowering the ratchet; and a locked device signs nothing that folds — including its own unlock.
+    #[cfg(feature = "client")]
+    #[test]
+    fn a_locked_device_stops_pinning_the_floor_and_holds_no_authority() {
+        use crate::pq::SigningBundle;
+        let a = SigningBundle::derive(b"lock-a");
+        let b = SigningBundle::derive(b"lock-b");
+        let drowned = Keypair::from_seed(&[7u8; 32]); // Ed25519 only, and at the bottom of the ocean
+        let hp = [3u8; 32];
+        let seed = [4u8; 32];
+        let mut blob = MembershipBlob::genesis_v2(&a, hp, &seed, 1);
+        let t = 2;
+        let bconsent = b.eggs(&bindreq_signing_bytes(&hp, &b.keypair().public.to_bytes(), t), b.public().mask());
+        blob.add_declared(&a, b.keypair().public.to_bytes(), t, t, bconsent, b.public());
+        let dpk = drowned.public.to_bytes();
+        let dconsent = drowned.eggs(&bindreq_signing_bytes(&hp, &dpk, 3), scheme::MASK_BASE);
+        blob.add(&a, dpk, 3, 3, dconsent);
+        blob.declare(&a, 4);
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_BASE, "the drowned phone holds the floor at Ed25519");
+        assert!(blob.locked_out().unwrap().is_empty());
+
+        blob.lock(&a, dpk, 5);
+        assert_eq!(blob.fold().unwrap().len(), 3, "locking removes nobody");
+        assert_eq!(blob.locked_out().unwrap(), vec![dpk]);
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_ALL, "with the drowned phone locked, the fleet promotes on its own");
+
+        // The locked device holds no authority: it cannot declare, add, or unlock itself.
+        let mut bad = blob.clone();
+        bad.unlock(&drowned, dpk, 6);
+        assert!(matches!(bad.fold(), Err(FoldError::SignerLocked { .. })), "a locked device cannot unlock itself");
+        let mut bad = blob.clone();
+        bad.declare(&drowned, 6);
+        assert!(matches!(bad.fold(), Err(FoldError::SignerLocked { .. })));
+
+        // Malformed locks do not fold: a non-member, twice, or yourself.
+        let mut bad = blob.clone();
+        bad.lock(&a, dpk, 6);
+        assert!(matches!(bad.fold(), Err(FoldError::LockMalformed { .. })), "already locked");
+        let mut bad = blob.clone();
+        bad.lock(&a, [9u8; 32], 6);
+        assert!(matches!(bad.fold(), Err(FoldError::LockMalformed { .. })), "not a member");
+        let mut bad = blob.clone();
+        bad.lock(&a, a.keypair().public.to_bytes(), 6);
+        assert!(matches!(bad.fold(), Err(FoldError::LockMalformed { .. })), "not yourself");
+        let mut bad = blob.clone();
+        bad.unlock(&a, b.keypair().public.to_bytes(), 6);
+        assert!(matches!(bad.fold(), Err(FoldError::LockMalformed { .. })), "unlock of an unlocked device");
+
+        // Unlock by the owner: back in the AND, but the ratchet holds — and the device is now below the floor, so its next op needs the floor's eggs, which it cannot produce.
+        blob.unlock(&b, dpk, 7);
+        assert!(blob.locked_out().unwrap().is_empty());
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_ALL, "the floor never falls");
+        let mut short = blob.clone();
+        short.declare(&drowned, 8);
+        assert!(matches!(short.fold(), Err(FoldError::InsufficientEggs { .. })), "an unlocked Ed25519-only device is below the floor it came back to");
+
+        // Wire round trip carries the new kinds.
+        let bytes = blob.to_vsf_bytes().unwrap();
+        let back = MembershipBlob::from_vsf_bytes(&bytes).unwrap();
+        assert_eq!(back.fold().unwrap(), blob.fold().unwrap());
+        assert_eq!(back.scheme_floor().unwrap(), scheme::MASK_ALL);
+    }
+
     #[test]
     fn floor_is_the_required_set() {
         let (a, b) = bundles();
