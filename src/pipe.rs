@@ -31,7 +31,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 ///
 /// Wire shape is the one the worker verifies and photon sends: header `signed_only_eggs(ke)` carrying every scheme the sender holds at the envelope tier (Ed25519 + Falcon; vsf anchors on the Ed25519 egg, the receiver holds the rest to its chain's floor), section `relay` with `recipient` (`kx`), `payload` (`v'r'`), and — new, optional, ignored by pre-svc workers' HTTPS path and refused-if-garbled by current ones — `svc` (`d`).
 pub fn build_relay_envelope(
-    device_key: &impl crate::pq::FleetSigner,
+    device_key: &(impl crate::pq::FleetSigner + ?Sized),
     recipient: &[u8; 32],
     svc: Option<&str>,
     payload: &[u8],

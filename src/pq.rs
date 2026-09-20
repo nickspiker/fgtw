@@ -196,12 +196,12 @@ pub fn reserve_eggs(mask: scheme::Mask) -> Vec<(u8, usize)> {
 }
 
 /// What `signer` signs an envelope with: everything it holds, clipped to the envelope tier. Ed25519 always; Falcon when the signer has it; never SPHINCS+.
-pub fn envelope_mask(signer: &impl FleetSigner) -> scheme::Mask {
+pub fn envelope_mask(signer: &(impl FleetSigner + ?Sized)) -> scheme::Mask {
     signer.bundle().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE) & ENVELOPE_TIER
 }
 
 /// Sign a VSF document whose header was reserved with `signed_only_eggs(ke, &reserve_eggs(envelope_mask(signer)))`. vsf hands us the 32-byte file hash; every scheme signs it.
-pub fn sign_envelope(unsigned: Vec<u8>, signer: &impl FleetSigner) -> Result<Vec<u8>, String> {
+pub fn sign_envelope(unsigned: Vec<u8>, signer: &(impl FleetSigner + ?Sized)) -> Result<Vec<u8>, String> {
     let mask = envelope_mask(signer);
     vsf::verification::sign_file_with(unsigned, |file_hash| signer.eggs(file_hash, mask))
 }
