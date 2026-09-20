@@ -21,6 +21,9 @@ use blake3::Hasher;
 
 /// Bytes per record.
 /// Divides 4 KiB exactly (16 records per block), which keeps a probe inside one read and leaves a block-level Merkle tree an option later without records straddling block boundaries.
+use crate::fleet::{scheme, Egg};
+use crate::pq::{FleetSigner, KeyBundle};
+
 pub const STRIDE: usize = 256;
 
 /// Slots in one slice. 1 MiB / 256 B.
@@ -53,13 +56,17 @@ const DOMAIN_ADDRESS: &[u8] = b"PHOTON_PB_ADDRESS_v1";
 
 // Signing domains, separate from the key domains so a signature can never be replayed as a key preimage or vice versa.
 /// The device's own claim: "I consent to be a device of this identity, and I am at this address."
-pub const SIGN_ADDRESS: &[u8] = b"PHOTON_PB_ADDR_SIG_v1";
+pub const SIGN_ADDRESS: &[u8] = b"PHOTON_PB_ADDR_SIG_v2";
 /// A current member's claim: "I placed this device's pointer at this index at this epoch."
-pub const SIGN_PLACEMENT: &[u8] = b"PHOTON_PB_PLACE_SIG_v1";
+pub const SIGN_PLACEMENT: &[u8] = b"PHOTON_PB_PLACE_SIG_v2";
 /// A current member's claim: "the device count for this identity is N as of this epoch."
-pub const SIGN_COUNT: &[u8] = b"PHOTON_PB_COUNT_SIG_v1";
+pub const SIGN_COUNT: &[u8] = b"PHOTON_PB_COUNT_SIG_v2";
 /// The departing device's own claim: "I am leaving this identity." Consent-only removal — no device removes another, so this signature is required alongside a CURRENT member's witness.
-pub const SIGN_DEPART: &[u8] = b"PHOTON_PB_DEPART_SIG_v1";
+pub const SIGN_DEPART: &[u8] = b"PHOTON_PB_DEPART_SIG_v2";
+/// Content address of an egg blob: `derive_key(domain, blob)`. In a hash-addressed store the key IS the location AND the integrity, so the record needs no separate signature field — 32 bytes point at every signature the record has, whatever schemes and sizes they come in.
+const DOMAIN_EGGS: &str = "PHOTON_PB_EGGS_v1";
+/// Policy cap on an egg blob a reader will fetch and hash — the one bound, since the pointer carries no length. Two full three-scheme lists are ~17 KB; anything larger is not a record's eggs.
+pub const EGGS_BLOB_MAX: usize = 32 * 1024;
 
 /// What kind of record occupies a slot.
 /// Stored as the first byte, so a slice dump is interpretable without external context (the phonebook is enumerable by design).
@@ -172,40 +179,36 @@ impl core::fmt::Debug for Record {
     }
 }
 
-// IdentityCount layout (PRIMARY). 237 used, 19 reserved.
+// IdentityCount layout (PRIMARY). 141 used, 115 reserved.
 const IC_HANDLE: usize = 1; // ..33
 const IC_COUNT: usize = 33; // ..37   u32 LE
 const IC_EPOCH: usize = 37; // ..45   i64 LE
 const IC_WITNESS: usize = 45; // ..77   the CURRENT member that signed this transition
-const IC_WITNESS_SIG: usize = 77; // ..141
-const IC_DEPARTING: usize = 141; // ..173  zero when the transition was an ADD
-const IC_DEPART_SIG: usize = 173; // ..237  the departing device's OWN consent; no device removes another
+const IC_DEPARTING: usize = 77; // ..109  zero when the transition was an ADD
+const IC_EGGS: usize = 109; // ..141  pointer to the blob holding the witness eggs AND the departing device's own consent eggs; no device removes another
 
-// DevicePointer layout (PRIMARY). 173 used, 83 reserved.
+// DevicePointer layout (PRIMARY). 141 used, 115 reserved.
 const DP_HANDLE: usize = 1; // ..33
 const DP_INDEX: usize = 33; // ..37   u32 LE
 const DP_DEVICE: usize = 37; // ..69
 const DP_EPOCH: usize = 69; // ..77   i64 LE
 const DP_PLACER: usize = 77; // ..109
-const DP_PLACE_SIG: usize = 109; // ..173
+const DP_EGGS: usize = 109; // ..141  pointer to the placer's eggs
 
-// DeviceAddress layout (SECONDARY). 171 used, 85 reserved.
+// DeviceAddress layout (SECONDARY). 139 used, 117 reserved.
 const DA_DEVICE: usize = 1; // ..33
 const DA_HANDLE: usize = 33; // ..65   signed, so a device cannot be planted under another identity
 const DA_IP: usize = 65; // ..81   v6; v4 as ::ffff:a.b.c.d so the field is fixed width
 const DA_PORT: usize = 81; // ..83   u16 LE
 const DA_LOCAL_IP: usize = 83; // ..99
 const DA_TIMESTAMP: usize = 99; // ..107  i64 LE eagle-time; the monotonic guard for address replay
-const DA_SIG: usize = 107; // ..171
+const DA_EGGS: usize = 107; // ..139  pointer to the device's own eggs
+
+// The epoch offsets are the same as the single-signature layout's, so a stored v1 record still reads its epoch correctly and the slot's monotonic guard lets a v2 write replace it; its verification fails (no blob hashes to a 64-byte signature), which every reader treats as absence.
 
 fn rd32(b: &[u8; STRIDE], at: usize) -> [u8; 32] {
     let mut o = [0u8; 32];
     o.copy_from_slice(&b[at..at + 32]);
-    o
-}
-fn rd64(b: &[u8; STRIDE], at: usize) -> [u8; 64] {
-    let mut o = [0u8; 64];
-    o.copy_from_slice(&b[at..at + 64]);
     o
 }
 fn rd_u32(b: &[u8; STRIDE], at: usize) -> u32 {
@@ -263,8 +266,8 @@ impl Record {
         count: u32,
         epoch: i64,
         witness: &[u8; 32],
-        witness_sig: &[u8; 64],
-        departing: Option<(&[u8; 32], &[u8; 64])>,
+        departing: Option<&[u8; 32]>,
+        eggs_ptr: &[u8; 32],
     ) -> Self {
         let mut b = [0u8; STRIDE];
         b[0] = RecordKind::IdentityCount as u8;
@@ -272,11 +275,10 @@ impl Record {
         b[IC_COUNT..IC_COUNT + 4].copy_from_slice(&count.to_le_bytes());
         b[IC_EPOCH..IC_EPOCH + 8].copy_from_slice(&epoch.to_le_bytes());
         b[IC_WITNESS..IC_WITNESS + 32].copy_from_slice(witness);
-        b[IC_WITNESS_SIG..IC_WITNESS_SIG + 64].copy_from_slice(witness_sig);
-        if let Some((dev, sig)) = departing {
+        if let Some(dev) = departing {
             b[IC_DEPARTING..IC_DEPARTING + 32].copy_from_slice(dev);
-            b[IC_DEPART_SIG..IC_DEPART_SIG + 64].copy_from_slice(sig);
         }
+        b[IC_EGGS..IC_EGGS + 32].copy_from_slice(eggs_ptr);
         Record(b)
     }
     pub fn count(&self) -> u32 {
@@ -285,18 +287,15 @@ impl Record {
     pub fn witness(&self) -> [u8; 32] {
         rd32(&self.0, IC_WITNESS)
     }
-    pub fn witness_sig(&self) -> [u8; 64] {
-        rd64(&self.0, IC_WITNESS_SIG)
-    }
-    /// The device that left, and its own departure signature — `None` when this transition was an add.
-    /// Removal requires BOTH this and a witness that is a CURRENT member: the leaver consents, a live member attests.
+    /// The device that left — `None` when this transition was an add.
+    /// Removal requires BOTH its own departure eggs (list 1 of the blob) and a witness that is a CURRENT member: the leaver consents, a live member attests.
     /// Neither alone suffices, and a member that has itself departed is not a witness.
-    pub fn departing(&self) -> Option<([u8; 32], [u8; 64])> {
+    pub fn departing(&self) -> Option<[u8; 32]> {
         let d = rd32(&self.0, IC_DEPARTING);
         if d == [0u8; 32] {
             return None;
         }
-        Some((d, rd64(&self.0, IC_DEPART_SIG)))
+        Some(d)
     }
 
     // ── DevicePointer ──
@@ -306,7 +305,7 @@ impl Record {
         device_pubkey: &[u8; 32],
         epoch: i64,
         placer: &[u8; 32],
-        placement_sig: &[u8; 64],
+        eggs_ptr: &[u8; 32],
     ) -> Self {
         let mut b = [0u8; STRIDE];
         b[0] = RecordKind::DevicePointer as u8;
@@ -315,7 +314,7 @@ impl Record {
         b[DP_DEVICE..DP_DEVICE + 32].copy_from_slice(device_pubkey);
         b[DP_EPOCH..DP_EPOCH + 8].copy_from_slice(&epoch.to_le_bytes());
         b[DP_PLACER..DP_PLACER + 32].copy_from_slice(placer);
-        b[DP_PLACE_SIG..DP_PLACE_SIG + 64].copy_from_slice(placement_sig);
+        b[DP_EGGS..DP_EGGS + 32].copy_from_slice(eggs_ptr);
         Record(b)
     }
     pub fn index(&self) -> u32 {
@@ -330,8 +329,15 @@ impl Record {
     pub fn placer(&self) -> [u8; 32] {
         rd32(&self.0, DP_PLACER)
     }
-    pub fn placement_sig(&self) -> [u8; 64] {
-        rd64(&self.0, DP_PLACE_SIG)
+
+    /// The content address of this record's egg blob. Every kind has exactly one; the record signs nothing about it — the eggs sign the record that points at them.
+    pub fn eggs_ptr(&self) -> [u8; 32] {
+        match self.kind() {
+            RecordKind::IdentityCount => rd32(&self.0, IC_EGGS),
+            RecordKind::DevicePointer => rd32(&self.0, DP_EGGS),
+            RecordKind::DeviceAddress => rd32(&self.0, DA_EGGS),
+            RecordKind::Empty => [0u8; 32],
+        }
     }
 
     // ── DeviceAddress ──
@@ -343,7 +349,7 @@ impl Record {
         port: u16,
         local_ip: &[u8; 16],
         timestamp: i64,
-        sig: &[u8; 64],
+        eggs_ptr: &[u8; 32],
     ) -> Self {
         let mut b = [0u8; STRIDE];
         b[0] = RecordKind::DeviceAddress as u8;
@@ -353,27 +359,28 @@ impl Record {
         b[DA_PORT..DA_PORT + 2].copy_from_slice(&port.to_le_bytes());
         b[DA_LOCAL_IP..DA_LOCAL_IP + 16].copy_from_slice(local_ip);
         b[DA_TIMESTAMP..DA_TIMESTAMP + 8].copy_from_slice(&timestamp.to_le_bytes());
-        b[DA_SIG..DA_SIG + 64].copy_from_slice(sig);
+        b[DA_EGGS..DA_EGGS + 32].copy_from_slice(eggs_ptr);
         Record(b)
     }
-    /// Mint a SIGNED address record in one step: build, sign the covered bytes, rebuild with the signature in place.
+    /// Mint a SIGNED address record in one step: build, sign the covered bytes with every scheme in `mask` the signer holds, point the record at the blob. Returns the record AND its egg blob — both go to storage.
     ///
     /// The two-step dance is easy to get subtly wrong at a call site (sign the wrong bytes, or sign before a field is final and ship a record that cannot verify), and an address record that fails verification is silently dropped by every reader — so the mistake is invisible until nobody can be found.
     /// Doing it here once means a caller cannot express the broken version.
+    /// `mask` is what the chain knows this device can sign with (its declared set) — an egg for an undeclared scheme fails closed at every verifier.
     pub fn sign_device_address(
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &impl FleetSigner,
+        mask: scheme::Mask,
         handle_proof: &[u8; 32],
         ip: &[u8; 16],
         port: u16,
         local_ip: &[u8; 16],
         timestamp: i64,
-    ) -> Self {
-        use ed25519_dalek::Signer;
-        let device_pubkey = signing_key.verifying_key().to_bytes();
-        let unsigned =
-            Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &[0u8; 64]);
-        let sig = signing_key.sign(&unsigned.address_signing_bytes()).to_bytes();
-        Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &sig)
+    ) -> (Self, Vec<u8>) {
+        let device_pubkey = signer.keypair().public.to_bytes();
+        let unsigned = Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &[0u8; 32]);
+        let eggs = signer.eggs(&unsigned.address_signing_bytes(), mask);
+        let blob = eggs_blob(&[&eggs]);
+        (Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &eggs_ptr(&blob)), blob)
     }
 
     pub fn handle_proof(&self) -> [u8; 32] {
@@ -395,10 +402,6 @@ impl Record {
         o.copy_from_slice(&self.0[DA_LOCAL_IP..DA_LOCAL_IP + 16]);
         o
     }
-    pub fn address_sig(&self) -> [u8; 64] {
-        rd64(&self.0, DA_SIG)
-    }
-
     /// The bytes a DEVICE signs to claim both membership and address: domain ‖ handle_proof ‖ device_pubkey ‖ ip ‖ port ‖ local_ip ‖ timestamp.
     /// Deliberately excludes any slot or index, so the record is portable — compaction can relocate it with the device offline, which is the whole reason removal never stalls on a device in a drawer.
     pub fn address_signing_bytes(&self) -> Vec<u8> {
@@ -450,6 +453,66 @@ impl Record {
     }
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// EGG BLOBS — the signatures live OUT of the record, behind a content-addressed pointer.
+//
+// A record is a fixed 256-byte stride; a three-scheme signature set is ~8.6 KB. Inlining was never going to fit, and a variable slot would break the one-read layout. So a record carries the 32-byte hash of a blob holding its egg lists, and the blob lives beside it in the same store. The hash is the integrity: a substituted or truncated blob does not hash to the pointer, and the eggs in a genuine blob sign the record's covered bytes.
+// One list for an address or a placement; two for a count — the witness's eggs, then the departing device's consent (empty on an add).
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Pack egg lists into one blob: for each list, `u16 LE` byte length then the list's wire form (empty list → length 0).
+pub fn eggs_blob(lists: &[&[Egg]]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for l in lists {
+        let bytes = if l.is_empty() { Vec::new() } else { crate::pq::eggs_to_bytes(l) };
+        v.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        v.extend_from_slice(&bytes);
+    }
+    v
+}
+
+/// Unpack exactly `n` lists from a blob. `None` on any framing fault, trailing bytes, or a list that is not a well-formed egg list.
+pub fn eggs_blob_lists(blob: &[u8], n: usize) -> Option<Vec<Vec<Egg>>> {
+    let mut out = Vec::with_capacity(n);
+    let mut rest = blob;
+    for _ in 0..n {
+        let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+        rest = &rest[2..];
+        let bytes = rest.get(..len)?;
+        rest = &rest[len..];
+        out.push(if len == 0 { Vec::new() } else { crate::pq::eggs_from_bytes(bytes).ok()? });
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The content address a record stores for its blob.
+pub fn eggs_ptr(blob: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(DOMAIN_EGGS).update(blob).finalize().as_bytes()
+}
+
+/// How a reader judges a record's eggs: which bundle verifies a given signer, and which schemes every egg list must cover.
+/// [`anchor_only`](Self::anchor_only) — Ed25519 from the key named in the record, nothing more required — is what a reader without the chain can apply, and is exactly the assurance the old inline signature gave. A reader holding the fold applies the chain's declared bundles at its floor, and a stripped list fails there.
+pub struct EggPolicy<'a> {
+    pub bundle_for: &'a dyn Fn(&[u8; 32]) -> Option<KeyBundle>,
+    pub required: scheme::Mask,
+}
+
+fn no_bundle(_: &[u8; 32]) -> Option<KeyBundle> {
+    None
+}
+
+impl EggPolicy<'_> {
+    pub fn anchor_only() -> EggPolicy<'static> {
+        EggPolicy { bundle_for: &no_bundle, required: scheme::MASK_BASE }
+    }
+    fn bundle(&self, signer: &[u8; 32]) -> KeyBundle {
+        (self.bundle_for)(signer).unwrap_or_else(|| KeyBundle::ed25519_only(signer))
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // SLICE — a gapped, sorted, fixed-stride array of one slice's records.
@@ -657,48 +720,63 @@ impl Slice {
 // Membership is the caller's check, because only the caller holds the registry state to answer it.
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { return false }; // unknown key → fail closed
-    vk.verify(msg, &Signature::from_bytes(sig)).is_ok()
-}
-
 impl Record {
+    /// The common check: the blob is within the cap and hashes to the record's pointer, unpacks to `n_lists`, and list `idx` verifies against the signer's bundle over `msg` at the policy's required set.
+    fn verify_list(&self, blob: &[u8], idx: usize, n_lists: usize, signer: &[u8; 32], msg: &[u8], policy: &EggPolicy<'_>) -> bool {
+        if blob.len() > EGGS_BLOB_MAX || eggs_ptr(blob) != self.eggs_ptr() {
+            return false;
+        }
+        let Some(lists) = eggs_blob_lists(blob, n_lists) else { return false };
+        crate::pq::verify_eggs(&lists[idx], &policy.bundle(signer), msg, policy.required)
+    }
+
     /// Self-verifying: the device signed its own address, and the key it signed with is in the record.
     /// Proves "the holder of this device key claims this address under this identity".
     ///
     /// Does NOT prove the device belongs to that identity's fleet — a stranger can sign a row for any `handle_proof` they scraped.
-    /// That binding is the PRIMARY registry's job (a current member placed a pointer to this device), and it is the gap the gossip path has today.
-    pub fn verify_address(&self) -> bool {
+    /// That binding is the PRIMARY registry's job (a current member placed a pointer to this device).
+    pub fn verify_address_with(&self, blob: &[u8], policy: &EggPolicy<'_>) -> bool {
         self.kind() == RecordKind::DeviceAddress
-            && verify_ed25519(&self.device_pubkey(), &self.address_signing_bytes(), &self.address_sig())
+            && self.verify_list(blob, 0, 1, &self.device_pubkey(), &self.address_signing_bytes(), policy)
+    }
+    pub fn verify_address(&self, blob: &[u8]) -> bool {
+        self.verify_address_with(blob, &EggPolicy::anchor_only())
     }
 
     /// The placement was signed by the device that claims to have made it.
     ///
     /// The caller MUST separately confirm that `placer()` is a CURRENT member — a departed member's signature is still cryptographically valid forever, and treating it as authority would let a device removed months ago keep rearranging the registry.
-    pub fn verify_placement(&self) -> bool {
+    pub fn verify_placement_with(&self, blob: &[u8], policy: &EggPolicy<'_>) -> bool {
         self.kind() == RecordKind::DevicePointer
-            && verify_ed25519(&self.placer(), &self.placement_signing_bytes(), &self.placement_sig())
+            && self.verify_list(blob, 0, 1, &self.placer(), &self.placement_signing_bytes(), policy)
+    }
+    pub fn verify_placement(&self, blob: &[u8]) -> bool {
+        self.verify_placement_with(blob, &EggPolicy::anchor_only())
     }
 
     /// The count was attested by the device that claims to have witnessed it.
     /// Same caveat: the caller confirms the witness is current.
-    pub fn verify_count(&self) -> bool {
+    pub fn verify_count_with(&self, blob: &[u8], policy: &EggPolicy<'_>) -> bool {
         self.kind() == RecordKind::IdentityCount
-            && verify_ed25519(&self.witness(), &self.count_signing_bytes(), &self.witness_sig())
+            && self.verify_list(blob, 0, 2, &self.witness(), &self.count_signing_bytes(), policy)
+    }
+    pub fn verify_count(&self, blob: &[u8]) -> bool {
+        self.verify_count_with(blob, &EggPolicy::anchor_only())
     }
 
     /// A removal is only consented if the DEPARTING device signed its own departure.
     /// No device removes another, so this is required in addition to a current member's witness — and it is the leaver's own key, which nobody else holds.
     ///
     /// `true` for an add (nothing departed).
-    /// A removal missing this signature is NOT consent.
-    pub fn verify_departure(&self) -> bool {
+    /// A removal missing these eggs is NOT consent.
+    pub fn verify_departure_with(&self, blob: &[u8], policy: &EggPolicy<'_>) -> bool {
         if self.kind() != RecordKind::IdentityCount { return false; }
-        let Some((dev, sig)) = self.departing() else { return true };
+        let Some(dev) = self.departing() else { return true };
         let msg = Record::departure_signing_bytes(&self.handle_proof(), &dev, self.epoch());
-        verify_ed25519(&dev, &msg, &sig)
+        self.verify_list(blob, 1, 2, &dev, &msg, policy)
+    }
+    pub fn verify_departure(&self, blob: &[u8]) -> bool {
+        self.verify_departure_with(blob, &EggPolicy::anchor_only())
     }
 }
 
@@ -709,20 +787,38 @@ impl Record {
 // Writes are idempotent and epoch-guarded, so racing siblings settle on whichever plan lands last — race-and-converge, no lease, no owner.
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The stored primary-registry state for one identity, as read back from storage: the count record plus the dense pointer run.
+/// The stored primary-registry state for one identity, as read back from storage: the count record, the dense pointer run, and the egg blobs they point at (keyed by content address, so order and duplicates are irrelevant).
 /// `pointers[i]` is expected to carry index `i`.
 #[derive(Debug, Clone, Default)]
 pub struct RegistryView {
     pub count: Option<Record>,
     pub pointers: Vec<Record>,
+    pub blobs: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 impl RegistryView {
-    /// Structural + cryptographic verification: right kinds, right identity, dense indices, every signature checks.
-    /// Membership of the SIGNERS is deliberately not checked here — that needs the fold, which the caller holds (verify_placement's caveat applies).
+    /// File an egg blob under its content address.
+    pub fn add_blob(&mut self, blob: Vec<u8>) {
+        if blob.len() <= EGGS_BLOB_MAX {
+            self.blobs.insert(eggs_ptr(&blob), blob);
+        }
+    }
+    /// The blob a record points at, if we hold it.
+    pub fn blob(&self, rec: &Record) -> Option<&[u8]> {
+        self.blobs.get(&rec.eggs_ptr()).map(|v| v.as_slice())
+    }
+
+    /// Structural + cryptographic verification at the anchor: right kinds, right identity, dense indices, every Ed25519 egg checks.
     pub fn verify(&self, handle_proof: &[u8; 32]) -> bool {
+        self.verify_with(handle_proof, &EggPolicy::anchor_only())
+    }
+
+    /// `verify` under a reader's own policy — the chain's declared bundles at its floor, for a reader that holds the fold.
+    /// Membership of the SIGNERS is deliberately not checked here — that needs the fold, which the caller holds (verify_placement's caveat applies).
+    pub fn verify_with(&self, handle_proof: &[u8; 32], policy: &EggPolicy<'_>) -> bool {
         if let Some(c) = &self.count {
-            if !c.verify_count() || !c.verify_departure() || c.handle_proof() != *handle_proof {
+            let Some(blob) = self.blob(c) else { return false };
+            if !c.verify_count_with(blob, policy) || !c.verify_departure_with(blob, policy) || c.handle_proof() != *handle_proof {
                 return false;
             }
             if c.count() as usize != self.pointers.len() {
@@ -732,7 +828,8 @@ impl RegistryView {
             return false; // pointers without a count have no attested extent
         }
         for (i, p) in self.pointers.iter().enumerate() {
-            if !p.verify_placement() || p.handle_proof() != *handle_proof || p.index() as usize != i {
+            let Some(blob) = self.blob(p) else { return false };
+            if !p.verify_placement_with(blob, policy) || p.handle_proof() != *handle_proof || p.index() as usize != i {
                 return false;
             }
         }
@@ -745,20 +842,20 @@ impl RegistryView {
     }
 }
 
-/// The minimal record writes that converge the stored registry onto the folded member set.
+/// The minimal record writes that converge the stored registry onto the folded member set, each with the egg blob its record points at.
 /// Empty when already in sync.
 /// Every emitted record carries `epoch` (strictly newer than any stored, or storage rejects it — pass eagle-now).
-/// `departing` is the leaver's own consent signature over [`Record::departure_signing_bytes`] when this convergence removes it; a fold-driven removal whose consent already lives in the CHAIN may pass `None` — chain readers still see the consent, registry-only readers see an unconsented shrink and can fetch the chain.
+/// `mask` is the signer's chain-declared scheme set. `departing` is the leaver's own consent eggs over [`Record::departure_signing_bytes`] when this convergence removes it; a fold-driven removal whose consent already lives in the CHAIN may pass `None` — chain readers still see the consent, registry-only readers see an unconsented shrink and can fetch the chain.
 pub fn registry_plan(
-    signer: &ed25519_dalek::SigningKey,
+    signer: &impl FleetSigner,
+    mask: scheme::Mask,
     handle_proof: &[u8; 32],
     fold: &[[u8; 32]],
     view: &RegistryView,
     epoch: i64,
-    departing: Option<(&[u8; 32], &[u8; 64])>,
-) -> Vec<Record> {
-    use ed25519_dalek::Signer;
-    let placer: [u8; 32] = signer.verifying_key().to_bytes();
+    departing: Option<(&[u8; 32], &[Egg])>,
+) -> Vec<(Record, Vec<u8>)> {
+    let placer: [u8; 32] = signer.keypair().public.to_bytes();
     let current = view.devices();
 
     // Pop-and-swap: a removed slot takes the tail pointer, the run stays dense, untouched indices keep their records (and their epochs) exactly as stored.
@@ -785,9 +882,10 @@ pub fn registry_plan(
         if current.get(idx) == Some(dev) {
             continue; // this slot is already right — leave its stored record alone
         }
-        let unsigned = Record::new_device_pointer(handle_proof, idx as u32, dev, epoch, &placer, &[0u8; 64]);
-        let sig = signer.sign(&unsigned.placement_signing_bytes()).to_bytes();
-        out.push(Record::new_device_pointer(handle_proof, idx as u32, dev, epoch, &placer, &sig));
+        let unsigned = Record::new_device_pointer(handle_proof, idx as u32, dev, epoch, &placer, &[0u8; 32]);
+        let eggs = signer.eggs(&unsigned.placement_signing_bytes(), mask);
+        let blob = eggs_blob(&[&eggs]);
+        out.push((Record::new_device_pointer(handle_proof, idx as u32, dev, epoch, &placer, &eggs_ptr(&blob)), blob));
     }
 
     let count_stale = view
@@ -796,9 +894,11 @@ pub fn registry_plan(
         .map(|c| c.count() as usize != list.len())
         .unwrap_or(true);
     if !out.is_empty() || count_stale {
-        let unsigned = Record::new_identity_count(handle_proof, list.len() as u32, epoch, &placer, &[0u8; 64], departing);
-        let sig = signer.sign(&unsigned.count_signing_bytes()).to_bytes();
-        out.push(Record::new_identity_count(handle_proof, list.len() as u32, epoch, &placer, &sig, departing));
+        let leaver = departing.map(|(d, _)| d);
+        let unsigned = Record::new_identity_count(handle_proof, list.len() as u32, epoch, &placer, leaver, &[0u8; 32]);
+        let eggs = signer.eggs(&unsigned.count_signing_bytes(), mask);
+        let blob = eggs_blob(&[&eggs, departing.map(|(_, e)| e).unwrap_or(&[])]);
+        out.push((Record::new_identity_count(handle_proof, list.len() as u32, epoch, &placer, leaver, &eggs_ptr(&blob)), blob));
     }
     out
 }
@@ -891,7 +991,7 @@ mod tests {
 
     fn ptr(seed: u32, epoch: i64) -> Record {
         let hp = *blake3::hash(&seed.to_le_bytes()).as_bytes();
-        Record::new_device_pointer(&hp, seed % 7, &[9u8; 32], epoch, &[8u8; 32], &[0u8; 64])
+        Record::new_device_pointer(&hp, seed % 7, &[9u8; 32], epoch, &[8u8; 32], &[0u8; 32])
     }
 
     fn populate(n: usize) -> (Slice, Vec<Record>) {
@@ -947,7 +1047,7 @@ mod tests {
     #[test]
     fn key_is_derived_from_contents() {
         let hp = [1u8; 32];
-        let r = Record::new_device_pointer(&hp, 3, &[2u8; 32], 5, &[4u8; 32], &[0u8; 64]);
+        let r = Record::new_device_pointer(&hp, 3, &[2u8; 32], 5, &[4u8; 32], &[0u8; 32]);
         assert_eq!(r.key().unwrap(), key_pointer(&hp, 3));
         assert!(Record::empty().key().is_none());
     }
@@ -1030,7 +1130,7 @@ mod tests {
                 let b = live[i];
                 let bumped = Record::new_device_pointer(
                     &b.handle_proof(), b.index(), &b.device_pubkey(),
-                    b.epoch() + 1, &b.placer(), &b.placement_sig());
+                    b.epoch() + 1, &b.placer(), &b.eggs_ptr());
                 s.insert(&bumped).expect("epoch bump accepted");
                 live[i] = bumped;
             }
@@ -1052,12 +1152,12 @@ mod tests {
         s.insert(&r).expect("first insert");
         for e in [100i64, 99, 0, -5] {
             let same = Record::new_device_pointer(
-                &r.handle_proof(), r.index(), &r.device_pubkey(), e, &r.placer(), &r.placement_sig());
+                &r.handle_proof(), r.index(), &r.device_pubkey(), e, &r.placer(), &r.eggs_ptr());
             assert!(matches!(s.insert(&same), Err(SliceError::StaleEpoch { .. })),
                 "epoch {e} must be refused against stored 100");
         }
         let newer = Record::new_device_pointer(
-            &r.handle_proof(), r.index(), &r.device_pubkey(), 101, &r.placer(), &r.placement_sig());
+            &r.handle_proof(), r.index(), &r.device_pubkey(), 101, &r.placer(), &r.eggs_ptr());
         assert!(s.insert(&newer).is_ok());
     }
 
@@ -1078,7 +1178,7 @@ mod tests {
         // (b) into a DIFFERENT index: the index is inside both the key derivation and the placement signature, so it cannot be moved without becoming a different record.
         let moved = Record::new_device_pointer(
             &victim.handle_proof(), victim.index() + 1, &victim.device_pubkey(),
-            victim.epoch(), &victim.placer(), &victim.placement_sig());
+            victim.epoch(), &victim.placer(), &victim.eggs_ptr());
         assert_ne!(moved.key().unwrap(), vkey, "changing the index changes the address");
         assert_ne!(moved.placement_signing_bytes(), victim.placement_signing_bytes(),
             "the signature covers the index, so it does not carry over");
@@ -1095,9 +1195,9 @@ mod tests {
     #[test]
     fn signing_bytes_are_domain_separated() {
         let hp = [1u8; 32];
-        let p = Record::new_device_pointer(&hp, 0, &[2u8; 32], 5, &[3u8; 32], &[0u8; 64]);
-        let a = Record::new_device_address(&[2u8; 32], &hp, &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 64]);
-        let c = Record::new_identity_count(&hp, 3, 5, &[3u8; 32], &[0u8; 64], None);
+        let p = Record::new_device_pointer(&hp, 0, &[2u8; 32], 5, &[3u8; 32], &[0u8; 32]);
+        let a = Record::new_device_address(&[2u8; 32], &hp, &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 32]);
+        let c = Record::new_identity_count(&hp, 3, 5, &[3u8; 32], None, &[0u8; 32]);
 
         assert!(p.placement_signing_bytes().starts_with(SIGN_PLACEMENT));
         assert!(a.address_signing_bytes().starts_with(SIGN_ADDRESS));
@@ -1105,7 +1205,7 @@ mod tests {
         assert!(Record::departure_signing_bytes(&hp, &[2u8; 32], 5).starts_with(SIGN_DEPART));
 
         // The address signature covers handle_proof, so a device cannot be planted under another identity — the gap that lets a stranger mint a row for any scraped handle_proof today.
-        let other = Record::new_device_address(&[2u8; 32], &[9u8; 32], &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 64]);
+        let other = Record::new_device_address(&[2u8; 32], &[9u8; 32], &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 32]);
         assert_ne!(a.address_signing_bytes(), other.address_signing_bytes());
     }
 
@@ -1115,13 +1215,13 @@ mod tests {
     fn removal_carries_consent_and_witness() {
         let hp = [1u8; 32];
         let leaver = [7u8; 32];
-        let add = Record::new_identity_count(&hp, 3, 10, &[3u8; 32], &[1u8; 64], None);
+        let add = Record::new_identity_count(&hp, 3, 10, &[3u8; 32], None, &[1u8; 32]);
         assert!(add.departing().is_none(), "an add has no departing device");
 
-        let rem = Record::new_identity_count(&hp, 2, 11, &[3u8; 32], &[1u8; 64], Some((&leaver, &[2u8; 64])));
-        let (dev, sig) = rem.departing().expect("a removal names the departing device");
+        let rem = Record::new_identity_count(&hp, 2, 11, &[3u8; 32], Some(&leaver), &[1u8; 32]);
+        let dev = rem.departing().expect("a removal names the departing device");
         assert_eq!(dev, leaver);
-        assert_eq!(sig, [2u8; 64]);
+        assert_eq!(rem.eggs_ptr(), [1u8; 32], "the consent eggs ride the blob the record points at");
         assert_ne!(add.count_signing_bytes(), rem.count_signing_bytes(),
             "the witness signature commits to which device departed");
     }
@@ -1154,46 +1254,43 @@ mod tests {
 
     // ── signatures ──
 
-    fn sk(seed: u8) -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    fn kp(seed: u8) -> crate::keys::Keypair {
+        crate::keys::Keypair::from_seed(&[seed; 32])
     }
-    fn pk(k: &ed25519_dalek::SigningKey) -> [u8; 32] {
-        k.verifying_key().to_bytes()
+    fn pk(k: &crate::keys::Keypair) -> [u8; 32] {
+        k.public.to_bytes()
     }
-    fn sign(k: &ed25519_dalek::SigningKey, msg: &[u8]) -> [u8; 64] {
-        use ed25519_dalek::Signer;
-        k.sign(msg).to_bytes()
+    /// A one-list blob signed by `k` over `msg` at the anchor, and its pointer.
+    fn blob_for(k: &crate::keys::Keypair, msg: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        let blob = eggs_blob(&[&k.eggs(msg, scheme::MASK_BASE)]);
+        let ptr = eggs_ptr(&blob);
+        (blob, ptr)
     }
+    const B: scheme::Mask = scheme::MASK_BASE;
 
     /// The one-step mint must produce exactly what the hand-rolled two-step produces, and must verify.
     /// This is the helper the client publishes through, so a regression here is an unfindable device rather than a visible error.
     #[test]
     fn sign_device_address_mints_a_verifying_record() {
-        let dev = sk(3);
+        let dev = kp(3);
         let hp = [8u8; 32];
-        let minted = Record::sign_device_address(&dev, &hp, &[4u8; 16], 4383, &[5u8; 16], 99);
-        assert!(minted.verify_address(), "a minted record must verify");
+        let (minted, blob) = Record::sign_device_address(&dev, B, &hp, &[4u8; 16], 4383, &[5u8; 16], 99);
+        assert!(minted.verify_address(&blob), "a minted record must verify");
 
-        let unsigned = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 99, &[0u8; 64]);
-        let expected = Record::new_device_address(
-            &pk(&dev),
-            &hp,
-            &[4u8; 16],
-            4383,
-            &[5u8; 16],
-            99,
-            &sign(&dev, &unsigned.address_signing_bytes()),
-        );
+        let unsigned = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 99, &[0u8; 32]);
+        let (blob2, ptr) = blob_for(&dev, &unsigned.address_signing_bytes());
+        let expected = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 99, &ptr);
         assert_eq!(minted.0, expected.0, "the one-step mint must equal the two-step");
+        assert_eq!(blob, blob2);
         assert_eq!(minted.key(), Some(key_address(&pk(&dev))), "keyed by device pubkey alone");
     }
 
-    /// The record crosses the wire to the seed as its raw 256 bytes and is reconstructed there before `verify_address` runs.
+    /// The record crosses the wire to the seed as its raw 256 bytes (the blob beside it) and is reconstructed there before `verify_address` runs.
     /// A stride change or a lossy copy would break publication silently, so pin the exact byte-for-byte round trip the worker's `pb_put` performs.
     #[test]
     fn address_record_survives_a_raw_stride_round_trip() {
-        let dev = sk(4);
-        let r = Record::sign_device_address(&dev, &[2u8; 32], &[7u8; 16], 4383, &[6u8; 16], 1234);
+        let dev = kp(4);
+        let (r, blob) = Record::sign_device_address(&dev, B, &[2u8; 32], &[7u8; 16], 4383, &[6u8; 16], 1234);
 
         let wire: Vec<u8> = r.0.to_vec();
         assert_eq!(wire.len(), STRIDE, "the wire form is exactly one stride");
@@ -1201,101 +1298,152 @@ mod tests {
         let mut back = [0u8; STRIDE];
         back.copy_from_slice(&wire);
         let restored = Record(back);
-        assert!(restored.verify_address(), "a round-tripped record still verifies");
+        assert!(restored.verify_address(&blob), "a round-tripped record still verifies");
         assert_eq!(restored.key(), r.key());
         assert_eq!(restored.epoch(), 1234, "the monotonic guard reads the same epoch back");
     }
 
     /// A device signs its own address, and the record self-verifies against the key inside it.
     /// Tampering with ANY covered field must break it — that is the whole integrity story, since there is no whole-file hash maintained across updates.
+    /// The pointer is not covered: the eggs sign the record, the record merely locates them — so a swapped blob fails the hash, and a swapped field fails the eggs.
     #[test]
     fn address_record_self_verifies_and_detects_tampering() {
-        let dev = sk(1);
+        let dev = kp(1);
         let hp = [5u8; 32];
-        let mut r = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &[0u8; 64]);
-        let sig = sign(&dev, &r.address_signing_bytes());
-        r = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &sig);
-        assert!(r.verify_address(), "a correctly signed address must verify");
+        let (r, blob) = Record::sign_device_address(&dev, B, &hp, &[1u8; 16], 7953, &[2u8; 16], 42);
+        let ptr = r.eggs_ptr();
+        assert!(r.verify_address(&blob), "a correctly signed address must verify");
 
-        // Every covered field: flip it, the signature must fail.
-        let bad_ip = Record::new_device_address(&pk(&dev), &hp, &[9u8; 16], 7953, &[2u8; 16], 42, &sig);
-        assert!(!bad_ip.verify_address(), "a redirected IP must not verify");
-        let bad_port = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 1, &[2u8; 16], 42, &sig);
-        assert!(!bad_port.verify_address(), "a changed port must not verify");
-        let bad_ts = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 43, &sig);
-        assert!(!bad_ts.verify_address(), "a replayed timestamp must not verify");
-        let bad_hp = Record::new_device_address(&pk(&dev), &[6u8; 32], &[1u8; 16], 7953, &[2u8; 16], 42, &sig);
-        assert!(!bad_hp.verify_address(), "planting the device under another identity must not verify");
+        // Every covered field: flip it, the eggs must fail.
+        let bad_ip = Record::new_device_address(&pk(&dev), &hp, &[9u8; 16], 7953, &[2u8; 16], 42, &ptr);
+        assert!(!bad_ip.verify_address(&blob), "a redirected IP must not verify");
+        let bad_port = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 1, &[2u8; 16], 42, &ptr);
+        assert!(!bad_port.verify_address(&blob), "a changed port must not verify");
+        let bad_ts = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 43, &ptr);
+        assert!(!bad_ts.verify_address(&blob), "a replayed timestamp must not verify");
+        let bad_hp = Record::new_device_address(&pk(&dev), &[6u8; 32], &[1u8; 16], 7953, &[2u8; 16], 42, &ptr);
+        assert!(!bad_hp.verify_address(&blob), "planting the device under another identity must not verify");
+
+        // The blob must be THE blob: a byte flipped, a truncation, or a different (even valid) blob fails the pointer.
+        let mut flipped = blob.clone();
+        flipped[3] ^= 1;
+        assert!(!r.verify_address(&flipped), "a blob that does not hash to the pointer is not this record's");
+        assert!(!r.verify_address(&blob[..blob.len() - 1]));
+        let (other, _) = blob_for(&dev, b"something else");
+        assert!(!r.verify_address(&other));
+        let mut huge = blob.clone();
+        huge.resize(EGGS_BLOB_MAX + 1, 0);
+        assert!(!r.verify_address(&huge), "over the cap is refused before hashing");
 
         // Another device cannot sign this device's row.
-        let attacker = sk(2);
-        let forged = sign(&attacker, &r.address_signing_bytes());
-        let bad_key = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &forged);
-        assert!(!bad_key.verify_address(), "a signature by another key must not verify");
+        let attacker = kp(2);
+        let (forged, fptr) = blob_for(&attacker, &r.address_signing_bytes());
+        let bad_key = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &fptr);
+        assert!(!bad_key.verify_address(&forged), "eggs by another key must not verify");
+    }
+
+    /// A reader with the chain holds a record to the fleet's floor: eggs verify against the declared bundle, and a list short of the required set fails even though its Ed25519 egg is good.
+    #[cfg(feature = "client")]
+    #[test]
+    fn policy_holds_a_record_to_the_floor() {
+        let dev = crate::pq::SigningBundle::derive(b"phonebook-device");
+        let full = dev.public();
+        let hp = [5u8; 32];
+        let all = full.mask();
+        let (r, blob) = Record::sign_device_address(&dev, all, &hp, &[1u8; 16], 7953, &[2u8; 16], 42);
+        let bundle_for = |who: &[u8; 32]| (who == &full.ed25519()).then(|| full.clone());
+        let strict = EggPolicy { bundle_for: &bundle_for, required: all };
+        assert!(r.verify_address_with(&blob, &strict), "the full set verifies at the full floor");
+        assert!(!r.verify_address(&blob), "anchor-only cannot verify eggs for schemes it holds no key for — every listed egg must verify");
+
+        let (short, short_blob) = Record::sign_device_address(dev.keypair(), B, &hp, &[1u8; 16], 7953, &[2u8; 16], 43);
+        assert!(short.verify_address(&short_blob), "Ed25519 alone is fine below the floor");
+        assert!(!short.verify_address_with(&short_blob, &strict), "and a stripped list fails at it");
     }
 
     /// A placement verifies against the placer named in it — but that is only WHO, never WHETHER they were entitled.
     /// A departed member's signature stays valid forever, so the caller must check current membership separately; this test pins that the check is genuinely absent here.
     #[test]
     fn placement_verifies_signer_but_not_membership() {
-        let placer = sk(3);
+        let placer = kp(3);
         let hp = [1u8; 32];
-        let base = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &[0u8; 64]);
-        let sig = sign(&placer, &base.placement_signing_bytes());
-        let r = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &sig);
-        assert!(r.verify_placement());
+        let base = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &[0u8; 32]);
+        let (blob, ptr) = blob_for(&placer, &base.placement_signing_bytes());
+        let r = Record::new_device_pointer(&hp, 2, &[7u8; 32], 10, &pk(&placer), &ptr);
+        assert!(r.verify_placement(&blob));
 
-        // Same signature, different index → different signing bytes → fails.
+        // Same eggs, different index → different signing bytes → fails.
         // This is target (b) of the shuffle attack, closed cryptographically rather than by convention.
-        let moved = Record::new_device_pointer(&hp, 3, &[7u8; 32], 10, &pk(&placer), &sig);
-        assert!(!moved.verify_placement(), "a placement cannot be replayed at another index");
+        let moved = Record::new_device_pointer(&hp, 3, &[7u8; 32], 10, &pk(&placer), &ptr);
+        assert!(!moved.verify_placement(&blob), "a placement cannot be replayed at another index");
 
         // A stranger's placement verifies as THEIRS — proving the caller must gate on membership.
-        let stranger = sk(9);
-        let sbase = Record::new_device_pointer(&hp, 2, &[7u8; 32], 11, &pk(&stranger), &[0u8; 64]);
-        let ssig = sign(&stranger, &sbase.placement_signing_bytes());
-        let srec = Record::new_device_pointer(&hp, 2, &[7u8; 32], 11, &pk(&stranger), &ssig);
-        assert!(srec.verify_placement(), "signature is valid — membership is the CALLER's check");
+        let stranger = kp(9);
+        let sbase = Record::new_device_pointer(&hp, 2, &[7u8; 32], 11, &pk(&stranger), &[0u8; 32]);
+        let (sblob, sptr) = blob_for(&stranger, &sbase.placement_signing_bytes());
+        let srec = Record::new_device_pointer(&hp, 2, &[7u8; 32], 11, &pk(&stranger), &sptr);
+        assert!(srec.verify_placement(&sblob), "eggs are valid — membership is the CALLER's check");
     }
 
-    /// Consent-only removal: the departing device's own signature is required, and an unsigned or wrongly-signed departure is not consent.
+    /// Consent-only removal: the departing device's own eggs are required, and an unsigned or wrongly-signed departure is not consent.
     /// An add has nothing to prove.
     #[test]
     fn departure_requires_the_leavers_own_signature() {
-        let leaver = sk(4);
-        let witness = sk(5);
+        let leaver = kp(4);
+        let witness = kp(5);
         let hp = [1u8; 32];
 
-        let add = Record::new_identity_count(&hp, 3, 10, &pk(&witness), &[0u8; 64], None);
-        assert!(add.verify_departure(), "an add has no departure to prove");
+        let add_blob = eggs_blob(&[&witness.eggs(b"x", B), &[]]);
+        let add = Record::new_identity_count(&hp, 3, 10, &pk(&witness), None, &eggs_ptr(&add_blob));
+        assert!(add.verify_departure(&add_blob), "an add has no departure to prove");
 
         let msg = Record::departure_signing_bytes(&hp, &pk(&leaver), 11);
-        let good = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &[0u8; 64], Some((&pk(&leaver), &sign(&leaver, &msg))));
-        assert!(good.verify_departure(), "the leaver's own signature is consent");
+        let good_blob = eggs_blob(&[&witness.eggs(b"x", B), &leaver.eggs(&msg, B)]);
+        let good = Record::new_identity_count(&hp, 2, 11, &pk(&witness), Some(&pk(&leaver)), &eggs_ptr(&good_blob));
+        assert!(good.verify_departure(&good_blob), "the leaver's own eggs are consent");
 
-        let forged = sign(&witness, &msg); // a member signing on the leaver's behalf
-        let bad = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &[0u8; 64], Some((&pk(&leaver), &forged)));
-        assert!(!bad.verify_departure(), "no device removes another — a member cannot sign for the leaver");
+        let forged_blob = eggs_blob(&[&witness.eggs(b"x", B), &witness.eggs(&msg, B)]); // a member signing on the leaver's behalf
+        let bad = Record::new_identity_count(&hp, 2, 11, &pk(&witness), Some(&pk(&leaver)), &eggs_ptr(&forged_blob));
+        assert!(!bad.verify_departure(&forged_blob), "no device removes another — a member cannot sign for the leaver");
 
-        let wrong_epoch = Record::new_identity_count(&hp, 2, 12, &pk(&witness), &[0u8; 64], Some((&pk(&leaver), &sign(&leaver, &msg))));
-        assert!(!wrong_epoch.verify_departure(), "the departure is bound to its epoch");
+        let empty_blob = eggs_blob(&[&witness.eggs(b"x", B), &[]]);
+        let unsigned = Record::new_identity_count(&hp, 2, 11, &pk(&witness), Some(&pk(&leaver)), &eggs_ptr(&empty_blob));
+        assert!(!unsigned.verify_departure(&empty_blob), "a removal with no consent eggs is not consent");
+
+        let wrong_epoch = Record::new_identity_count(&hp, 2, 12, &pk(&witness), Some(&pk(&leaver)), &eggs_ptr(&good_blob));
+        assert!(!wrong_epoch.verify_departure(&good_blob), "the departure is bound to its epoch");
     }
 
     /// The witness attests the count AND which device departed, so it cannot be replayed against a different removal.
     #[test]
     fn count_witness_commits_to_the_departure() {
-        let witness = sk(6);
+        let witness = kp(6);
         let hp = [1u8; 32];
         let leaver = [7u8; 32];
-        let base = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &[0u8; 64], Some((&leaver, &[0u8; 64])));
-        let sig = sign(&witness, &base.count_signing_bytes());
-        let r = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &sig, Some((&leaver, &[0u8; 64])));
-        assert!(r.verify_count());
+        let base = Record::new_identity_count(&hp, 2, 11, &pk(&witness), Some(&leaver), &[0u8; 32]);
+        let blob = eggs_blob(&[&witness.eggs(&base.count_signing_bytes(), B), &[]]);
+        let ptr = eggs_ptr(&blob);
+        let r = Record::new_identity_count(&hp, 2, 11, &pk(&witness), Some(&leaver), &ptr);
+        assert!(r.verify_count(&blob));
 
-        let other_leaver = Record::new_identity_count(&hp, 2, 11, &pk(&witness), &sig, Some((&[8u8; 32], &[0u8; 64])));
-        assert!(!other_leaver.verify_count(), "the witness names WHICH device departed");
-        let other_count = Record::new_identity_count(&hp, 5, 11, &pk(&witness), &sig, Some((&leaver, &[0u8; 64])));
-        assert!(!other_count.verify_count(), "the witness attests a specific count");
+        let other_leaver = Record::new_identity_count(&hp, 2, 11, &pk(&witness), Some(&[8u8; 32]), &ptr);
+        assert!(!other_leaver.verify_count(&blob), "the witness names WHICH device departed");
+        let other_count = Record::new_identity_count(&hp, 5, 11, &pk(&witness), Some(&leaver), &ptr);
+        assert!(!other_count.verify_count(&blob), "the witness attests a specific count");
+    }
+
+    /// The blob codec frames each list, refuses trailing bytes, and round-trips an empty list.
+    #[test]
+    fn egg_blob_round_trips_and_fails_closed() {
+        let k = kp(1);
+        let a = k.eggs(b"a", B);
+        let blob = eggs_blob(&[&a, &[]]);
+        let lists = eggs_blob_lists(&blob, 2).unwrap();
+        assert_eq!(lists, vec![a.clone(), vec![]]);
+        assert!(eggs_blob_lists(&blob, 1).is_none(), "wrong list count is trailing bytes");
+        assert!(eggs_blob_lists(&blob, 3).is_none(), "wrong list count is truncation");
+        assert!(eggs_blob_lists(&blob[..blob.len() - 1], 2).is_none());
+        assert_ne!(eggs_ptr(&blob), eggs_ptr(&eggs_blob(&[&a])), "the pointer commits to the framing");
     }
 
     // ── transport ──
@@ -1338,14 +1486,15 @@ mod tests {
         assert_eq!(STRIDE, 256);
         assert_eq!(SLICE_SLOTS * STRIDE, 1024 * 1024, "one slice is 1 MiB");
         assert_eq!(STRIDE * 16, 4096, "16 records per 4 KiB block");
-        assert!(IC_DEPART_SIG + 64 <= STRIDE, "IdentityCount overflows");
-        assert!(DP_PLACE_SIG + 64 <= STRIDE, "DevicePointer overflows");
-        assert!(DA_SIG + 64 <= STRIDE, "DeviceAddress overflows");
+        assert!(IC_EGGS + 32 <= STRIDE, "IdentityCount overflows");
+        assert!(DP_EGGS + 32 <= STRIDE, "DevicePointer overflows");
+        assert!(DA_EGGS + 32 <= STRIDE, "DeviceAddress overflows");
     }
 
-    /// Test-side registry storage: apply a plan's records the way per-key storage would (count replaces, a pointer lands at its index), then trim to the attested extent.
-    fn apply_plan(view: &mut RegistryView, plan: &[Record]) {
-        for r in plan {
+    /// Test-side registry storage: apply a plan's records the way per-key storage would (count replaces, a pointer lands at its index, every blob is filed), then trim to the attested extent.
+    fn apply_plan(view: &mut RegistryView, plan: &[(Record, Vec<u8>)]) {
+        for (r, blob) in plan {
+            view.add_blob(blob.clone());
             match r.kind() {
                 RecordKind::IdentityCount => view.count = Some(*r),
                 RecordKind::DevicePointer => {
@@ -1364,29 +1513,29 @@ mod tests {
 
     #[test]
     fn plan_converges_from_empty_then_goes_quiet() {
-        let member = sk(1);
+        let member = kp(1);
         let hp = [9u8; 32];
-        let fold = [pk(&sk(1)), pk(&sk(2))];
+        let fold = [pk(&kp(1)), pk(&kp(2))];
         let mut view = RegistryView::default();
-        let plan = registry_plan(&member, &hp, &fold, &view, 100, None);
+        let plan = registry_plan(&member, B, &hp, &fold, &view, 100, None);
         assert_eq!(plan.len(), 3, "two pointers + the count");
         apply_plan(&mut view, &plan);
         assert!(view.verify(&hp), "a plan minted by one member must verify for any reader");
         assert_eq!(view.devices(), fold.to_vec());
         // In sync → the next plan is empty, so racing siblings settle instead of ping-ponging writes.
-        assert!(registry_plan(&member, &hp, &fold, &view, 101, None).is_empty());
+        assert!(registry_plan(&member, B, &hp, &fold, &view, 101, None).is_empty());
     }
 
     #[test]
     fn plan_appends_without_touching_stored_slots() {
-        let member = sk(1);
+        let member = kp(1);
         let hp = [9u8; 32];
         let mut view = RegistryView::default();
-        let plan0 = registry_plan(&member, &hp, &[pk(&sk(1)), pk(&sk(2))], &view, 100, None);
+        let plan0 = registry_plan(&member, B, &hp, &[pk(&kp(1)), pk(&kp(2))], &view, 100, None);
         apply_plan(&mut view, &plan0);
         let stored_first = view.pointers[0];
-        let fold3 = [pk(&sk(1)), pk(&sk(2)), pk(&sk(3))];
-        let plan = registry_plan(&member, &hp, &fold3, &view, 200, None);
+        let fold3 = [pk(&kp(1)), pk(&kp(2)), pk(&kp(3))];
+        let plan = registry_plan(&member, B, &hp, &fold3, &view, 200, None);
         assert_eq!(plan.len(), 2, "one new pointer + the count — stored slots stay untouched");
         apply_plan(&mut view, &plan);
         assert!(view.verify(&hp));
@@ -1396,36 +1545,33 @@ mod tests {
 
     #[test]
     fn plan_removes_by_pop_and_swap_with_consent() {
-        let member = sk(1);
+        let member = kp(1);
         let hp = [9u8; 32];
-        let leaver = sk(2);
+        let leaver = kp(2);
         let mut view = RegistryView::default();
-        let fold3 = [pk(&sk(1)), pk(&leaver), pk(&sk(3))];
-        let plan0 = registry_plan(&member, &hp, &fold3, &view, 100, None);
+        let fold3 = [pk(&kp(1)), pk(&leaver), pk(&kp(3))];
+        let plan0 = registry_plan(&member, B, &hp, &fold3, &view, 100, None);
         apply_plan(&mut view, &plan0);
         // The leaver consents with its OWN key over the departure bytes at the new epoch.
-        let fold2 = [pk(&sk(1)), pk(&sk(3))];
+        let fold2 = [pk(&kp(1)), pk(&kp(3))];
         let leaver_pk = pk(&leaver);
-        let consent = {
-            use ed25519_dalek::Signer;
-            leaver.sign(&Record::departure_signing_bytes(&hp, &leaver_pk, 200)).to_bytes()
-        };
-        let plan = registry_plan(&member, &hp, &fold2, &view, 200, Some((&leaver_pk, &consent)));
+        let consent = leaver.eggs(&Record::departure_signing_bytes(&hp, &leaver_pk, 200), B);
+        let plan = registry_plan(&member, B, &hp, &fold2, &view, 200, Some((&leaver_pk, &consent)));
         assert_eq!(plan.len(), 2, "the relocated tail pointer + the count");
         apply_plan(&mut view, &plan);
         assert!(view.verify(&hp), "verify covers the departure consent riding the count");
-        assert_eq!(view.devices(), vec![pk(&sk(1)), pk(&sk(3))], "the tail popped into the hole — indices stay dense");
+        assert_eq!(view.devices(), vec![pk(&kp(1)), pk(&kp(3))], "the tail popped into the hole — indices stay dense");
         let count = view.count.unwrap();
-        assert_eq!(count.departing().unwrap().0, leaver_pk);
-        assert!(count.verify_departure());
+        assert_eq!(count.departing().unwrap(), leaver_pk);
+        assert!(count.verify_departure(view.blob(&count).unwrap()));
     }
 
     #[test]
     fn view_verify_rejects_tampering() {
-        let member = sk(1);
+        let member = kp(1);
         let hp = [9u8; 32];
         let mut view = RegistryView::default();
-        let plan0 = registry_plan(&member, &hp, &[pk(&sk(1)), pk(&sk(2))], &view, 100, None);
+        let plan0 = registry_plan(&member, B, &hp, &[pk(&kp(1)), pk(&kp(2))], &view, 100, None);
         apply_plan(&mut view, &plan0);
         assert!(view.verify(&hp));
         // A pointer moved to the wrong slot fails (index is inside the placement signature).
@@ -1435,5 +1581,12 @@ mod tests {
         // A count that disagrees with the pointer run fails.
         view.pointers.pop();
         assert!(!view.verify(&hp), "count and pointer extent must agree");
+        // A missing blob is a missing signature.
+        let mut stripped = view.clone();
+        stripped.pointers = view.pointers.clone();
+        stripped.pointers.push(plan0[1].0);
+        stripped.blobs.clear();
+        assert!(!stripped.verify(&hp), "records without their blobs cannot verify");
     }
+
 }
