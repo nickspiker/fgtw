@@ -133,7 +133,7 @@ pub fn fetch_successor<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Resu
 /// Publish a succession record. MEMBER-GATED: `device_key` must fold as a member of the CURRENT chain at `record.handle_proof` — the worker checks the write signature against that chain. The record's continuity eggs are what a contact later verifies; this write signature only authorises the write (stops a stranger squatting the slot). Idempotent: a member may overwrite.
 pub fn publish_successor<T: FgtwTransport>(
     t: &T,
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     record: &SuccessorRecord,
 ) -> Result<(), String> {
     let resp = signed_req(t, device_key, record.to_section(), "succession_put")?;
@@ -150,11 +150,11 @@ pub fn publish_successor<T: FgtwTransport>(
 /// No fleet yet → claim it with a first-come, identity-co-signed genesis. Already a member → nothing to do. A fleet exists without this device → it must be enrolled from an existing device first.
 pub fn ensure_member<T: FgtwTransport>(
     t: &T,
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     identity_seed: &[u8; 32],
 ) -> Result<(), String> {
-    let me = device_key.public.to_bytes();
+    let me = device_key.keypair().public.to_bytes();
     // A fold ERROR is indeterminate (corrupt/stale-format chain), NOT "not a member" — the two used to collapse into the same enroll-from-another-device message, hiding the real fault.
     let member_of = |blob: &MembershipBlob| -> Result<bool, String> {
         blob.fold()
@@ -204,12 +204,12 @@ pub fn ensure_member<T: FgtwTransport>(
 pub fn push_checkpoint<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     k: u64,
     commit: [u8; 32],
     fanout_epoch: u64,
 ) -> Result<Option<(u64, [u8; 32], u64)>, String> {
-    let me = device_key.public.to_bytes();
+    let me = device_key.keypair().public.to_bytes();
     let mut blob = fetch(t, handle_proof)?.ok_or("no fleet chain to checkpoint")?;
     let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
     if !members.contains(&me) {
@@ -366,10 +366,10 @@ pub fn bind_device<T: FgtwTransport>(
 /// This device's own departure — the ONLY chain remove that exists (self-signed; expelling another device is not a verb). Idempotent: already gone folds as success. Not yet wired to any UI; the self-retire flow arrives with the device-trust bundle.
 pub fn depart_device<T: FgtwTransport>(
     t: &T,
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
 ) -> Result<(), String> {
-    let me = device_key.public.to_bytes();
+    let me = device_key.keypair().public.to_bytes();
     for _attempt in 0..4 {
         let mut blob = fetch(t, handle_proof)?.ok_or("no fleet to depart from")?;
         let members = blob.fold().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
@@ -484,7 +484,7 @@ pub fn bindreq_put<T: FgtwTransport>(
 /// NEW device: withdraw its own request — the author's exit act (on green, or on ceremony cancel). Signed envelope: the worker deletes exactly the signer's own entry, nobody else's. Best-effort; an unreachable worker just means the stamp lapses instead.
 pub fn bindreq_withdraw<T: FgtwTransport>(
     t: &T,
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
 ) -> Result<(), String> {
     let mut section = vsf::VsfSection::new("bindreq_withdraw");
@@ -502,7 +502,7 @@ pub fn bindreq_withdraw<T: FgtwTransport>(
 /// OWNER frees a retired device's hardware brand — the second signature of the two-signature retire (the first was the device's own departure). `member_key` must be a CURRENT fleet member; the worker refuses a release of a device still in the fold (membership only ever ends by the device's own hand) and a brand held by a different identity. Idempotent: already-free acks.
 pub fn device_release<T: FgtwTransport>(
     t: &T,
-    member_key: &Keypair,
+    member_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     released_pubkey: &[u8; 32],
 ) -> Result<(), String> {
@@ -523,7 +523,7 @@ pub fn device_release<T: FgtwTransport>(
 /// `member_key` signs as a current fleet member — the worker folds the chain and rejects a non-member, so this can't lock a device outside the caller's own fleet.
 pub fn device_lock<T: FgtwTransport>(
     t: &T,
-    member_key: &Keypair,
+    member_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     locked_pubkey: &[u8; 32],
 ) -> Result<(), String> {
@@ -544,7 +544,7 @@ pub fn device_lock<T: FgtwTransport>(
 /// Same member-gated auth as `device_lock`; idempotent.
 pub fn device_unlock<T: FgtwTransport>(
     t: &T,
-    member_key: &Keypair,
+    member_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     locked_pubkey: &[u8; 32],
 ) -> Result<(), String> {
@@ -564,7 +564,7 @@ pub fn device_unlock<T: FgtwTransport>(
 /// EXISTING device: the pending binding requests for OUR fleet — the matcher's candidate set. Member-gated at the worker (signed envelope, signer must fold as a current member); every returned request is re-verified HERE too (freshness + both signatures against `Ed25519(identity_seed)`), so a compromised relay can inject nothing.
 pub fn bindreq_list<T: FgtwTransport>(
     t: &T,
-    member_key: &Keypair,
+    member_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     identity_seed: &[u8; 32],
 ) -> Result<Vec<BindRequest>, String> {
