@@ -157,48 +157,8 @@ pub fn verify_egg(scheme_tag: u8, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool
     }
 }
 
-/// Wire form of an egg list, for any signature slot that must carry several schemes: `u8 count`, then per egg `u8 scheme ‖ u32 LE len ‖ sig`. Every element framed. This is ONE primitive — the fleet chain's consent, the bindreq registry, the RustDesk handshake and the phonebook egg blob all use it — so "egg-list shaped from day one" is a single codec, not four.
-pub fn eggs_to_bytes(eggs: &[Egg]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + eggs.iter().map(|e| 5 + e.sig.len()).sum::<usize>());
-    v.push(eggs.len() as u8);
-    for e in eggs {
-        v.push(e.scheme);
-        v.extend_from_slice(&(e.sig.len() as u32).to_le_bytes());
-        v.extend_from_slice(&e.sig);
-    }
-    v
-}
-
-/// Inverse of [`eggs_to_bytes`]. Rejects an empty list (a slot with no signature is not a signed slot), duplicate schemes, and trailing bytes.
-pub fn eggs_from_bytes(b: &[u8]) -> Result<Vec<Egg>, &'static str> {
-    let Some((&count, mut rest)) = b.split_first() else {
-        return Err("egg list: empty");
-    };
-    if count == 0 {
-        return Err("egg list: no eggs");
-    }
-    let mut out = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        if rest.len() < 5 {
-            return Err("egg list: truncated egg");
-        }
-        let scheme_tag = rest[0];
-        let n = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
-        rest = &rest[5..];
-        if rest.len() < n {
-            return Err("egg list: truncated signature");
-        }
-        if out.iter().any(|e: &Egg| e.scheme == scheme_tag) {
-            return Err("egg list: duplicate scheme");
-        }
-        out.push(Egg { scheme: scheme_tag, sig: rest[..n].to_vec() });
-        rest = &rest[n..];
-    }
-    if !rest.is_empty() {
-        return Err("egg list: trailing bytes");
-    }
-    Ok(out)
-}
+/// The egg-list wire form lives in `vsf::eggs` — the lowest layer — so the VSF header's `gm` slot and every slot above it share one codec. Re-exported so fgtw callers keep their paths.
+pub use vsf::eggs::{eggs_from_bytes, eggs_to_bytes};
 
 /// The one rule for a consent, a vouch, or a handshake: every listed egg verifies against `bundle`, AND the listed set covers `required`. An egg for a scheme the bundle lacks fails closed; a list that is short of `required` fails even if everything in it is valid.
 pub fn verify_eggs(eggs: &[Egg], bundle: &KeyBundle, msg: &[u8], required: scheme::Mask) -> bool {
@@ -212,6 +172,50 @@ pub fn verify_eggs(eggs: &[Egg], bundle: &KeyBundle, msg: &[u8], required: schem
         }
     }
     scheme::covers(egg_mask(eggs), required)
+}
+
+/// The schemes a per-message ENVELOPE carries: Ed25519 + Falcon-512. SPHINCS+ is left to the chain, where an op is rare and archival — at 7.8 KB a signature it has no place on every relay frame or status ping. The same tier the RustDesk handshake uses.
+pub const ENVELOPE_TIER: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
+
+/// Signature length for each scheme — what a header slot must reserve. Falcon and SLH-DSA both have fixed (padded) signature sizes, which is what makes reserve-then-patch sound.
+pub fn sig_len(scheme_tag: u8) -> Option<usize> {
+    match scheme_tag {
+        scheme::ED25519 => Some(64),
+        scheme::FALCON512 => Some(fn_dsa_vrfy::signature_size(fn_dsa_vrfy::FN_DSA_LOGN_512)),
+        scheme::SPHINCS_PLUS => Some(fips205::slh_dsa_sha2_128s::SIG_LEN),
+        _ => None,
+    }
+}
+
+/// The `(scheme, length)` slots a header must reserve to carry every scheme in `mask`, in scheme order — the argument to `VsfBuilder::signed_only_eggs`.
+pub fn reserve_eggs(mask: scheme::Mask) -> Vec<(u8, usize)> {
+    (0u8..16)
+        .filter(|s| mask & (1 << s) != 0)
+        .filter_map(|s| sig_len(s).map(|n| (s, n)))
+        .collect()
+}
+
+/// What `signer` signs an envelope with: everything it holds, clipped to the envelope tier. Ed25519 always; Falcon when the signer has it; never SPHINCS+.
+pub fn envelope_mask(signer: &impl FleetSigner) -> scheme::Mask {
+    signer.bundle().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE) & ENVELOPE_TIER
+}
+
+/// Sign a VSF document whose header was reserved with `signed_only_eggs(ke, &reserve_eggs(envelope_mask(signer)))`. vsf hands us the 32-byte file hash; every scheme signs it.
+pub fn sign_envelope(unsigned: Vec<u8>, signer: &impl FleetSigner) -> Result<Vec<u8>, String> {
+    let mask = envelope_mask(signer);
+    vsf::verification::sign_file_with(unsigned, |file_hash| signer.eggs(file_hash, mask))
+}
+
+/// Verify a signed VSF document's header eggs against the signer's declared `bundle`, requiring `required` — the policy half that vsf leaves to us. vsf has already checked the Ed25519 anchor; this checks the rest and that nothing required is missing. Returns the signer's device key.
+pub fn verify_envelope(doc: &[u8], bundle: &KeyBundle, required: scheme::Mask) -> Result<[u8; 32], String> {
+    let (signer, eggs, file_hash) = vsf::verification::header_eggs(doc)?;
+    if bundle.ed25519() != signer {
+        return Err("envelope: bundle is not the signer's".into());
+    }
+    if !verify_eggs(&eggs, bundle, &file_hash, required) {
+        return Err("envelope: eggs do not verify at the required tier".into());
+    }
+    Ok(signer)
 }
 
 /// The mask of schemes an egg list actually carries — what an op PROVED, as opposed to what its signer declared.
@@ -392,24 +396,38 @@ mod tests {
     }
 
     #[test]
-    fn egg_list_blob_round_trips_and_rejects_malformed() {
-        let eggs = vec![Egg { scheme: scheme::ED25519, sig: vec![1u8; 64] }, Egg { scheme: scheme::FALCON512, sig: vec![2u8; 666] }];
-        let b = eggs_to_bytes(&eggs);
-        assert_eq!(eggs_from_bytes(&b).unwrap(), eggs);
-        assert!(eggs_from_bytes(&[]).is_err(), "empty");
-        assert!(eggs_from_bytes(&[0]).is_err(), "no eggs");
-        let mut dup = eggs.clone();
-        dup.push(Egg { scheme: scheme::ED25519, sig: vec![3u8; 64] });
-        assert!(eggs_from_bytes(&eggs_to_bytes(&dup)).is_err(), "duplicate scheme");
-        let mut trailing = b.clone();
-        trailing.push(0);
-        assert!(eggs_from_bytes(&trailing).is_err(), "trailing bytes");
-    }
-
-    #[test]
     fn unknown_scheme_never_verifies() {
         assert!(!verify_egg(200, &[0u8; 32], b"m", &[0u8; 64]));
         assert!(!verify_egg(scheme::FALCON512, &[0u8; 5], b"m", &[0u8; 666]), "short key");
+    }
+
+    /// A three-scheme signer signs an envelope at the envelope tier (Ed25519 + Falcon, never SPHINCS+); vsf anchors it, we finish it against the declared bundle, and a short envelope is refused when Falcon is required.
+    #[cfg(feature = "client")]
+    #[test]
+    fn envelope_signs_at_the_tier_and_verifies_against_the_bundle() {
+        let a = SigningBundle::derive(b"envelope-machine");
+        let ke = vsf::VsfType::ke(a.keypair().public.to_bytes().to_vec());
+        let unsigned = vsf::VsfBuilder::new()
+            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .signed_only_eggs(ke.clone(), &reserve_eggs(envelope_mask(&a)))
+            .add_section("relay", vec![("payload".to_string(), vsf::VsfType::v(b'r', vec![1, 2, 3]))])
+            .build()
+            .unwrap();
+        let signed = sign_envelope(unsigned, &a).unwrap();
+        assert!(vsf::verification::read_verified(&signed, Some(a.keypair().public.to_bytes())).is_ok(), "vsf anchors on Ed25519");
+        let (_, eggs, _) = vsf::verification::header_eggs(&signed).unwrap();
+        assert_eq!(egg_mask(&eggs), ENVELOPE_TIER, "Ed25519 + Falcon, and no SPHINCS+ on an envelope");
+        assert_eq!(verify_envelope(&signed, &a.public(), ENVELOPE_TIER).unwrap(), a.keypair().public.to_bytes());
+        // An Ed25519-only signer's envelope is fine when only Ed25519 is required, and refused when Falcon is.
+        let bare = a.keypair();
+        let unsigned2 = vsf::VsfBuilder::new()
+            .signed_only_eggs(ke, &reserve_eggs(envelope_mask(bare)))
+            .add_section("relay", vec![])
+            .build()
+            .unwrap();
+        let short = sign_envelope(unsigned2, bare).unwrap();
+        assert!(verify_envelope(&short, &a.public(), scheme::MASK_BASE).is_ok());
+        assert!(verify_envelope(&short, &a.public(), ENVELOPE_TIER).is_err());
     }
 
     #[cfg(feature = "client")]

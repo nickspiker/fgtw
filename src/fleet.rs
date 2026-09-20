@@ -61,12 +61,8 @@ pub mod scheme {
     pub const MASK_KNOWN: Mask = MASK_ALL;
 }
 
-/// One signature egg: which scheme, and the signature bytes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Egg {
-    pub scheme: u8,
-    pub sig: Vec<u8>,
-}
+/// One signature egg: which scheme, and the signature bytes. Defined at the lowest layer (`vsf::eggs`) so the chain, the registry, the handshake, the phonebook pointer and the VSF header all share one type and one wire form.
+pub use vsf::eggs::Egg;
 
 /// What a fleet op does. `u8` discriminant is the on-wire `kind`; wire-stable.
 /// Checkpoint (2026-08-12) is the fleet-plane epoch spine (photon docs/braid.md §14.4): a chain-format flag-day — pre-checkpoint builds hard-fail the parse on kind 3, which is the approved atomic-update behaviour, never a tolerated fork.

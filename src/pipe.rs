@@ -7,7 +7,7 @@
 //!
 //! **This module is sans-io** like [`crate::traverse`]: envelope build/peel and the stream frame codec live here with tests; the socket pump (tokio/tungstenite) is each app's concern, so `fgtw` stays free of async deps.
 
-use crate::keys::Keypair;
+use crate::fleet::Egg;
 use vsf::types::VsfType;
 
 /// The rustdesk fork's service tag.
@@ -29,9 +29,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Build a signed relay envelope addressed to `recipient` (optionally to its `svc` hub).
 ///
-/// Wire shape is the one the deployed worker verifies and photon already sends: header `signed_only(ke)` + canonical `sign_file`, section `relay` with `recipient` (`kx`), `payload` (`v'r'`), and — new, optional, ignored by pre-svc workers' HTTPS path and refused-if-garbled by current ones — `svc` (`d`).
+/// Wire shape is the one the worker verifies and photon sends: header `signed_only_eggs(ke)` carrying every scheme the sender holds at the envelope tier (Ed25519 + Falcon; vsf anchors on the Ed25519 egg, the receiver holds the rest to its chain's floor), section `relay` with `recipient` (`kx`), `payload` (`v'r'`), and — new, optional, ignored by pre-svc workers' HTTPS path and refused-if-garbled by current ones — `svc` (`d`).
 pub fn build_relay_envelope(
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     recipient: &[u8; 32],
     svc: Option<&str>,
     payload: &[u8],
@@ -48,11 +48,11 @@ pub fn build_relay_envelope(
     }
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
-        .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
+        .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section("relay", fields)
         .build()
         .map_err(|e| format!("relay envelope build: {e}"))?;
-    vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
+    crate::pq::sign_envelope(unsigned, device_key)
 }
 
 /// Peel a relay envelope received over the pipe: verify the sender's whole-file signature, then return `(sender_device_key, inner_payload)`.
@@ -61,21 +61,15 @@ pub fn build_relay_envelope(
 /// Ported verbatim from photon (which now delegates here): `verify_file_signature`, NOT `read_verified` — the signature covers the entire file (authorship + integrity), only the content-hp self-attestation is waived, same as every CLUTCH/chat parser.
 /// And the section resolves via `primary_section`, not a bare body parse: the section NAME lives in the header TOC (near-form), so a body parse sees `name == ""` and a `== "relay"` check silently fails — the trap that black-holed the pipe data plane once already.
 pub fn peel_relay_envelope(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
+    peel_relay_envelope_eggs(bytes).map(|(k, p, _, _)| (k, p))
+}
+
+/// `peel_relay_envelope`, also handing back the header's egg list and the file hash they sign, so a receiver that knows the sender's declared bundle can hold the frame to its fleet's floor with `pq::verify_eggs` — vsf checks only the Ed25519 anchor. The sender is not known until the anchor has been checked, which is why the tier check cannot live here.
+pub fn peel_relay_envelope_eggs(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>, Vec<Egg>, [u8; 32])> {
     use vsf::file_format::VsfHeader;
 
-    match vsf::verification::verify_file_signature(bytes) {
-        Ok(true) => {}
-        _ => return None,
-    }
+    let (sender_key, eggs, file_hash) = vsf::verification::header_eggs(bytes).ok()?;
     let (header, header_end) = VsfHeader::decode(bytes).ok()?;
-    let sender_key: [u8; 32] = match &header.signer_pubkey {
-        Some(VsfType::ke(k)) if k.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(k);
-            arr
-        }
-        _ => return None,
-    };
     let section = header.primary_section(bytes, header_end).ok()?;
     let payload = section
         .get_field("payload")
@@ -87,7 +81,7 @@ pub fn peel_relay_envelope(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
     if payload.is_empty() {
         return None;
     }
-    Some((sender_key, payload))
+    Some((sender_key, payload, eggs, file_hash))
 }
 
 // ── the rustdesk stream frame ──
@@ -157,7 +151,7 @@ mod tests {
     use super::*;
     use crate::keys::derive_device_keypair;
 
-    fn kp(tag: u8) -> Keypair {
+    fn kp(tag: u8) -> crate::keys::Keypair {
         derive_device_keypair(&[tag; 16])
     }
 

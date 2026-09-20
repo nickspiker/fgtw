@@ -422,15 +422,14 @@ pub fn depart_device_consented<T: FgtwTransport>(
 // ── Binding-request registry (docs/pairing-v2.md): keyed per (hp, device), dual-signed at write, member-gated at read, author-withdrawn or stamp-lapsed — the worker NEVER consumes an entry. ──
 
 /// Build + POST a device-signed envelope (ke/ge header, canonical scheme) around `section` — the shape the worker's signature-gated ops verify.
-fn signed_req<T: FgtwTransport>(t: &T, device_key: &Keypair, section: vsf::VsfSection, what: &str) -> Result<FgtwResponse, String> {
+fn signed_req<T: FgtwTransport>(t: &T, device_key: &impl crate::pq::FleetSigner, section: vsf::VsfSection, what: &str) -> Result<FgtwResponse, String> {
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
-        .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
+        .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section_direct(section)
         .build()
         .map_err(|e| format!("{what} build: {e}"))?;
-    let signed = vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
-        .map_err(|e| format!("{what} sign: {e}"))?;
+    let signed = crate::pq::sign_envelope(unsigned, device_key).map_err(|e| format!("{what} sign: {e}"))?;
     t.post(signed)
 }
 
@@ -631,7 +630,7 @@ pub fn bindreq_list<T: FgtwTransport>(
 pub fn post_fanout<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     revision: u64,
     fleet_key: &[u8; 32],
     wraps: &[FanoutWrap],
@@ -641,15 +640,14 @@ pub fn post_fanout<T: FgtwTransport>(
     let epoch_pub = crate::pq::epoch_bundle(fleet_key).public();
     let mut section = vsf::VsfSection::new("fanout_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("bl", VsfType::ge(fanout_to_bytes(revision, &kfp, &device_key.public.to_bytes(), &epoch_pub, wraps)));
+    section.add_field("bl", VsfType::ge(fanout_to_bytes(revision, &kfp, &device_key.keypair().public.to_bytes(), &epoch_pub, wraps)));
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
-        .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
+        .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section_direct(section)
         .build()
         .map_err(|e| format!("fanout_put build: {e}"))?;
-    let signed = vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
-        .map_err(|e| format!("fanout_put sign: {e}"))?;
+    let signed = crate::pq::sign_envelope(unsigned, device_key).map_err(|e| format!("fanout_put sign: {e}"))?;
     let resp = t.post(signed)?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw fanout_put {reason}: {detail}"));
@@ -854,12 +852,12 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
 
 // ── Fleet state transport ──
 
-/// Publish the fleet-shared state (roster + settings layers): seal it under the fleet key and PUT it to the membership-gated slot. The envelope is device-signed (ke/ge header) so FGTW checks the writer against the folded fleet chain — any fleet device may write.
+/// Publish the fleet-shared state (roster + settings layers): seal it under the fleet key and PUT it to the membership-gated slot. The envelope is device-signed (ke/gm header, every scheme the writer holds at the envelope tier) so FGTW checks the writer against the folded fleet chain — any fleet device may write.
 pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     t: &T,
     s: &S,
     handle_proof: &[u8; 32],
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     fleet_key: &[u8; 32],
     state: &FleetState,
 ) -> Result<(), String> {
@@ -870,12 +868,11 @@ pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(vsf::eagle_time_oscillations())));
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
-        .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
+        .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section_direct(section)
         .build()
         .map_err(|e| format!("fstate_put build: {e}"))?;
-    let signed = vsf::verification::sign_file(unsigned, device_key.secret.as_bytes())
-        .map_err(|e| format!("fstate_put sign: {e}"))?;
+    let signed = crate::pq::sign_envelope(unsigned, device_key).map_err(|e| format!("fstate_put sign: {e}"))?;
     let resp = t.post(signed)?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw fstate_put {reason}: {detail}"));
