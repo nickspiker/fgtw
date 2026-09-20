@@ -494,23 +494,22 @@ pub fn eggs_ptr(blob: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new_derive_key(DOMAIN_EGGS).update(blob).finalize().as_bytes()
 }
 
-/// How a reader judges a record's eggs: which bundle verifies a given signer, and which schemes every egg list must cover.
-/// [`anchor_only`](Self::anchor_only) — Ed25519 from the key named in the record, nothing more required — is what a reader without the chain can apply, and is exactly the assurance the old inline signature gave. A reader holding the fold applies the chain's declared bundles at its floor, and a stripped list fails there.
+/// How a reader judges a record's eggs: for a given signer, which bundle verifies it and which schemes its egg list must cover — or `None` for the anchor alone (Ed25519 from the key named in the record, nothing more required).
+/// [`anchor_only`](Self::anchor_only) answers `None` for everyone; that is what a reader without the chain can apply, and is exactly the assurance the old inline signature gave. A reader holding the fold answers a current member with the chain's declared bundle at its floor (a stripped list fails there), and a signer it does not know — a device that has since departed, consenting to its own removal — with `None`.
 pub struct EggPolicy<'a> {
-    pub bundle_for: &'a dyn Fn(&[u8; 32]) -> Option<KeyBundle>,
-    pub required: scheme::Mask,
+    pub for_signer: &'a dyn Fn(&[u8; 32]) -> Option<(KeyBundle, scheme::Mask)>,
 }
 
-fn no_bundle(_: &[u8; 32]) -> Option<KeyBundle> {
+fn anchor(_: &[u8; 32]) -> Option<(KeyBundle, scheme::Mask)> {
     None
 }
 
 impl EggPolicy<'_> {
     pub fn anchor_only() -> EggPolicy<'static> {
-        EggPolicy { bundle_for: &no_bundle, required: scheme::MASK_BASE }
+        EggPolicy { for_signer: &anchor }
     }
-    fn bundle(&self, signer: &[u8; 32]) -> KeyBundle {
-        (self.bundle_for)(signer).unwrap_or_else(|| KeyBundle::ed25519_only(signer))
+    fn judge(&self, signer: &[u8; 32]) -> (KeyBundle, scheme::Mask) {
+        (self.for_signer)(signer).unwrap_or_else(|| (KeyBundle::ed25519_only(signer), scheme::MASK_BASE))
     }
 }
 
@@ -727,7 +726,8 @@ impl Record {
             return false;
         }
         let Some(lists) = eggs_blob_lists(blob, n_lists) else { return false };
-        crate::pq::verify_eggs(&lists[idx], &policy.bundle(signer), msg, policy.required)
+        let (bundle, required) = policy.judge(signer);
+        crate::pq::verify_eggs(&lists[idx], &bundle, msg, required)
     }
 
     /// Self-verifying: the device signed its own address, and the key it signed with is in the record.
@@ -1351,8 +1351,8 @@ mod tests {
         let hp = [5u8; 32];
         let all = full.mask();
         let (r, blob) = Record::sign_device_address(&dev, all, &hp, &[1u8; 16], 7953, &[2u8; 16], 42);
-        let bundle_for = |who: &[u8; 32]| (who == &full.ed25519()).then(|| full.clone());
-        let strict = EggPolicy { bundle_for: &bundle_for, required: all };
+        let for_signer = |who: &[u8; 32]| (who == &full.ed25519()).then(|| (full.clone(), all));
+        let strict = EggPolicy { for_signer: &for_signer };
         assert!(r.verify_address_with(&blob, &strict), "the full set verifies at the full floor");
         assert!(!r.verify_address(&blob), "anchor-only cannot verify eggs for schemes it holds no key for — every listed egg must verify");
 
