@@ -48,6 +48,16 @@ pub fn fanout_blob_epoch(bytes: &[u8]) -> Option<u64> {
     }
 }
 
+/// The fan-out's EPOCH PUBLIC BUNDLE, readable without the `fanout` feature: the keys a verifier checks a current-membership proof against. `None` for a pre-v3 blob or a malformed one. Layout: magic(3) ‖ version(1) ‖ revision(8) ‖ kfp(32) ‖ rotator(32) ‖ u16 BE len ‖ bundle.
+pub fn fanout_blob_epoch_pub(bytes: &[u8]) -> Option<pq::KeyBundle> {
+    if bytes.len() < 78 || &bytes[0..3] != b"PFO" || bytes[3] != 3 {
+        return None;
+    }
+    let n = u16::from_be_bytes([bytes[76], bytes[77]]) as usize;
+    let b = bytes.get(78..78 + n)?;
+    pq::KeyBundle::from_bytes(b).ok()
+}
+
 /// Per-member fan-out — sealing the fleet key to each current member's device key, and opening your own.
 /// A device recovers the current key by trial-decrypting its own wrap; a removed device just isn't a wrap target next epoch.
 /// The scoped-key-bundle / KEK-DEK generalisation (rotate keys, not data) grows from here — see `docs/fleet-vault-security.md` in photon.

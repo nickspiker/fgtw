@@ -244,7 +244,7 @@ impl FleetSigner for crate::keys::Keypair {
 }
 
 #[cfg(feature = "client")]
-pub use signing::SigningBundle;
+pub use signing::{epoch_bundle, SigningBundle};
 
 #[cfg(feature = "client")]
 mod signing {
@@ -303,6 +303,15 @@ mod signing {
             ])
             .expect("a derived bundle is well-formed by construction")
         }
+    }
+
+    /// The fleet's EPOCH signing bundle: the keys a member proves current, unlocked membership with — to a stateless verifier that holds nothing but the fan-out header.
+    ///
+    /// Derived from the fleet key under its own domain rather than wrapped as a second secret. Everyone holding the fleet key is, by definition, an unlocked member of the current epoch (the fan-out wraps it to exactly that set and re-mints on every lock or departure), so this adds no exposure and leaves the wrap format, `fanout_open` and every recovery path untouched. A locked device cannot open the re-minted key, so it cannot derive this bundle, so it cannot sign an epoch proof. That is what makes lock-out a HANDSHAKE fact and not merely a fan-out fact.
+    ///
+    /// The public half rides the fan-out header; members detect a tampered header by re-deriving and comparing.
+    pub fn epoch_bundle(fleet_key: &[u8; 32]) -> SigningBundle {
+        SigningBundle::derive(&blake3::derive_key("PHOTON_FLEET_EPOCH_SIGNING_v1", fleet_key))
     }
 
     impl FleetSigner for SigningBundle {

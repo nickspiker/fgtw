@@ -4,7 +4,7 @@
 //! ALL the protocol logic lives here (request framing, the `error`-frame reason rules, freshness + signature checks) — the app supplies only the raw HTTP and the roster AEAD, via [`FgtwTransport`] and [`FleetSealer`].
 //! So photon rides its warm-TLS connection pool and its own error-message UX, the calendar can use a different HTTP client, and this crate stays reqwest-free.
 
-use crate::fanout::{fanout_from_bytes, fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
+use crate::fanout::{fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
 use crate::fleet::{
     bindreq_signing_bytes, et_to_osc, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
 };
@@ -273,10 +273,8 @@ pub fn recover_fleet_key_with_epoch<T: FgtwTransport>(
     device_key: &Keypair,
     identity_seed: &[u8; 32],
 ) -> Result<Option<(u64, [u8; 32])>, String> {
-    match fetch_fanout(t, handle_proof) {
-        Ok(Some((revision, kfp, _rotator, wraps))) => {
-            Ok(fanout_open(handle_proof, &kfp, &wraps, device_key, identity_seed).map(|k| (revision, k)))
-        }
+    match fetch_fanout_full(t, handle_proof) {
+        Ok(Some(f)) => Ok(open_checked(&f, handle_proof, device_key, identity_seed)?.map(|k| (f.revision, k))),
         Ok(None) => Ok(None),
         Err(e) if e.starts_with("fanout:") => Ok(None),
         Err(e) => Err(e),
@@ -635,12 +633,15 @@ pub fn post_fanout<T: FgtwTransport>(
     handle_proof: &[u8; 32],
     device_key: &Keypair,
     revision: u64,
-    kfp: &[u8; 32],
+    fleet_key: &[u8; 32],
     wraps: &[FanoutWrap],
 ) -> Result<(), String> {
+    // The publisher holds the key (a mint just made it, a grow proved it against the stored fingerprint), so both header fields derive here: the fingerprint, and the epoch public bundle a stateless verifier will check membership proofs against.
+    let kfp = crate::fanout::fleet_key_fingerprint(fleet_key);
+    let epoch_pub = crate::pq::epoch_bundle(fleet_key).public();
     let mut section = vsf::VsfSection::new("fanout_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("bl", VsfType::ge(fanout_to_bytes(revision, kfp, &device_key.public.to_bytes(), wraps)));
+    section.add_field("bl", VsfType::ge(fanout_to_bytes(revision, &kfp, &device_key.public.to_bytes(), &epoch_pub, wraps)));
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
         .signed_only(VsfType::ke(device_key.public.to_bytes().to_vec()))
@@ -683,11 +684,8 @@ pub fn fetch_fanout_blob<T: FgtwTransport>(
     }
 }
 
-/// Fetch the current fan-out (revision + kfp + rotator + wraps), or None if none published yet. A pre-v2 blob fails the version gate inside `fanout_from_bytes` and surfaces as an error the publish path treats as absent (hard flag-day).
-pub fn fetch_fanout<T: FgtwTransport>(
-    t: &T,
-    handle_proof: &[u8; 32],
-) -> Result<Option<(u64, [u8; 32], [u8; 32], Vec<FanoutWrap>)>, String> {
+/// The served fan-out document, verbatim: the worker stores the signed `fanout_put` body it verified and echoes it back, so the envelope signature is still on it. `None` if none published yet.
+fn fetch_fanout_doc<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
     let mut section = vsf::VsfSection::new("fanout_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -700,11 +698,76 @@ pub fn fetch_fanout<T: FgtwTransport>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    let (_, stored) = parse_section(&resp.body)?;
-    match stored.get_field("bl").and_then(|f| f.values.first()) {
-        Some(VsfType::ge(b)) => Ok(Some(fanout_from_bytes(b)?)),
-        _ => Ok(None),
+    Ok(Some(resp.body))
+}
+
+/// The fan-out blob inside a served document.
+fn fanout_blob_of(doc: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (_, stored) = parse_section(doc)?;
+    Ok(match stored.get_field("bl").and_then(|f| f.values.first()) {
+        Some(VsfType::ge(b)) => Some(b.clone()),
+        _ => None,
+    })
+}
+
+/// Fetch the current fan-out in full (revision, kfp, rotator, epoch public bundle, wraps), or None if none published yet. A pre-v3 blob fails the version gate inside `fanout_from_bytes_full` and surfaces as an error the publish path treats as absent (hard flag-day).
+pub fn fetch_fanout_full<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<crate::fanout::Fanout>, String> {
+    match fetch_fanout_doc(t, handle_proof)? {
+        Some(doc) => match fanout_blob_of(&doc)? {
+            Some(b) => Ok(Some(crate::fanout::fanout_from_bytes_full(&b)?)),
+            None => Ok(None),
+        },
+        None => Ok(None),
     }
+}
+
+/// [`fetch_fanout_full`] as the `(revision, kfp, rotator, wraps)` view.
+pub fn fetch_fanout<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+) -> Result<Option<(u64, [u8; 32], [u8; 32], Vec<FanoutWrap>)>, String> {
+    Ok(fetch_fanout_full(t, handle_proof)?.map(|f| (f.revision, f.kfp, f.rotator_ed, f.wraps)))
+}
+
+/// Fetch the fan-out AND verify its provenance from public data alone — what a verifier that is NOT a member of the wrap set (a stateless host checking a guest's epoch proof) has to rely on.
+///
+/// The served document is the signed `fanout_put` the worker verified and stored; we re-check that signature, require the envelope's signer to be the blob's `rotator_ed`, and require that rotator to be in `members` (the caller's fold of the chain). Without this the epoch public bundle in the header would have no anchor: anyone who could plant a document in the slot could name their own verifying keys. Returns the parsed fan-out alongside the verified document bytes, which a caller may cache to repeat this check offline.
+pub fn fetch_fanout_verified<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32], members: &[[u8; 32]]) -> Result<Option<(crate::fanout::Fanout, Vec<u8>)>, String> {
+    let Some(doc) = fetch_fanout_doc(t, handle_proof)? else { return Ok(None) };
+    let f = verify_fanout_doc(&doc, members)?;
+    Ok(Some((f, doc)))
+}
+
+/// The provenance check behind [`fetch_fanout_verified`], on document bytes already in hand (a cached copy included).
+pub fn verify_fanout_doc(doc: &[u8], members: &[[u8; 32]]) -> Result<crate::fanout::Fanout, String> {
+    match vsf::verification::verify_file_signature(doc) {
+        Ok(true) => {}
+        Ok(false) => return Err("fanout: envelope signature invalid".into()),
+        Err(e) => return Err(format!("fanout: envelope unverifiable: {e}")),
+    }
+    let (header, _) = vsf::file_format::VsfHeader::decode(doc).map_err(|e| format!("fanout: header: {e}"))?;
+    let signer: [u8; 32] = match header.signer_pubkey {
+        Some(VsfType::ke(b)) if b.len() == 32 => b.as_slice().try_into().unwrap(),
+        _ => return Err("fanout: envelope has no signer".into()),
+    };
+    let blob = fanout_blob_of(doc)?.ok_or("fanout: document carries no blob")?;
+    let f = crate::fanout::fanout_from_bytes_full(&blob)?;
+    if signer != f.rotator_ed {
+        return Err("fanout: envelope signer is not the blob's rotator".into());
+    }
+    if !members.contains(&f.rotator_ed) {
+        return Err("fanout: rotator is not a current fleet member".into());
+    }
+    Ok(f)
+}
+
+/// Open a fan-out for this device and REFUSE a header whose epoch public bundle is not the one the recovered key derives — a member never trusts a header it cannot reproduce.
+fn open_checked(f: &crate::fanout::Fanout, handle_proof: &[u8; 32], device_key: &Keypair, identity_seed: &[u8; 32]) -> Result<Option<[u8; 32]>, String> {
+    let Some(k) = fanout_open(handle_proof, &f.kfp, &f.wraps, device_key, identity_seed) else { return Ok(None) };
+    if crate::pq::epoch_bundle(&k).public() != f.epoch_pub {
+        return Err("fanout: header epoch bundle does not match the fleet key — tampered header".into());
+    }
+    Ok(Some(k))
 }
 
 /// MINT the fleet key — genesis and SHRINK only (docs/fleet-key.md): fresh key, sealed to every ira in `members`, published at `stored_revision + 1`. A locked/departed device just isn't in `members`. The CALLER owns the atomic shrink duty (preserve-pull the fstate slot under the old key BEFORE calling this, re-seal it under the returned key immediately after).
@@ -722,9 +785,8 @@ pub fn mint_fleet_key<T: FgtwTransport>(
         .unwrap_or(0);
     let revision = current + 1;
     let key = new_fleet_key();
-    let kfp = crate::fanout::fleet_key_fingerprint(&key);
     let wraps = fanout_seal(handle_proof, &key, members, identity_seed)?;
-    post_fanout(t, handle_proof, device_key, revision, &kfp, &wraps)?;
+    post_fanout(t, handle_proof, device_key, revision, &key, &wraps)?;
     Ok((revision, key))
 }
 
@@ -745,7 +807,7 @@ pub fn grow_fleet_wraps<T: FgtwTransport>(
         return Err("fanout: held key is not the published key — grow refused (mint owns key changes)".into());
     }
     let wraps = fanout_seal(handle_proof, held_key, members, identity_seed)?;
-    post_fanout(t, handle_proof, device_key, revision + 1, &kfp, &wraps)?;
+    post_fanout(t, handle_proof, device_key, revision + 1, held_key, &wraps)?;
     Ok(revision + 1)
 }
 
@@ -757,10 +819,8 @@ pub fn recover_fleet_key<T: FgtwTransport>(
     identity_seed: &[u8; 32],
 ) -> Result<Option<[u8; 32]>, String> {
     // An unreadable (pre-v2) blob means "no key for us yet", NOT a transport failure: reporting it as an error made the establish fallback re-propagate it, so the device logged `fleet key sync failed` and stayed dark instead of establishing.
-    match fetch_fanout(t, handle_proof) {
-        Ok(Some((_, kfp, _rotator, wraps))) => {
-            Ok(fanout_open(handle_proof, &kfp, &wraps, device_key, identity_seed))
-        }
+    match fetch_fanout_full(t, handle_proof) {
+        Ok(Some(f)) => open_checked(&f, handle_proof, device_key, identity_seed),
         Ok(None) => Ok(None),
         Err(e) if e.starts_with("fanout:") => Ok(None),
         Err(e) => Err(e),
@@ -776,11 +836,9 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     device_key: &Keypair,
     identity_seed: &[u8; 32],
 ) -> Result<Option<[u8; 32]>, String> {
-    match fetch_fanout(t, handle_proof) {
-        Ok(Some((_, kfp, _rotator, wraps))) => {
-            Ok(fanout_open(handle_proof, &kfp, &wraps, device_key, identity_seed))
-        }
-        // Err = a pre-v2 blob (hard flag-day) — fall through to establish over it, same as absent.
+    match fetch_fanout_full(t, handle_proof) {
+        Ok(Some(f)) => open_checked(&f, handle_proof, device_key, identity_seed),
+        // Err = a pre-v3 blob (hard flag-day) — fall through to establish over it, same as absent.
         Ok(None) | Err(_) => {
             let members = current_members(t, handle_proof)?;
             if members.is_empty() {

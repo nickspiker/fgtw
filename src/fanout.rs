@@ -25,7 +25,7 @@ pub fn fleet_key_fingerprint(fleet_key: &[u8; 32]) -> [u8; 32] {
 // Version rides as a literal binary numeral, never an ASCII digit baked into the string (repo convention 2026-08-01).
 const FANOUT_DOMAIN_TEXT: &[u8] = b"PHOTON_FLEET_FANOUT_v";
 const FANOUT_MAGIC: &[u8; 3] = b"PFO";
-pub const FANOUT_VERSION: u8 = 2;
+pub const FANOUT_VERSION: u8 = 3;
 
 /// One sealed copy of the fleet key for one (unlabelled) member. `epk` is a per-wrap ephemeral X25519 public; `commit` binds the ciphertext to the exact derived key (KEY-COMMITTING — so a malicious member can't craft one `ct` that opens to different keys for two devices, the invisible-salamander split); `ct` is XChaCha20-Poly1305(fleet_key) under the hybrid-derived key. No recipient label — a device recomputes `commit` to find its own — so the slot carries only a count, never recipient pubkeys.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -158,14 +158,18 @@ pub fn fanout_open(
     None
 }
 
-/// Serialize a fan-out (revision + kfp + rotator + wraps) for the always-online slot. Opaque per-wrap ciphertext, so a plain length-framed layout; the envelope on the wire stays VSF. `revision` sits at the same offset as every prior version's epoch, so the worker's version-agnostic monotonic guard reads it unchanged. The rotator's device pubkey is public (it is in the membership chain).
-pub fn fanout_to_bytes(revision: u64, kfp: &[u8; 32], rotator_ed: &[u8; 32], wraps: &[FanoutWrap]) -> Vec<u8> {
+/// Serialize a fan-out (revision + kfp + rotator + epoch public bundle + wraps) for the always-online slot. Opaque per-wrap ciphertext, so a plain length-framed layout; the envelope on the wire stays VSF. `revision` sits at the same offset as every prior version's epoch, so the worker's version-agnostic monotonic guard reads it unchanged. The rotator's device pubkey is public (it is in the membership chain).
+pub fn fanout_to_bytes(revision: u64, kfp: &[u8; 32], rotator_ed: &[u8; 32], epoch_pub: &crate::pq::KeyBundle, wraps: &[FanoutWrap]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(FANOUT_MAGIC);
     out.push(FANOUT_VERSION);
     out.extend_from_slice(&revision.to_be_bytes());
     out.extend_from_slice(kfp);
     out.extend_from_slice(rotator_ed);
+    // v3: the epoch public bundle — what a verifier holding nothing but this header checks a current-membership proof against. Framed by length so a fourth scheme never moves the wrap count.
+    let ep = epoch_pub.to_bytes();
+    out.extend_from_slice(&(ep.len() as u16).to_be_bytes());
+    out.extend_from_slice(&ep);
     out.extend_from_slice(&(wraps.len() as u32).to_be_bytes());
     for w in wraps {
         out.extend_from_slice(&w.epk);
@@ -179,8 +183,24 @@ pub fn fanout_to_bytes(revision: u64, kfp: &[u8; 32], rotator_ed: &[u8; 32], wra
 // The version-agnostic revision reader lives at the crate root (`crate::fanout_blob_epoch`) because the WORKER needs it without compiling any fan-out crypto; re-exported so fan-out call sites read naturally.
 pub use crate::fanout_blob_epoch;
 
-/// Parse a fan-out blob. Bounds-checked — a truncated or corrupt blob fails rather than panicking. A pre-v2 blob fails the version gate and reads as an error the caller treats as absent — the first v2 publish steps OVER it (hard flag-day, no read-both), using [`fanout_blob_epoch`] to keep the revision monotonic across the boundary.
+/// A parsed fan-out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fanout {
+    pub revision: u64,
+    pub kfp: [u8; 32],
+    pub rotator_ed: [u8; 32],
+    /// The epoch public bundle from the header — see [`crate::pq::epoch_bundle`]. A member re-derives it from the key it recovers and refuses a header that disagrees.
+    pub epoch_pub: crate::pq::KeyBundle,
+    pub wraps: Vec<FanoutWrap>,
+}
+
+/// [`fanout_from_bytes_full`] as the `(revision, kfp, rotator, wraps)` view every pre-v3 caller reads.
 pub fn fanout_from_bytes(bytes: &[u8]) -> Result<(u64, [u8; 32], [u8; 32], Vec<FanoutWrap>), String> {
+    fanout_from_bytes_full(bytes).map(|f| (f.revision, f.kfp, f.rotator_ed, f.wraps))
+}
+
+/// Parse a fan-out blob. Bounds-checked — a truncated or corrupt blob fails rather than panicking. A pre-v3 blob fails the version gate and reads as an error the caller treats as absent — the first v3 publish steps OVER it (hard flag-day, no read-both), using [`fanout_blob_epoch`] to keep the revision monotonic across the boundary.
+pub fn fanout_from_bytes_full(bytes: &[u8]) -> Result<Fanout, String> {
     let mut p = 0usize;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
         if *p + n > bytes.len() {
@@ -199,6 +219,8 @@ pub fn fanout_from_bytes(bytes: &[u8]) -> Result<(u64, [u8; 32], [u8; 32], Vec<F
     let revision = u64::from_be_bytes(take(&mut p, 8)?.try_into().unwrap());
     let kfp: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
     let rotator_ed: [u8; 32] = take(&mut p, 32)?.try_into().unwrap();
+    let ep_len = u16::from_be_bytes(take(&mut p, 2)?.try_into().unwrap()) as usize;
+    let epoch_pub = crate::pq::KeyBundle::from_bytes(take(&mut p, ep_len)?).map_err(|e| format!("fanout: epoch bundle: {e}"))?;
     let count = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
     // A fleet is a person's devices — a four-figure count is adversarial. Reject before allocating/looping.
     if count > 1024 {
@@ -212,7 +234,7 @@ pub fn fanout_from_bytes(bytes: &[u8]) -> Result<(u64, [u8; 32], [u8; 32], Vec<F
         let ct = take(&mut p, ct_len)?.to_vec();
         wraps.push(FanoutWrap { epk, commit, ct });
     }
-    Ok((revision, kfp, rotator_ed, wraps))
+    Ok(Fanout { revision, kfp, rotator_ed, epoch_pub, wraps })
 }
 
 /// The shrink trigger (docs/fleet-key.md): a fan-out wrapping MORE iras than the desired set (fold minus locked) means a departed/locked member's wrap lingers — any surviving member mints, and the mint carries the fstate re-seal atomically.
@@ -283,8 +305,12 @@ mod tests {
         assert!(fanout_open(&[0x22u8; 32], &kfp, &wraps, &b, &seed).is_none());
         assert!(fanout_open(&hp, &[0xEEu8; 32], &wraps, &b, &seed).is_none());
         // Serialize round-trips (revision + kfp + rotator + wraps) and the recovered blob still opens.
-        let bytes = fanout_to_bytes(7, &kfp, &pk(&a), &wraps);
+        let ep = crate::pq::epoch_bundle(&fleet_key).public();
+        let bytes = fanout_to_bytes(7, &kfp, &pk(&a), &ep, &wraps);
         let (rev, got_kfp, got_rotator, back) = fanout_from_bytes(&bytes).unwrap();
+        // The header carries the epoch public bundle, and the base-feature reader sees it without the fan-out crypto.
+        assert_eq!(fanout_from_bytes_full(&bytes).unwrap().epoch_pub, ep);
+        assert_eq!(crate::fanout_blob_epoch_pub(&bytes), Some(ep.clone()));
         assert_eq!(rev, 7);
         assert_eq!(got_kfp, kfp);
         assert_eq!(got_rotator, pk(&a));
@@ -304,7 +330,7 @@ mod tests {
         let mut grown = wraps.clone();
         grown.extend(fanout_seal(&hp, &fleet_key, &[pk(&d)], &seed).unwrap());
         // The GROWER (d's sponsor could be any keyholder — here b) publishes; the blob rotator changes, and every wrap still opens because the rotator is unbound.
-        let grown_bytes = fanout_to_bytes(8, &kfp, &pk(&b), &grown);
+        let grown_bytes = fanout_to_bytes(8, &kfp, &pk(&b), &ep, &grown);
         let (_, gk, _gr, gw) = fanout_from_bytes(&grown_bytes).unwrap();
         assert_eq!(fanout_open(&hp, &gk, &gw, &b, &seed).unwrap(), fleet_key, "pre-grow wrap survives the grow");
         assert_eq!(fanout_open(&hp, &gk, &gw, &d, &seed).unwrap(), fleet_key, "the added ira opens its new wrap");
@@ -320,9 +346,10 @@ mod tests {
         let mut loword = wraps.clone();
         loword[0].epk = [0u8; 32];
         assert!(fanout_open(&hp, &kfp, &loword[..1], &a, &seed).is_none());
-        // Wrap-count sanity: an implausible count is rejected before allocation (count sits after magic+ver+revision+kfp+rotator).
-        let mut huge = fanout_to_bytes(7, &kfp, &pk(&a), &wraps);
-        huge[76..80].copy_from_slice(&2000u32.to_be_bytes());
+        // Wrap-count sanity: an implausible count is rejected before allocation (count sits after magic+ver+revision+kfp+rotator+epoch bundle).
+        let mut huge = fanout_to_bytes(7, &kfp, &pk(&a), &ep, &wraps);
+        let count_at = 76 + 2 + ep.to_bytes().len();
+        huge[count_at..count_at + 4].copy_from_slice(&2000u32.to_be_bytes());
         assert!(fanout_from_bytes(&huge).is_err());
     }
 
