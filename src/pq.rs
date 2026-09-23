@@ -207,12 +207,27 @@ pub fn sign_envelope(unsigned: Vec<u8>, signer: &(impl FleetSigner + ?Sized)) ->
 }
 
 /// Verify a signed VSF document's header eggs against the signer's declared `bundle`, requiring `required` — the policy half that vsf leaves to us. vsf has already checked the Ed25519 anchor; this checks the rest and that nothing required is missing. Returns the signer's device key.
+/// The ENVELOPE rule, one step looser than [`verify_eggs`]: every egg for a scheme the bundle HAS must verify, and those verified eggs must cover `required`; an egg for a scheme the bundle lacks is skipped, not fatal.
+///
+/// Why the difference (field 2026-09-23): a device signs envelopes with everything it holds, but the chain only knows what it has DECLARED — and the Declare itself travels in an envelope. Under the strict rule a fresh phone with a bundle sent Ed25519 + Falcon, the worker verified against the Ed25519-only bundle the chain held, hit the Falcon egg, failed closed, and the phone could never attest, never declare, never get in. An egg nobody can check is noise, not a forgery: it proves nothing and it is not counted toward coverage, so ignoring it weakens no gate. Chain ops keep the strict rule — a fold sees the whole history and knows exactly which keys apply.
+pub fn verify_eggs_declared(eggs: &[Egg], bundle: &KeyBundle, msg: &[u8], required: scheme::Mask) -> bool {
+    let mut verified: scheme::Mask = 0;
+    for e in eggs {
+        let Some(pk) = bundle.pubkey(e.scheme) else { continue };
+        if !verify_egg(e.scheme, pk, msg, &e.sig) {
+            return false;
+        }
+        verified |= 1 << e.scheme;
+    }
+    verified != 0 && scheme::covers(verified, required)
+}
+
 pub fn verify_envelope(doc: &[u8], bundle: &KeyBundle, required: scheme::Mask) -> Result<[u8; 32], String> {
     let (signer, eggs, file_hash) = vsf::verification::header_eggs(doc)?;
     if bundle.ed25519() != signer {
         return Err("envelope: bundle is not the signer's".into());
     }
-    if !verify_eggs(&eggs, bundle, &file_hash, required) {
+    if !verify_eggs_declared(&eggs, bundle, &file_hash, required) {
         return Err("envelope: eggs do not verify at the required tier".into());
     }
     Ok(signer)
@@ -453,5 +468,30 @@ mod tests {
         }
         // Deterministic: re-signing the same message yields byte-identical eggs.
         assert_eq!(a.eggs(msg, scheme::MASK_ALL), eggs);
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod declared_rule {
+    use super::*;
+    use crate::fleet::scheme;
+
+    /// A device with a bundle the chain has not seen signs with everything it holds; the verifier checks what it can, ignores what it cannot, and the floor still binds.
+    #[test]
+    fn undeclared_eggs_are_noise_not_forgery() {
+        let dev = SigningBundle::derive(b"fresh-phone");
+        let msg = b"hello";
+        let eggs = dev.eggs(msg, scheme::MASK_ALL);
+        let chain_knows = KeyBundle::ed25519_only(&dev.keypair().public.to_bytes());
+        assert!(!verify_eggs(&eggs, &chain_knows, msg, scheme::MASK_BASE), "the strict rule fails closed on the Falcon egg");
+        assert!(verify_eggs_declared(&eggs, &chain_knows, msg, scheme::MASK_BASE), "the envelope rule verifies the anchor and skips the rest");
+        assert!(!verify_eggs_declared(&eggs, &chain_knows, msg, scheme::MASK_ALL), "but an undeclared egg never counts toward the floor");
+        // A verifiable egg that is WRONG is still fatal.
+        let mut bad = eggs.clone();
+        bad[0].sig[3] ^= 1;
+        assert!(!verify_eggs_declared(&bad, &chain_knows, msg, scheme::MASK_BASE));
+        // Once declared, the full bundle verifies everything and the full floor is met.
+        assert!(verify_eggs_declared(&eggs, &dev.public(), msg, scheme::MASK_ALL));
+        assert!(!verify_eggs_declared(&[], &chain_knows, msg, scheme::MASK_BASE), "nothing verified is not coverage");
     }
 }
