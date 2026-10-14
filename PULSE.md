@@ -77,15 +77,15 @@ A contribution is a VSF record:
 | `commit` | the 32-byte commitment being anchored |
 | `stamp` | its claimed instant, `u64` oscillations |
 | `unc` | the uncertainty of that claim, in oscillations (as tukutahi marks carry `unc_ns`) |
-| `signer` | the signing key (see Privacy) |
-| `sig` | an egg list over the record (`vsf::eggs`, multi-scheme) |
+| `tag` | the contributor's anonymous tag for this window and slot (see Anti-spam) |
+| `proof` | the credential proof, bound to the record's hash; it is the record's signature |
 
 A stamp outside the window being reconciled, beyond its uncertainty, is refused, and so is a stamp in the future of the receiving node (its local floor, as `PeerRecord.local_seen` floors `last_seen`, `photon/src/network/fgtw/protocol.rs:180-190`).
 
-Its **key** is the stamp followed by `spaghettify(DOMAIN_CONTRIB ‖ commit ‖ signer)`: the stamp places it in time, the hash separates contributions at the same instant, and two signers anchoring the same commitment are two leaves.
-The leaf value is the hash of the full record, so the signature is committed too.
+Its **key** is the stamp followed by `spaghettify(DOMAIN_CONTRIB ‖ commit ‖ tag)`: the stamp places it in time, the hash separates contributions at the same instant, and two contributors anchoring the same commitment are two leaves.
+The leaf value is the hash of the full record, so the proof is committed too.
 
-**Batching.** A device contributes at most one record per window: the Merkle root of every event it wants anchored in that window (photos, message heads, fleet ops), stamped with the window's last event.
+**Batching.** A device contributes one record per window (it holds two slots, the second a buffer; see Anti-spam): the Merkle root of every event it wants anchored in that window (photos, message heads, fleet ops), stamped with the window's last event.
 That bounds load, hides how many events a device had, and gives each event an inclusion path of two parts: event → device batch root, batch root → time tree.
 lumis's run chain fits the same shape: one contribution for a whole offline run, the run's Merkle root, made when the device reconnects.
 
@@ -142,7 +142,7 @@ So the layering is: fine time and order from local chains, at whatever resolutio
 
 ## Dispersion
 
-Contributions spread by gossip, deduplicated by contribution key, rate-limited per signer.
+Contributions spread by gossip, deduplicated by contribution key, limited per tag (see Anti-spam).
 **Pulse gossip is open**, by the phonebook doctrine (`photon/docs/peers-are-fgtw.md:14`), unlike today's contact-gated gossip (`photon/src/network/status.rs:3938-3944`), which stays as it is for everything else.
 
 During the grace period nodes reconcile their sets for the closing window:
@@ -197,9 +197,44 @@ That gives sampling the age signal it lacks, for every fleet created after the p
 From the constraints the stack already holds (`photon/docs/braid.md`, `lanes.md:28`, `keyring.md`, `lumis/docs/provenance.md:151-157`):
 
 - **Never contribute raw identifiers or values.** A commitment is `spaghettify(salt ‖ tag ‖ value)` with the salt kept by its owner and revealed only for disclosure.
-- **Do not sign with a raw device key.** Per-window signing keys derived unlinkably from the device secret, so contributions do not reveal which devices are active or how many a fleet has; the owner proves authorship later by revealing the derivation.
-- **Batch per device per window**, which hides event counts; optional cover contributions in idle windows hide activity itself, at a cost to be measured.
-- Anti-spam without identity: open decision (see below).
+- **Do not sign with a raw device key.** A contribution carries an anonymous per-window tag and a credential proof (Anti-spam), so contributions do not reveal which devices are active or how many a fleet has; the owner proves authorship later by showing the tag's derivation.
+- **Batch per device per window**, which hides event counts. Idle devices contribute nothing (no cover traffic).
+
+## Anti-spam
+
+Decided 2026-10-12. The requirements: a cap per device that is cheap for honest devices, no identity in the pulse, no proof of work (no battery cost for watches and phones), and nothing that expires in the user's face.
+
+**The cap.** Each enrolled device may place two contributions per window; the rest are dropped. Selection is deterministic: among records carrying the same tag, the one with the lowest key is kept once the window is reconciled. "First to arrive" would not do, because arrival order differs from node to node and would give different nodes different trees. Honest devices batch a window into one contribution (Contributions), so the second slot is a buffer for a resend.
+
+**The credential.** Periodic n-times anonymous authentication with n = 2 (Camenisch, Hohenberger, Kohlweiss, Lysyanskaya, Meyerovich, "How to win the clone wars", CCS 2006):
+
+- Each renewal period `p` the device holds a fresh secret `s_p` and obtains a blind credential on it from the committee (below), which checks the device's fleet membership and learns nothing of `s_p`. BBS signatures (IETF draft) are the candidate credential.
+- Each contribution carries `tag = PRF(s_p, window ‖ slot)`, slot 0 or 1, and a proof that the tag comes from a credentialed secret, bound to the record's hash so it doubles as the record's signature. The PRF is Dodis–Yampolskiy as in the paper: a few elliptic-curve multiplications per contribution, no SNARK.
+- Tags from different windows cannot be linked to each other or to the device.
+- The same tag on two *different* records reveals `s_p`: each proof includes a value linear in a challenge derived from its record, and two challenges solve for the secret. An identical resend is identical bytes, deduplicates, and reveals nothing.
+- Spent state lasts one window: nodes keep the current window's tags and drop them at finalization. Nothing accumulates.
+
+**A reveal costs one period.** Overuse exposes `s_p`, the current period's secret, never anything longer lived. With `s_p` public, every node computes that credential's remaining tags and refuses them at ingress until the period ends. That protects bandwidth; the cap alone already keeps the excess out of the tree. Renewal is limited to one per device per period, so a ban cannot be shed early.
+
+**The device's counter.** Before a contribution leaves the device, the device durably records the window, the slot and the exact record bytes, then sends; any resend sends those bytes. An honest device therefore never puts two different records under one tag, even across a crash. The counter only matters inside the current window, so restoring an old backup cannot collide with it.
+
+**Clones, and PIPE.** The one remaining honest path to a reveal is two devices running the same stored credential, such as a backup restored onto a second phone. PIPE closes it: `s_p = BLAKE3("fgtw-pulse/credential" ‖ ira ‖ p)` is derived inside the enclave from the device's write-once `ira`, which never leaves it ([`../PIPE/IRA.md`](../PIPE/IRA.md): every key derives from `ira` by domain-separated BLAKE3), so a backup carries no credential secret and a second device cannot run one. That requires every computation touching `s_p` (the tag and the secret-dependent part of the proof) to run inside PIPE, which today derives with BLAKE3 only: a gap below. On devices without PIPE a clone costs at most the current period.
+
+**No device revocation.** A credential grants a quota, not authority: its holder can place two anonymous contributions per window, cannot move anything in time, and speaks for nobody. The invariant that keeps this true: **nothing may trust a contribution because of its credential.** Revoking a device's signing keys stays as in Revocation.
+
+**The committee.** It issues and renews credentials, and only that: it works once per device per period, never per contribution.
+
+- Chosen for each key period by the beacon with the sampling rule (256 candidates, the first 42; Root answers and sampling), weighted by fleet age. The beacon cannot be predicted, so the committee cannot be ground.
+- It runs a distributed key generation, so the period has one public key that nobody holds whole, and any `t` of its `n` members issue together: threshold blind BLS (Boldyreva 2003), or Coconut (Sonnino et al., NDSS 2019) where public attributes are wanted. One key means a credential reveals nothing about which members signed it, and the device cannot choose its issuers: the beacon fixes the committee and the key generation fixes the key. Prior art: drand runs this kind of committee for threshold BLS randomness; Nym runs Coconut issuance.
+- Each member gives one share per device per period. A credential needs `t` shares, so with `t > n/2` a device shopping across subsets still gets one credential; with `c` colluding members it gets at most `(n − c)/(t − c)`.
+
+**Keys retire.** Proactive re-sharing hands fresh shares to each new committee, but it cannot stop `t` members of one period who kept their shares from rebuilding that period's key, years later when they have nothing at stake. So keys retire: a credential is valid under the current key and, during an overlap, the previous one; devices renew automatically whenever they are online, and each renewal is a fresh blind credential, unlinkable to the last. Retirement also kills any credentials hoarded through repeated enrolment.
+
+**The issuance counter.** The committee contributes each period's issuance count to the pulse. Each credential yields at most two tags per window, so a window with more than twice that many distinct tags under one key proves someone minted extra credentials; the key then retires early and devices renew. This is detection, not prevention: a few quietly minted credentials hide in the slack (not every device contributes every window), but minting enough to matter trips it.
+
+The residual risk is a small colluding committee minting a little, kept small by a larger `t` and by committees drawn across many fleets. It is the trust every threshold system makes, here with a tripwire on it.
+
+**Rejected:** proof of work (battery cost on small devices); single-use blind tokens (the spent-serial list grows with token lifetime, and short lifetimes let issuers link a fetch to its spend by timing); signing with named device keys (publishes when each device is active); RLN (SNARK proofs, about a second on a phone).
 
 ## Wiring into this crate
 
@@ -253,26 +288,29 @@ Sampling weights the worker like any other answer, so the network does not depen
 | vsf `eggs.rs` | multi-scheme signatures | contribution and answer signatures |
 | nunc | diversity-weighted, nonce-seeded sampler | Sybil weighting |
 | worker | signed challenge, `PeerUpdateHub`, R2 | transition node |
+| PIPE `IRA.md` | write-once `ira`, domain-separated BLAKE3 derivation | per-period credential secrets that cannot be cloned |
 
 ## Gaps to build
 
 0. The time tree: binary levels over stamps, compressed window subtrees, inclusion and non-inclusion proofs, incremental update.
 1. Window closing and acceptance rules.
-2. Open contribution gossip with dedup and per-signer rate limits.
+2. Open contribution gossip with dedup and the two-per-tag cap.
 3. Set reconciliation: LtHash digest plus a sketch that locates differences.
 4. The `PulseMessage` family: contributions, root requests and answers, proof requests.
 5. Peer sampling with weighting (moves `peer_store` and the DHT into the crate).
 6. The worker's window closer on a Durable Object alarm.
-7. Unlinkable per-window signing keys and the contribution privacy rules.
+7. Pulse credentials: BBS credential, Dodis–Yampolskiy tags and proofs, the reveal, the device's counter, renewal; the contribution privacy rules.
 8. Optional ingestion of external beacons (drand, NIST) as extra not-before sources.
+9. The committee: beacon selection, distributed key generation, threshold blind issuance, key retirement and the issuance-count tripwire.
+10. PIPE: computing tags and the secret-dependent part of the proof inside the enclave, or a credential whose secret-dependent part is BLAKE3 only.
 
-Suggested order: 0 and 1 (pure, testable in core), then 4 and 6 (the worker as sole closer, so apps can start contributing), then 2, 3 and 5 (peers close windows too and the worker becomes one witness among many), with 7 before any app contributes real user events.
+Suggested order: 0 and 1 (pure, testable in core), then 4 and 6 (the worker as sole closer, so apps can start contributing), then 2, 3 and 5 (peers close windows too and the worker becomes one witness among many), with 7 and 9 before any app contributes real user events.
 
 ## Open decisions
 
-- **Window level.** 2³⁶ (≈ 48 s) is proposed, 2³⁷ (≈ 97 s) the alternative; it can change later without touching the tree or existing proofs.
-- **Anti-spam.** Contributions must be cheap for real devices and expensive in bulk, without revealing who contributed: a per-window proof of work, a fleet-membership token, or rate limits by network origin.
+- **Window level: decided 2026-10-12, 2³⁶ (≈ 48 s).** It can change later without touching the tree or existing proofs.
+- **Anti-spam: decided 2026-10-12** (see Anti-spam): two per window per device, anonymous tags from periodic credentials, period-scoped reveals, no device revocation, a beacon-chosen threshold committee, retiring keys. Still open: the key period (a year suggested), the renewal period, the overlap, and the committee's `n` and `t`.
 - **Leaf retention.** 30 days proposed.
-- **Cover contributions.** Whether devices contribute in idle windows to hide activity, and at what cost.
+- **Cover contributions: decided 2026-10-12, none.** Idle devices stay silent: no CPU or network spent on proofs nobody wants.
 - **Transition.** Whether the worker closes windows alone at first, and when peers take over.
 - **The patent appendix.** Whether to update `fgtw_proofs.tex` to define `M_n(t−1)` as the chained window root.
