@@ -203,6 +203,7 @@ const DA_PORT: usize = 81; // ..83   u16 LE
 const DA_LOCAL_IP: usize = 83; // ..99
 const DA_TIMESTAMP: usize = 99; // ..107  i64 LE eagle-time; the monotonic guard for address replay
 const DA_EGGS: usize = 107; // ..139  pointer to the device's own eggs
+const DA_LOCAL_PORT: usize = 139; // ..141  u16 LE: the port the device LISTENS on at `local_ip` (2026-10-15); 0 = not stated (records minted before it). The public `port` is the NAT's mapping and says nothing about the LAN side — a LAN candidate built from it could never connect.
 
 // The epoch offsets are the same as the single-signature layout's, so a stored v1 record still reads its epoch correctly and the slot's monotonic guard lets a v2 write replace it; its verification fails (no blob hashes to a 64-byte signature), which every reader treats as absence.
 
@@ -342,12 +343,14 @@ impl Record {
 
     // ── DeviceAddress ──
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_device_address(
         device_pubkey: &[u8; 32],
         handle_proof: &[u8; 32],
         ip: &[u8; 16],
         port: u16,
         local_ip: &[u8; 16],
+        local_port: u16,
         timestamp: i64,
         eggs_ptr: &[u8; 32],
     ) -> Self {
@@ -358,6 +361,7 @@ impl Record {
         b[DA_IP..DA_IP + 16].copy_from_slice(ip);
         b[DA_PORT..DA_PORT + 2].copy_from_slice(&port.to_le_bytes());
         b[DA_LOCAL_IP..DA_LOCAL_IP + 16].copy_from_slice(local_ip);
+        b[DA_LOCAL_PORT..DA_LOCAL_PORT + 2].copy_from_slice(&local_port.to_le_bytes());
         b[DA_TIMESTAMP..DA_TIMESTAMP + 8].copy_from_slice(&timestamp.to_le_bytes());
         b[DA_EGGS..DA_EGGS + 32].copy_from_slice(eggs_ptr);
         Record(b)
@@ -367,6 +371,7 @@ impl Record {
     /// The two-step dance is easy to get subtly wrong at a call site (sign the wrong bytes, or sign before a field is final and ship a record that cannot verify), and an address record that fails verification is silently dropped by every reader — so the mistake is invisible until nobody can be found.
     /// Doing it here once means a caller cannot express the broken version.
     /// `mask` is what the chain knows this device can sign with (its declared set) — an egg for an undeclared scheme fails closed at every verifier.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_device_address(
         signer: &impl FleetSigner,
         mask: scheme::Mask,
@@ -374,13 +379,14 @@ impl Record {
         ip: &[u8; 16],
         port: u16,
         local_ip: &[u8; 16],
+        local_port: u16,
         timestamp: i64,
     ) -> (Self, Vec<u8>) {
         let device_pubkey = signer.keypair().public.to_bytes();
-        let unsigned = Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &[0u8; 32]);
+        let unsigned = Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, local_port, timestamp, &[0u8; 32]);
         let eggs = signer.eggs(&unsigned.address_signing_bytes(), mask);
         let blob = eggs_blob(&[&eggs]);
-        (Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, timestamp, &eggs_ptr(&blob)), blob)
+        (Self::new_device_address(&device_pubkey, handle_proof, ip, port, local_ip, local_port, timestamp, &eggs_ptr(&blob)), blob)
     }
 
     pub fn handle_proof(&self) -> [u8; 32] {
@@ -396,6 +402,10 @@ impl Record {
     }
     pub fn port(&self) -> u16 {
         u16::from_le_bytes(self.0[DA_PORT..DA_PORT + 2].try_into().unwrap())
+    }
+    /// The port the device listens on at its LAN address; 0 = not stated (a record minted before 2026-10-15).
+    pub fn local_port(&self) -> u16 {
+        u16::from_le_bytes(self.0[DA_LOCAL_PORT..DA_LOCAL_PORT + 2].try_into().unwrap())
     }
     pub fn local_ip(&self) -> [u8; 16] {
         let mut o = [0u8; 16];
@@ -413,6 +423,12 @@ impl Record {
         v.extend_from_slice(&self.port().to_le_bytes());
         v.extend_from_slice(&self.local_ip());
         v.extend_from_slice(&self.epoch().to_le_bytes());
+        // The LAN port is covered only when stated: a record minted before the field (0 there) signs and verifies exactly as it always did, so the registry and every updated reader accept both.
+        let lp = self.local_port();
+        if lp != 0 {
+            v.extend_from_slice(b"local_port");
+            v.extend_from_slice(&lp.to_le_bytes());
+        }
         v
     }
 
@@ -1196,7 +1212,7 @@ mod tests {
     fn signing_bytes_are_domain_separated() {
         let hp = [1u8; 32];
         let p = Record::new_device_pointer(&hp, 0, &[2u8; 32], 5, &[3u8; 32], &[0u8; 32]);
-        let a = Record::new_device_address(&[2u8; 32], &hp, &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 32]);
+        let a = Record::new_device_address(&[2u8; 32], &hp, &[0u8; 16], 80, &[0u8; 16], 0, 5, &[0u8; 32]);
         let c = Record::new_identity_count(&hp, 3, 5, &[3u8; 32], None, &[0u8; 32]);
 
         assert!(p.placement_signing_bytes().starts_with(SIGN_PLACEMENT));
@@ -1205,7 +1221,7 @@ mod tests {
         assert!(Record::departure_signing_bytes(&hp, &[2u8; 32], 5).starts_with(SIGN_DEPART));
 
         // The address signature covers handle_proof, so a device cannot be planted under another identity — the gap that lets a stranger mint a row for any scraped handle_proof today.
-        let other = Record::new_device_address(&[2u8; 32], &[9u8; 32], &[0u8; 16], 80, &[0u8; 16], 5, &[0u8; 32]);
+        let other = Record::new_device_address(&[2u8; 32], &[9u8; 32], &[0u8; 16], 80, &[0u8; 16], 0, 5, &[0u8; 32]);
         assert_ne!(a.address_signing_bytes(), other.address_signing_bytes());
     }
 
@@ -1268,18 +1284,34 @@ mod tests {
     }
     const B: scheme::Mask = scheme::MASK_BASE;
 
+    /// THE LAN PORT (2026-10-15): stated, it is signed — a tampered port does not verify; unstated (0), the record signs byte-for-byte as it did before the field, so a registry and readers built with this crate accept both generations.
+    #[test]
+    fn the_lan_port_is_signed_when_stated_and_old_records_still_verify() {
+        let dev = kp(1);
+        let hp = [7u8; 32];
+        let (r, blob) = Record::sign_device_address(&dev, B, &hp, &[1u8; 16], 49189, &[2u8; 16], 4383, 42);
+        assert!(r.verify_address(&blob));
+        assert_eq!(r.local_port(), 4383);
+        let ptr = eggs_ptr(&blob);
+        let moved = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 49189, &[2u8; 16], 4384, 42, &ptr);
+        assert!(!moved.verify_address(&blob), "a changed LAN port must not verify");
+        let (old, old_blob) = Record::sign_device_address(&dev, B, &hp, &[1u8; 16], 49189, &[2u8; 16], 0, 42);
+        assert!(old.verify_address(&old_blob));
+        assert!(!old.address_signing_bytes().windows(10).any(|w| w == b"local_port"), "an unstated port adds nothing to the signed bytes");
+    }
+
     /// The one-step mint must produce exactly what the hand-rolled two-step produces, and must verify.
     /// This is the helper the client publishes through, so a regression here is an unfindable device rather than a visible error.
     #[test]
     fn sign_device_address_mints_a_verifying_record() {
         let dev = kp(3);
         let hp = [8u8; 32];
-        let (minted, blob) = Record::sign_device_address(&dev, B, &hp, &[4u8; 16], 4383, &[5u8; 16], 99);
+        let (minted, blob) = Record::sign_device_address(&dev, B, &hp, &[4u8; 16], 4383, &[5u8; 16], 0, 99);
         assert!(minted.verify_address(&blob), "a minted record must verify");
 
-        let unsigned = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 99, &[0u8; 32]);
+        let unsigned = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 0, 99, &[0u8; 32]);
         let (blob2, ptr) = blob_for(&dev, &unsigned.address_signing_bytes());
-        let expected = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 99, &ptr);
+        let expected = Record::new_device_address(&pk(&dev), &hp, &[4u8; 16], 4383, &[5u8; 16], 0, 99, &ptr);
         assert_eq!(minted.0, expected.0, "the one-step mint must equal the two-step");
         assert_eq!(blob, blob2);
         assert_eq!(minted.key(), Some(key_address(&pk(&dev))), "keyed by device pubkey alone");
@@ -1290,7 +1322,7 @@ mod tests {
     #[test]
     fn address_record_survives_a_raw_stride_round_trip() {
         let dev = kp(4);
-        let (r, blob) = Record::sign_device_address(&dev, B, &[2u8; 32], &[7u8; 16], 4383, &[6u8; 16], 1234);
+        let (r, blob) = Record::sign_device_address(&dev, B, &[2u8; 32], &[7u8; 16], 4383, &[6u8; 16], 0, 1234);
 
         let wire: Vec<u8> = r.0.to_vec();
         assert_eq!(wire.len(), STRIDE, "the wire form is exactly one stride");
@@ -1310,18 +1342,18 @@ mod tests {
     fn address_record_self_verifies_and_detects_tampering() {
         let dev = kp(1);
         let hp = [5u8; 32];
-        let (r, blob) = Record::sign_device_address(&dev, B, &hp, &[1u8; 16], 7953, &[2u8; 16], 42);
+        let (r, blob) = Record::sign_device_address(&dev, B, &hp, &[1u8; 16], 7953, &[2u8; 16], 0, 42);
         let ptr = r.eggs_ptr();
         assert!(r.verify_address(&blob), "a correctly signed address must verify");
 
         // Every covered field: flip it, the eggs must fail.
-        let bad_ip = Record::new_device_address(&pk(&dev), &hp, &[9u8; 16], 7953, &[2u8; 16], 42, &ptr);
+        let bad_ip = Record::new_device_address(&pk(&dev), &hp, &[9u8; 16], 7953, &[2u8; 16], 0, 42, &ptr);
         assert!(!bad_ip.verify_address(&blob), "a redirected IP must not verify");
-        let bad_port = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 1, &[2u8; 16], 42, &ptr);
+        let bad_port = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 1, &[2u8; 16], 0, 42, &ptr);
         assert!(!bad_port.verify_address(&blob), "a changed port must not verify");
-        let bad_ts = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 43, &ptr);
+        let bad_ts = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 0, 43, &ptr);
         assert!(!bad_ts.verify_address(&blob), "a replayed timestamp must not verify");
-        let bad_hp = Record::new_device_address(&pk(&dev), &[6u8; 32], &[1u8; 16], 7953, &[2u8; 16], 42, &ptr);
+        let bad_hp = Record::new_device_address(&pk(&dev), &[6u8; 32], &[1u8; 16], 7953, &[2u8; 16], 0, 42, &ptr);
         assert!(!bad_hp.verify_address(&blob), "planting the device under another identity must not verify");
 
         // The blob must be THE blob: a byte flipped, a truncation, or a different (even valid) blob fails the pointer.
@@ -1338,7 +1370,7 @@ mod tests {
         // Another device cannot sign this device's row.
         let attacker = kp(2);
         let (forged, fptr) = blob_for(&attacker, &r.address_signing_bytes());
-        let bad_key = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 42, &fptr);
+        let bad_key = Record::new_device_address(&pk(&dev), &hp, &[1u8; 16], 7953, &[2u8; 16], 0, 42, &fptr);
         assert!(!bad_key.verify_address(&forged), "eggs by another key must not verify");
     }
 
@@ -1350,13 +1382,13 @@ mod tests {
         let full = dev.public();
         let hp = [5u8; 32];
         let all = full.mask();
-        let (r, blob) = Record::sign_device_address(&dev, all, &hp, &[1u8; 16], 7953, &[2u8; 16], 42);
+        let (r, blob) = Record::sign_device_address(&dev, all, &hp, &[1u8; 16], 7953, &[2u8; 16], 0, 42);
         let for_signer = |who: &[u8; 32]| (who == &full.ed25519()).then(|| (full.clone(), all));
         let strict = EggPolicy { for_signer: &for_signer };
         assert!(r.verify_address_with(&blob, &strict), "the full set verifies at the full floor");
         assert!(!r.verify_address(&blob), "anchor-only cannot verify eggs for schemes it holds no key for — every listed egg must verify");
 
-        let (short, short_blob) = Record::sign_device_address(dev.keypair(), B, &hp, &[1u8; 16], 7953, &[2u8; 16], 43);
+        let (short, short_blob) = Record::sign_device_address(dev.keypair(), B, &hp, &[1u8; 16], 7953, &[2u8; 16], 0, 43);
         assert!(short.verify_address(&short_blob), "Ed25519 alone is fine below the floor");
         assert!(!short.verify_address_with(&short_blob, &strict), "and a stripped list fails at it");
     }
