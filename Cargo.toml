@@ -30,7 +30,7 @@ client = ["fanout", "dep:fn-dsa", "fips205/default-rng"]
 
 [dependencies]
 # vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.
-vsf = { version = "0.10", path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
+vsf = { version = "0.11", path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
 blake3 = { version = "1", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 # The two post-quantum egg families, VERIFY side — base, because the worker folds chains with the same code clients sign with. Both pure Rust, no build.rs, no C. `fn-dsa-vrfy` is the verify-only crate and declares no RNG; fips205 needs none to verify, so `default-rng` (which is what drags in getrandom) stays off here and is enabled by `client`.
