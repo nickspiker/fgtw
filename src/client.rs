@@ -954,6 +954,25 @@ pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
 mod tests {
     use super::*;
 
+    /// Emma, 2026-10-17: a device holding every scheme posted a ~10 KB request into a 4096-byte cap and could never join. Build the real body a full-bundle joiner sends and hold it under the worker's cap.
+    #[test]
+    fn a_full_bundle_bindreq_fits_the_worker_cap() {
+        struct Capture(std::cell::RefCell<Vec<u8>>);
+        impl FgtwTransport for Capture {
+            fn post(&self, body: Vec<u8>) -> Result<FgtwResponse, String> {
+                *self.0.borrow_mut() = body;
+                Ok(FgtwResponse { status: 500, body: Vec::new() })
+            }
+        }
+        let t = Capture(std::cell::RefCell::new(Vec::new()));
+        let device = crate::pq::SigningBundle::derive(b"a joiner with every scheme");
+        assert_eq!(device.public().mask(), crate::fleet::scheme::MASK_ALL);
+        let _ = bindreq_put(&t, &device, &[7u8; 32], &[9u8; 32], &[0u8; 32]);
+        let n = t.0.borrow().len();
+        assert!(n > 4096, "a full bundle outgrew the old cap ({n} bytes) — the case this guards");
+        assert!(n <= crate::fleet::BINDREQ_MAX_BYTES, "a full-bundle bindreq is {n} bytes, over the worker cap");
+    }
+
     /// Near-form sections are anonymous on the wire (name only in the header TOC) — error_frame must still recognize them. This was broken from the v9 near-form change until 2026-07-06: section.name came back empty, every error frame went unrecognized, and callers parsed error frames as data (the "chain unverifiable: Empty" class).
     #[test]
     fn error_frame_recognizes_anonymous_near_form() {

@@ -213,6 +213,10 @@ pub const CONSENT_WINDOW_OSC: i64 = 3600 * vsf::OSCILLATIONS_PER_SECOND as i64;
 /// Binding requests older than this are lapsed (worker refuses at put, skips at list; clients skip too). The author refreshes at ~3.5 min while its ceremony screen is up; an abandoned ceremony self-cleans by expiry — the worker NEVER consumes a request (no third-party deletion, per the sovereign-records rule).
 pub const BINDREQ_FRESH_OSC: i64 = 300 * vsf::OSCILLATIONS_PER_SECOND as i64;
 
+/// The largest binding request the worker accepts, in bytes. A request carries one egg per scheme the joiner holds plus its key bundle — Ed25519 + Falcon-512 + SPHINCS+ (one SLH-DSA-SHA2-128s signature alone is 7856 bytes) is about 10 KB, so the old 4096-byte cap refused every device with a full bundle (Emma, 2026-10-17: "bindreq_put too_large").
+/// Sized with room for another scheme; the test `a_full_bundle_bindreq_fits_the_worker_cap` holds a real request under it.
+pub const BINDREQ_MAX_BYTES: usize = 64 * 1024;
+
 /// A binding request: a device's signed, identity-co-signed ask to join a fleet — the registry entry the old device's matcher screens candidates from, and the source of the Add op's consent egg.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BindRequest {
