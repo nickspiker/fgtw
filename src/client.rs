@@ -811,7 +811,7 @@ fn open_checked(f: &crate::fanout::Fanout, handle_proof: &[u8; 32], device_key: 
 pub fn mint_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     members: &[[u8; 32]],
     identity_seed: &[u8; 32],
 ) -> Result<(u64, [u8; 32]), String> {
@@ -828,10 +828,11 @@ pub fn mint_fleet_key<T: FgtwTransport>(
 }
 
 /// GROW the fan-out: republish wraps for the full `members` set under the SAME key, at revision+1. Never a mint — the fingerprint does not move, so no reader has adoption or re-seal work. Wraps are unlabelled (no recipient pubkeys in the slot), so a grower cannot know which member lacks one; a fresh full re-wrap is always correct and costs one ECDH per member. The publisher must hold the current key (`held_key` is verified against the stored blob's fingerprint — growing a fan-out you can't read is refused, that's a mint's job). Returns the new revision. A `stale` race loser refetches and re-applies.
+/// `device_key` signs the publish: pass the device's full signer — a bare Ed25519 keypair is refused `below_floor` by any fleet whose members all declared Falcon (Emma 2026-10-17: every green-confirm grow bounced).
 pub fn grow_fleet_wraps<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     held_key: &[u8; 32],
     members: &[[u8; 32]],
     identity_seed: &[u8; 32],
@@ -953,6 +954,25 @@ pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Emma, 2026-10-17: the green confirm's grow was signed Ed25519-only and the worker refused it below the floor of a fleet whose members all declared Falcon. A fan-out publish by a full-bundle device must carry the envelope tier the worker demands.
+    #[test]
+    fn a_fanout_publish_by_a_full_bundle_device_clears_the_envelope_floor() {
+        struct Capture(std::cell::RefCell<Vec<u8>>);
+        impl FgtwTransport for Capture {
+            fn post(&self, body: Vec<u8>) -> Result<FgtwResponse, String> {
+                *self.0.borrow_mut() = body;
+                Ok(FgtwResponse { status: 500, body: Vec::new() })
+            }
+        }
+        let t = Capture(std::cell::RefCell::new(Vec::new()));
+        let device = crate::pq::SigningBundle::derive(b"a member with every scheme");
+        let me = device.public().ed25519();
+        let _ = mint_fleet_key(&t, &[5u8; 32], &device, &[me], &[6u8; 32]);
+        let body = t.0.borrow().clone();
+        let required = crate::pq::ENVELOPE_TIER;
+        assert!(crate::pq::verify_envelope(&body, &device.public(), required).is_ok(), "the publish must carry every envelope-tier egg the worker requires");
+    }
 
     /// Emma, 2026-10-17: a device holding every scheme posted a ~10 KB request into a 4096-byte cap and could never join. Build the real body a full-bundle joiner sends and hold it under the worker's cap.
     #[test]
