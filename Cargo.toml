@@ -1,6 +1,6 @@
 [package]
 name = "fgtw"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
 description = "Fractal Gradient Trust Web — the client substrate for TOKEN identity: fleet membership, per-member fan-out of scoped keys, fleet-shared state, and the FGTW protocol. Shared by every TOKEN app (photon, calendar, …) and the FGTW worker."
