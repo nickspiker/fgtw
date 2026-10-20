@@ -9,6 +9,7 @@
 //! Deletion is deliberately not load-bearing. An old ciphertext is opaque to everyone except readers already granted it, and they hold the plaintext already, so an orphan leaks nothing new. There is no lease and no expiry: a publisher who goes off-grid for a year still renders for every friend who cached the content, and an identity must never decay because its owner stopped checking in.
 
 use crate::keys::Keypair;
+use vsf::VsfType;
 
 // Versions ride as literal binary numerals, never ASCII digits welded into a tag (repo convention 2026-08-01).
 const SLOT_DOMAIN: &[u8] = b"PHOTON_SCOPED_SLOT_v";
@@ -20,6 +21,44 @@ pub const SCOPED_VERSION: u8 = 0;
 pub struct SlotContents {
     pub blob_id: [u8; 32],
     pub dek: [u8; 32],
+}
+
+/// The stored form of everything FGTW holds for a client (photon docs/scoped-blobs.md): a VSF document signed by the writing device, one section named for what it is, carrying `version` and the AEAD output as `v'e'`. A reader verifies the document (provenance hash and device signature, un-skippable) before it opens anything. The bare `[nonce][ciphertext]` objects written before 2026-10-20 are still read; nothing writes them.
+pub const ENVELOPE_VERSION: usize = 1;
+
+/// A VSF document starts with these bytes; a bare sealed object (random nonce first) is anything else. The odds a random nonce starts this way are 2⁻³².
+pub fn is_vsf(bytes: &[u8]) -> bool {
+    bytes.starts_with("RÅ<".as_bytes())
+}
+
+/// Wrap `sealed` (an AEAD output) as a signed VSF document: section `section`, fields `version` and `field` = `v'e'{sealed}`.
+pub fn envelope(section: &str, field: &str, sealed: Vec<u8>, device: &Keypair) -> Result<Vec<u8>, String> {
+    let unsigned = vsf::VsfBuilder::new()
+        .signed_only(VsfType::ke(device.public.as_bytes().to_vec()))
+        .add_section(section, vec![("version".to_string(), VsfType::u(ENVELOPE_VERSION, false)), (field.to_string(), VsfType::v(b'e', sealed))])
+        .build()
+        .map_err(|e| format!("scoped: envelope build: {e}"))?;
+    vsf::verification::sign_file(unsigned, &device.secret.to_bytes()).map_err(|e| format!("scoped: envelope sign: {e}"))
+}
+
+/// Verify an envelope and return its sealed payload and the device key that signed it. `Err` when the document does not verify, is not `section`, has a version this reader does not know, or lacks `field`.
+pub fn open_envelope(section: &str, field: &str, doc: &[u8]) -> Result<(Vec<u8>, [u8; 32]), String> {
+    let (header, _) = vsf::verification::read_verified(doc, None)?;
+    if header.signature.is_none() {
+        return Err("scoped: envelope is unsigned".into());
+    }
+    let signer = vsf::verification::extract_signer_pubkey(doc)?;
+    let entry = header.fields.iter().find(|f| f.name == section).ok_or_else(|| format!("scoped: no '{section}' section"))?;
+    let mut ptr = entry.offset_bytes;
+    let sec = vsf::file_format::VsfSection::parse(doc, &mut ptr)?;
+    match sec.uint("version") {
+        Some(v) if v == ENVELOPE_VERSION as u64 => {}
+        other => return Err(format!("scoped: '{section}' version {other:?} unknown")),
+    }
+    match sec.get_field(field).and_then(|f| f.values.first()) {
+        Some(VsfType::v(b'e', sealed)) => Ok((sealed.clone(), signer)),
+        _ => Err(format!("scoped: '{section}' has no v'e' '{field}'")),
+    }
 }
 
 /// The address of one reader's private slot. Derived from the secret shared with that reader, so only the two of them can compute it — and it is stable, so an update overwrites in place rather than stranding the reader at a dead address.
@@ -74,8 +113,16 @@ pub fn seal_slot(
 }
 
 /// Open our own slot. `None` when the bytes are not ours to read (wrong secret, wrong purpose, tampered, or an empty/absent slot).
-pub fn open_slot(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Option<SlotContents> {
+pub fn open_slot(kek_secret: &[u8; 32], purpose: &[u8], stored: &[u8]) -> Option<SlotContents> {
     use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
+    // The signed VSF envelope (section `slot`, field `wrap`), or a bare slot written before it.
+    let unwrapped;
+    let sealed = if is_vsf(stored) {
+        unwrapped = open_envelope("slot", "wrap", stored).ok()?.0;
+        unwrapped.as_slice()
+    } else {
+        stored
+    };
     let key = slot_key(kek_secret, purpose);
     // Read-both: current XChaCha20 (24-byte zero nonce), then legacy ChaCha20 (12-byte zero nonce).
     let plain = XChaCha20Poly1305::new((&key).into())
@@ -159,9 +206,22 @@ pub fn seal_content(dek: &[u8; 32], blob_id: &[u8; 32], plaintext: &[u8]) -> Res
     Ok(out)
 }
 
+/// [`seal_content`] in its stored form: the signed VSF envelope, section `blob`, field `content`. This is what a publisher uploads.
+pub fn seal_content_doc(dek: &[u8; 32], blob_id: &[u8; 32], plaintext: &[u8], device: &Keypair) -> Result<Vec<u8>, String> {
+    envelope("blob", "content", seal_content(dek, blob_id, plaintext)?, device)
+}
+
 /// Decrypt content fetched from `blob_id`. `None` if the key is wrong, the bytes were tampered with, or the object was served from a different address than the one it was sealed for.
-pub fn open_content(dek: &[u8; 32], blob_id: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
+pub fn open_content(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) -> Option<Vec<u8>> {
     use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce};
+    // The signed VSF envelope (section `blob`, field `content`), or a bare object written before it.
+    let unwrapped;
+    let sealed = if is_vsf(stored) {
+        unwrapped = open_envelope("blob", "content", stored).ok()?.0;
+        unwrapped.as_slice()
+    } else {
+        stored
+    };
     // Read-both: current XChaCha20 ([nonce:24][ct], blob_id AAD), then legacy ChaCha20 ([nonce:12][ct]).
     if sealed.len() >= 24 + 16 {
         if let Ok(n) = XNonce::try_from(&sealed[..24]) {
@@ -200,17 +260,20 @@ pub struct SlotWrite {
 }
 
 /// Build the slot writes for a full reader set. `readers` is each reader's shared secret — the fleet key for our own devices, the CLUTCH pair secret per friend. Removing a reader is simply leaving them out of a republish; adding one is a single extra write against the SAME blob.
+///
+/// Each slot is stored as the signed VSF envelope (section `slot`, field `wrap`); `blob_id` stays inside the wrap, so a host cannot link a blob's slots to each other or to the blob.
 pub fn slot_writes(
     readers: &[[u8; 32]],
     purpose: &[u8],
     contents: &SlotContents,
+    device: &Keypair,
 ) -> Result<Vec<SlotWrite>, String> {
     readers
         .iter()
         .map(|kek| {
             Ok(SlotWrite {
                 address: slot_address(kek, purpose),
-                sealed: seal_slot(kek, purpose, contents)?,
+                sealed: envelope("slot", "wrap", seal_slot(kek, purpose, contents)?, device)?,
             })
         })
         .collect()
@@ -231,6 +294,40 @@ mod tests {
 
     fn secret(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    fn dev() -> Keypair {
+        Keypair::from_seed(&[7u8; 32])
+    }
+
+    /// What a publisher uploads is a signed VSF document, it opens, and tampering with any byte of it fails verification before any decrypt.
+    #[test]
+    fn stored_objects_are_signed_vsf_envelopes() {
+        let kek = secret(1);
+        let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
+        let slot = &slot_writes(&[kek], b"avatar", &contents, &dev()).unwrap()[0].sealed;
+        let blob = seal_content_doc(&contents.dek, &contents.blob_id, b"pixels", &dev()).unwrap();
+        assert!(is_vsf(slot) && is_vsf(&blob));
+        assert_eq!(open_envelope("blob", "content", &blob).unwrap().1, *dev().public.as_bytes());
+        assert_eq!(open_slot(&kek, b"avatar", slot).unwrap(), contents);
+        assert_eq!(open_content(&contents.dek, &contents.blob_id, &blob).unwrap(), b"pixels");
+        for i in [0usize, blob.len() / 2, blob.len() - 1] {
+            let mut bad = blob.clone();
+            bad[i] ^= 1;
+            assert!(open_content(&contents.dek, &contents.blob_id, &bad).is_none(), "byte {i} flipped still opened");
+        }
+        assert!(open_envelope("slot", "wrap", &blob).is_err(), "a blob is not a slot");
+    }
+
+    /// The bare form written before the envelope still opens (read-both); nothing writes it any more.
+    #[test]
+    fn bare_objects_written_before_the_envelope_still_open() {
+        let kek = secret(1);
+        let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
+        let bare_slot = seal_slot(&kek, b"avatar", &contents).unwrap();
+        let bare_blob = seal_content(&contents.dek, &contents.blob_id, b"old").unwrap();
+        assert_eq!(open_slot(&kek, b"avatar", &bare_slot).unwrap(), contents);
+        assert_eq!(open_content(&contents.dek, &contents.blob_id, &bare_blob).unwrap(), b"old");
     }
 
     /// Legacy 12-byte-nonce ChaCha20 blobs (slot, value, content) must still open — the read-both migration path. Each is synthesized directly under the same derived key the new sealer uses.
@@ -285,8 +382,8 @@ mod tests {
         let contents = SlotContents { blob_id, dek };
         let content = b"a small avatar".to_vec();
 
-        let sealed_content = seal_content(&dek, &blob_id, &content).unwrap();
-        let writes = slot_writes(&[friend, device], b"avatar", &contents).unwrap();
+        let sealed_content = seal_content_doc(&dek, &blob_id, &content, &dev()).unwrap();
+        let writes = slot_writes(&[friend, device], b"avatar", &contents, &dev()).unwrap();
         assert_eq!(writes.len(), 2);
         // Two readers, two unlinkable addresses.
         assert_ne!(writes[0].address, writes[1].address);
@@ -306,7 +403,7 @@ mod tests {
         let friend = secret(1);
         let stranger = secret(9);
         let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
-        let writes = slot_writes(&[friend], b"avatar", &contents).unwrap();
+        let writes = slot_writes(&[friend], b"avatar", &contents, &dev()).unwrap();
 
         assert_ne!(slot_address(&stranger, b"avatar"), writes[0].address);
         assert!(open_slot(&stranger, b"avatar", &writes[0].sealed).is_none());
@@ -317,7 +414,7 @@ mod tests {
     fn slots_do_not_cross_purposes_or_addresses() {
         let friend = secret(1);
         let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
-        let avatar = slot_writes(&[friend], b"avatar", &contents).unwrap();
+        let avatar = slot_writes(&[friend], b"avatar", &contents, &dev()).unwrap();
 
         assert!(open_slot(&friend, b"attachment-7", &avatar[0].sealed).is_none());
         assert_ne!(slot_address(&friend, b"avatar"), slot_address(&friend, b"attachment-7"));
@@ -346,8 +443,8 @@ mod tests {
         let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
         let sealed_content = seal_content(&contents.dek, &contents.blob_id, b"pixels").unwrap();
 
-        let before = slot_writes(&[a], b"avatar", &contents).unwrap();
-        let after = slot_writes(&[a, b], b"avatar", &contents).unwrap();
+        let before = slot_writes(&[a], b"avatar", &contents, &dev()).unwrap();
+        let after = slot_writes(&[a, b], b"avatar", &contents, &dev()).unwrap();
 
         assert_eq!(before[0], after[0], "an existing reader's slot is byte-identical");
         // The content never moved: the same bytes still open under the same key.
@@ -363,12 +460,12 @@ mod tests {
         let stay = secret(1);
         let go = secret(2);
         let v0 = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
-        let old_writes = slot_writes(&[stay, go], b"avatar", &v0).unwrap();
+        let old_writes = slot_writes(&[stay, go], b"avatar", &v0, &dev()).unwrap();
         let removed_slot = open_slot(&go, b"avatar", &old_writes[1].sealed).unwrap();
 
         let v1 = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
         let new_content = seal_content(&v1.dek, &v1.blob_id, b"new pixels").unwrap();
-        let new_writes = slot_writes(&[stay], b"avatar", &v1).unwrap();
+        let new_writes = slot_writes(&[stay], b"avatar", &v1, &dev()).unwrap();
         assert_eq!(new_writes.len(), 1);
 
         // The survivor follows the republish to the new object.
