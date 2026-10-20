@@ -133,7 +133,7 @@ pub fn open_slot(kek_secret: &[u8; 32], purpose: &[u8], stored: &[u8]) -> Option
     open_slot_signed(kek_secret, purpose, stored).map(|(c, _)| c)
 }
 
-/// [`open_slot`] with who signed it: `Some(signed)` for the VSF envelope, `None` for a bare slot written before it (which no signer can be pinned on).
+/// [`open_slot`] with who signed it: `Some(signed)` for the VSF envelope, `None` for a bare slot written before it (which no signer can be pinned on). RETIRE with photon 0.133: the bare branch.
 pub fn open_slot_signed(kek_secret: &[u8; 32], purpose: &[u8], stored: &[u8]) -> Option<(SlotContents, Option<Signed>)> {
     use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
     // The signed VSF envelope (section `slot`, field `wrap`), or a bare slot written before it.
@@ -237,7 +237,7 @@ pub fn open_content(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) -> Option
     open_content_signed(dek, blob_id, stored).map(|(c, _)| c)
 }
 
-/// [`open_content`] with who signed it: `Some(signed)` for the VSF envelope, `None` for a bare object written before it.
+/// [`open_content`] with who signed it: `Some(signed)` for the VSF envelope, `None` for a bare object written before it. RETIRE with photon 0.133: the bare branch.
 pub fn open_content_signed(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) -> Option<(Vec<u8>, Option<Signed>)> {
     let (unwrapped, signed) = if is_vsf(stored) {
         let (sealed, signed) = open_envelope("blob", "content", stored).ok()?;
