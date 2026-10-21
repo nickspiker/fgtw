@@ -743,7 +743,8 @@ impl Record {
         }
         let Some(lists) = eggs_blob_lists(blob, n_lists) else { return false };
         let (bundle, required) = policy.judge(signer);
-        crate::pq::verify_eggs(&lists[idx], &bundle, msg, required)
+        // DECLARED, not strict: a device signs with every scheme it holds, while a reader without the chain holds only the anchor. The strict rule rejected every such record for want of a Falcon key (2026-09-20 → 2026-10-21: every one of a fleet's phonebook records "Unverified", address lookups dead for a month). Each egg the reader CAN check must verify, the rest are skipped, and the policy's floor must still be covered by verified eggs — an anchor-only reader gets exactly the Ed25519 assurance it always had.
+        crate::pq::verify_eggs_declared(&lists[idx], &bundle, msg, required)
     }
 
     /// Self-verifying: the device signed its own address, and the key it signed with is in the record.
@@ -1300,6 +1301,19 @@ mod tests {
         assert!(!old.address_signing_bytes().windows(10).any(|w| w == b"local_port"), "an unstated port adds nothing to the signed bytes");
     }
 
+    /// A FULL-BUNDLE device (Ed25519 + Falcon + SPHINCS+, as every attested device signs) publishes a record an anchor-only reader verifies: the Ed25519 egg checks, the PQ eggs it holds no key for are skipped, and a tampered field still fails (field 2026-10-21: the strict rule had rejected every such record for a month).
+    #[cfg(feature = "client")]
+    #[test]
+    fn a_full_bundle_record_verifies_for_an_anchor_only_reader() {
+        let dev = crate::pq::SigningBundle::derive(b"a phone with all three schemes");
+        let (r, blob) = Record::sign_device_address(&dev, crate::fleet::scheme::MASK_ALL, &[9u8; 32], &[1u8; 16], 4383, &[2u8; 16], 0, 7);
+        assert_eq!(eggs_blob_lists(&blob, 1).unwrap()[0].len(), 3, "the record carries all three eggs");
+        assert!(r.verify_address(&blob), "an anchor-only reader verifies the Ed25519 egg and skips the rest");
+        let mut tampered = r.clone();
+        tampered.0[DA_HANDLE] ^= 1;
+        assert!(!tampered.verify_address(&blob), "a covered field still binds");
+    }
+
     /// The one-step mint must produce exactly what the hand-rolled two-step produces, and must verify.
     /// This is the helper the client publishes through, so a regression here is an unfindable device rather than a visible error.
     #[test]
@@ -1386,7 +1400,8 @@ mod tests {
         let for_signer = |who: &[u8; 32]| (who == &full.ed25519()).then(|| (full.clone(), all));
         let strict = EggPolicy { for_signer: &for_signer };
         assert!(r.verify_address_with(&blob, &strict), "the full set verifies at the full floor");
-        assert!(!r.verify_address(&blob), "anchor-only cannot verify eggs for schemes it holds no key for — every listed egg must verify");
+        // Nick 2026-10-21 (option 1): an anchor-only reader checks the Ed25519 egg and skips the eggs it holds no key for — the strict "every listed egg must verify" rule had rejected every full-bundle record for a month; the chain policy above still holds the record to the full floor.
+        assert!(r.verify_address(&blob), "anchor-only verifies the Ed25519 egg and skips the post-quantum ones");
 
         let (short, short_blob) = Record::sign_device_address(dev.keypair(), B, &hp, &[1u8; 16], 7953, &[2u8; 16], 0, 43);
         assert!(short.verify_address(&short_blob), "Ed25519 alone is fine below the floor");
