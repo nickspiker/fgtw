@@ -41,6 +41,7 @@ pub mod pq;
 /// The epoch of any fan-out blob, readable WITHOUT the `fanout` feature — the worker's monotonic guard needs it but compiles none of the fan-out crypto.
 /// Version-agnostic on purpose: the 3-byte magic leads and the big-endian epoch sits at 4..12 in every layout (the 4th byte was the ASCII '0' of the original tag, now a binary version numeral), so a reader can order blobs whose BODY it cannot parse. That is what lets a new-format rotation step over an old-format blob instead of proposing epoch 1 and being refused as stale forever.
 pub fn fanout_blob_epoch(bytes: &[u8]) -> Option<u64> {
+    // WHY/PROOF: fan-out blobs are fetched from FGTW and may be truncated — the epoch slice would panic.
     if bytes.len() >= 12 && &bytes[0..3] == b"PFO" {
         Some(u64::from_be_bytes(bytes[4..12].try_into().unwrap()))
     } else {
@@ -50,10 +51,12 @@ pub fn fanout_blob_epoch(bytes: &[u8]) -> Option<u64> {
 
 /// The fan-out's EPOCH PUBLIC BUNDLE, readable without the `fanout` feature: the keys a verifier checks a current-membership proof against. `None` for a pre-v3 blob or a malformed one. Layout: magic(3) ‖ version(1) ‖ revision(8) ‖ kfp(32) ‖ rotator(32) ‖ u16 BE len ‖ bundle.
 pub fn fanout_blob_epoch_pub(bytes: &[u8]) -> Option<pq::KeyBundle> {
+    // WHY/PROOF: fan-out blobs are fetched from FGTW and may be truncated — the fixed header slices would panic.
     if bytes.len() < 78 || &bytes[0..3] != b"PFO" || bytes[3] != 3 {
         return None;
     }
     let n = u16::from_be_bytes([bytes[76], bytes[77]]) as usize;
+    // WHY/PROOF: the bundle length is read from the blob itself and may run past its end — slicing would panic.
     let b = bytes.get(78..78 + n)?;
     pq::KeyBundle::from_bytes(b).ok()
 }

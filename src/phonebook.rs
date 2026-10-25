@@ -493,6 +493,7 @@ pub fn eggs_blob_lists(blob: &[u8], n: usize) -> Option<Vec<Vec<Egg>>> {
     let mut out = Vec::with_capacity(n);
     let mut rest = blob;
     for _ in 0..n {
+        // WHY/PROOF: the blob is fetched from storage a peer wrote — a length prefix or list may run past the end, and plain slicing would panic.
         let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
         rest = &rest[2..];
         let bytes = rest.get(..len)?;
@@ -738,6 +739,7 @@ impl Slice {
 impl Record {
     /// The common check: the blob is within the cap and hashes to the record's pointer, unpacks to `n_lists`, and list `idx` verifies against the signer's bundle over `msg` at the policy's required set.
     fn verify_list(&self, blob: &[u8], idx: usize, n_lists: usize, signer: &[u8; 32], msg: &[u8], policy: &EggPolicy<'_>) -> bool {
+        // WHY/PROOF: the blob is peer-written — the size cap bounds the work spent hashing and parsing hostile input.
         if blob.len() > EGGS_BLOB_MAX || eggs_ptr(blob) != self.eggs_ptr() {
             return false;
         }
@@ -816,6 +818,7 @@ pub struct RegistryView {
 impl RegistryView {
     /// File an egg blob under its content address.
     pub fn add_blob(&mut self, blob: Vec<u8>) {
+        // WHY/PROOF: blobs arrive from storage peers wrote — an oversize one is refused before it is filed in memory.
         if blob.len() <= EGGS_BLOB_MAX {
             self.blobs.insert(eggs_ptr(&blob), blob);
         }
@@ -896,6 +899,7 @@ pub fn registry_plan(
 
     let mut out = Vec::new();
     for (idx, dev) in list.iter().enumerate() {
+        // WHY/PROOF: internal, but not in range: `list` gains the fold's new devices, so it can be longer than `current` and indexing would panic.
         if current.get(idx) == Some(dev) {
             continue; // this slot is already right — leave its stored record alone
         }
@@ -961,6 +965,7 @@ impl Slice {
             .find(|f| f.name == SLICE_SECTION)
             .ok_or_else(|| format!("no '{SLICE_SECTION}' section in document TOC"))?;
         let start = field.offset_bytes;
+        // WHY/PROOF: offset and size come from a fetched document header — a hostile pair can overflow usize, and the range must also fit the document before it is sliced.
         let end = start
             .checked_add(field.size_bytes)
             .ok_or("slice byte range overflows")?;

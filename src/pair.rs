@@ -79,18 +79,19 @@ pub fn pair_word_tokens(s: &str) -> usize {
     count
 }
 
-/// Lazy index over the voca FULL alphabet for live spell-checking: a hash set for exact membership plus a sorted copy for prefix tests. Built once, ~3177 entries.
-static WORD_INDEX: std::sync::OnceLock<(
-    std::collections::HashSet<&'static [u8]>,
-    Vec<&'static [u8]>,
-)> = std::sync::OnceLock::new();
-fn word_index() -> &'static (std::collections::HashSet<&'static [u8]>, Vec<&'static [u8]>) {
+/// Lazy index over the voca FULL alphabet for live spell-checking: one sorted copy, binary-searched for exact membership and partition-pointed for prefix tests. Built once, ~3177 entries.
+static WORD_INDEX: std::sync::OnceLock<Vec<&'static [u8]>> = std::sync::OnceLock::new();
+fn word_index() -> &'static [&'static [u8]] {
     WORD_INDEX.get_or_init(|| {
-        let set: std::collections::HashSet<_> = voca::FULL.alphabet.iter().copied().collect();
         let mut sorted: Vec<_> = voca::FULL.alphabet.to_vec();
         sorted.sort_unstable();
-        (set, sorted)
+        sorted
     })
+}
+
+/// Exact membership in the voca FULL alphabet.
+fn is_word(sorted: &[&[u8]], w: &[u8]) -> bool {
+    sorted.binary_search(&w).is_ok()
 }
 
 /// The typed entry's tokens, lowercased, split exactly the way [`pair_word_tokens`] counts them: whitespace-separated if the entry contains any whitespace, else camelCase boundaries.
@@ -122,16 +123,17 @@ pub fn first_bad_pair_word(s: &str) -> Option<String> {
     if words.is_empty() {
         return None;
     }
-    let (set, sorted) = word_index();
+    let sorted = word_index();
     // The last token is "complete" (must match exactly) only once a separator follows it — a full-width count is NOT completion, because the 23rd token exists from its first typed character (an "at 23 words check everything" rule would flag the last word mid-type). A valid full word passes the prefix test anyway (exact match is its own prefix), so the lenient last-token rule never rejects a correct entry.
     let last_complete = s != s.trim_end();
     let n = words.len();
     for (i, w) in words.iter().enumerate() {
         let wb = w.as_bytes();
         let ok = if i + 1 < n || last_complete {
-            set.contains(wb)
+            is_word(sorted, wb)
         } else {
             let idx = sorted.partition_point(|&cand| cand < wb);
+            // WHY/PROOF: the typed word is user input and may sort after every list word, so partition_point returns len — indexing there would panic.
             idx < sorted.len() && sorted[idx].starts_with(wb)
         };
         if !ok {
@@ -170,8 +172,8 @@ pub fn parse_pair_event(bytes: &[u8]) -> Option<(String, [u8; 32])> {
 pub fn pair_entry_complete(s: &str) -> bool {
     let words = pair_word_list(s);
     words.len() == PAIR_WORD_COUNT && {
-        let (set, _) = word_index();
-        words.iter().all(|w| set.contains(w.as_bytes()))
+        let sorted = word_index();
+        words.iter().all(|w| is_word(sorted, w.as_bytes()))
     }
 }
 
@@ -182,6 +184,7 @@ pub fn words_to_pair_pubkey(words: &str) -> Result<[u8; 32], String> {
     }
     let n = voca::decode(words.trim()).map_err(|e| format!("unrecognised word: {e:?}"))?;
     let bytes = n.to_bytes_be();
+    // WHY/PROOF: 23 typed words can encode a value past 2^256 — the slice index below would underflow and panic without this.
     if bytes.len() > 32 {
         return Err("words don't decode to a key".into());
     }
@@ -246,7 +249,7 @@ pub fn lock_word() -> String {
 /// Exact-member spell check for the lock word entry (case/whitespace tolerant), reusing the pairing word index.
 pub fn is_lock_word(s: &str) -> bool {
     let w = s.trim().to_ascii_lowercase();
-    !w.is_empty() && word_index().0.contains(w.as_bytes())
+    is_word(word_index(), w.as_bytes())
 }
 
 /// The proof the NEW device beacons once the user typed the lock word: a keyed MAC over its device pubkey under a key derived from (word, handle_proof). The word is canonicalised (trim + lowercase) so display case and stray whitespace never break the ceremony. Word freshness is the replay guard — an old ceremony's proof verifies against nothing.

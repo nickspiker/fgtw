@@ -111,62 +111,68 @@ fn label(name: &str) -> VsfType {
     VsfType::d(name.to_string())
 }
 
-/// Walk a row's values as (label, datum) pairs into a lookup map. A trailing label with no datum is dropped; unlabeled values are ignored (forward compatibility: a future writer can add labeled data an old reader skips by name).
-fn labeled_values(values: &[VsfType]) -> std::collections::HashMap<&str, &VsfType> {
-    let mut map = std::collections::HashMap::new();
+/// Walk a row's values as (label, datum) pairs. A trailing label with no datum is dropped; unlabeled values are ignored (forward compatibility: a future writer can add labeled data an old reader skips by name).
+/// A row holds about a dozen labels, so the pairs stay a plain list searched linearly by [`lookup`].
+fn labeled_values(values: &[VsfType]) -> Vec<(&str, &VsfType)> {
+    let mut pairs = Vec::new();
     let mut it = values.iter();
     while let Some(v) = it.next() {
         if let VsfType::d(name) = v {
             if let Some(datum) = it.next() {
-                map.insert(name.as_str(), datum);
+                pairs.push((name.as_str(), datum));
             }
         }
     }
-    map
+    pairs
 }
 
-fn get_k32(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<[u8; 32]> {
-    match m.get(name)? {
+/// The datum under `name`; a label repeated in one row reads as its LAST occurrence.
+fn lookup<'a>(m: &[(&str, &'a VsfType)], name: &str) -> Option<&'a VsfType> {
+    m.iter().rev().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
+fn get_k32(m: &[(&str, &VsfType)], name: &str) -> Option<[u8; 32]> {
+    match lookup(m, name)? {
         VsfType::hP(b) | VsfType::ke(b) if b.len() == 32 => b.as_slice().try_into().ok(),
         _ => None,
     }
 }
 
-fn get_k64(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<[u8; 64]> {
-    match m.get(name)? {
+fn get_k64(m: &[(&str, &VsfType)], name: &str) -> Option<[u8; 64]> {
+    match lookup(m, name)? {
         VsfType::ge(b) if b.len() == 64 => b.as_slice().try_into().ok(),
         _ => None,
     }
 }
 
-fn get_e6(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<i64> {
-    match m.get(name)? {
+fn get_e6(m: &[(&str, &VsfType)], name: &str) -> Option<i64> {
+    match lookup(m, name)? {
         VsfType::e(EtType::e6(o)) => Some(*o),
         _ => None,
     }
 }
 
-fn get_u3(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<u8> {
+fn get_u3(m: &[(&str, &VsfType)], name: &str) -> Option<u8> {
     // Width-agnostic on purpose: the writer emits u3 today, but the reader must not care which width (the key names the semantics — an exact-variant match dies the day the encoder's choice changes).
-    m.get(name)?.as_u64().and_then(|n| u8::try_from(n).ok())
+    lookup(m, name)?.as_u64().and_then(|n| u8::try_from(n).ok())
 }
 
-fn get_text(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<String> {
-    match m.get(name)? {
+fn get_text(m: &[(&str, &VsfType)], name: &str) -> Option<String> {
+    match lookup(m, name)? {
         VsfType::x(s) => Some(s.clone()),
         _ => None,
     }
 }
 
-fn get_key(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<String> {
-    match m.get(name)? {
+fn get_key(m: &[(&str, &VsfType)], name: &str) -> Option<String> {
+    match lookup(m, name)? {
         VsfType::d(s) => Some(s.clone()),
         _ => None,
     }
 }
 
-fn get_value(m: &std::collections::HashMap<&str, &VsfType>, name: &str) -> Option<VsfType> {
-    m.get(name).map(|v| (*v).clone())
+fn get_value(m: &[(&str, &VsfType)], name: &str) -> Option<VsfType> {
+    lookup(m, name).cloned()
 }
 
 fn roster_section_bytes(entries: &[RosterEntry]) -> Vec<u8> {
@@ -453,6 +459,7 @@ pub fn fstate_to_bytes(state: &FleetState) -> Vec<u8> {
 /// Parse a fleet-state document. A roster-only document reads as roster + empty settings — no version fork.
 pub fn fstate_from_bytes(bytes: &[u8]) -> Result<FleetState, String> {
     // A KNOWN legacy layout (the pre-v6 hand-rolled tags) is the documented flag-day: it reads as ABSENT — roster re-seeds from live contacts, settings re-push. It must NOT read as an error: push is pull-merge-push and a pull error rightly aborts the push (the PRST2→PRST3 lesson), so error-ing on the old blob would deadlock the slot on its old bytes forever — no v6 device could ever complete the push that re-seeds it.
+    // WHY/PROOF: the slot bytes are fetched from FGTW and may be shorter than a tag — the slice would panic.
     if bytes.len() >= 4 {
         let tag = &bytes[..4];
         if tag == b"PRST" || tag == b"PFST" || tag == b"PSET" {
@@ -480,7 +487,6 @@ pub fn fstate_from_bytes(bytes: &[u8]) -> Result<FleetState, String> {
     Ok(FleetState { roster, global_settings, device_settings })
 }
 
-/// CRDT merge: union by handle_proof, per-entry last-writer-wins on `updated`. Deterministic and order-independent (commutative/idempotent). A tombstone wins an `updated` tie so a concurrent remove beats a concurrent re-add — deletes are conservative.
 /// Canonical total order over a roster entry's CONTENT (everything but the key and the clock), for the equal-stamp tie-break below — same role as the value-bytes compare in `merge_global_settings`. Without it, two devices writing different content at the same instant each kept their own winner forever (whichever arrived second in the merge's input order), so the fleet held two truths.
 fn roster_entry_canon(e: &RosterEntry) -> impl Ord + '_ {
     (
@@ -495,51 +501,52 @@ fn roster_entry_canon(e: &RosterEntry) -> impl Ord + '_ {
     )
 }
 
-pub fn merge_rosters(a: Vec<RosterEntry>, b: Vec<RosterEntry>) -> Vec<RosterEntry> {
-    use std::collections::HashMap;
-    let mut by: HashMap<[u8; 32], RosterEntry> = HashMap::new();
-    for e in a.into_iter().chain(b.into_iter()) {
-        let replace = match by.get(&e.handle_proof) {
-            None => true,
-            Some(cur) => {
-                e.updated > cur.updated
-                    || (e.updated == cur.updated
-                        && (e.tombstone && !cur.tombstone
-                            || (e.tombstone == cur.tombstone
-                                && roster_entry_canon(&e) > roster_entry_canon(cur))))
-            }
-        };
-        if replace {
-            by.insert(e.handle_proof, e);
+/// Union of `a` then `b`, one survivor per key: a later copy replaces the held one only when `newer(later, held)`.
+/// The stable sort keeps each key's copies in arrival order, so folding a run gives exactly what a one-pass insert-if-newer would, and the output comes out sorted by key.
+fn merge_by_key<T>(a: Vec<T>, b: Vec<T>, cmp: impl Fn(&T, &T) -> std::cmp::Ordering, newer: impl Fn(&T, &T) -> bool) -> Vec<T> {
+    let mut out = a;
+    out.extend(b);
+    out.sort_by(&cmp);
+    out.dedup_by(|later, held| {
+        if cmp(later, held) != std::cmp::Ordering::Equal {
+            return false;
         }
-    }
-    let mut out: Vec<RosterEntry> = by.into_values().collect();
-    out.sort_by(|x, y| x.handle_proof.cmp(&y.handle_proof));
+        if newer(later, held) {
+            std::mem::swap(later, held);
+        }
+        true
+    });
     out
+}
+
+/// CRDT merge: union by handle_proof, per-entry last-writer-wins on `updated`. Deterministic and order-independent (commutative/idempotent). A tombstone wins an `updated` tie so a concurrent remove beats a concurrent re-add — deletes are conservative.
+pub fn merge_rosters(a: Vec<RosterEntry>, b: Vec<RosterEntry>) -> Vec<RosterEntry> {
+    merge_by_key(
+        a,
+        b,
+        |x, y| x.handle_proof.cmp(&y.handle_proof),
+        |e, cur| {
+            e.updated > cur.updated
+                || (e.updated == cur.updated
+                    && (e.tombstone && !cur.tombstone
+                        || (e.tombstone == cur.tombstone && roster_entry_canon(e) > roster_entry_canon(cur))))
+        },
+    )
 }
 
 /// CRDT merge for the GLOBAL settings layer: union by key, last-writer-wins on `updated`. On an exact-tie: a tombstone wins (deletes are conservative, mirroring the roster), then greater value bytes — a strictly deterministic total order, so the merge is commutative even for a same-instant write of different values.
 pub fn merge_global_settings(a: Vec<SettingEntry>, b: Vec<SettingEntry>) -> Vec<SettingEntry> {
-    use std::collections::HashMap;
-    let mut by: HashMap<String, SettingEntry> = HashMap::new();
-    for e in a.into_iter().chain(b.into_iter()) {
-        let replace = match by.get(&e.key) {
-            None => true,
-            Some(cur) => {
-                e.updated > cur.updated
-                    || (e.updated == cur.updated
-                        && (e.tombstone && !cur.tombstone
-                            || (e.tombstone == cur.tombstone
-                                && e.value.flatten() > cur.value.flatten())))
-            }
-        };
-        if replace {
-            by.insert(e.key.clone(), e);
-        }
-    }
-    let mut out: Vec<SettingEntry> = by.into_values().collect();
-    out.sort_by(|x, y| x.key.cmp(&y.key));
-    out
+    merge_by_key(
+        a,
+        b,
+        |x, y| x.key.cmp(&y.key),
+        |e, cur| {
+            e.updated > cur.updated
+                || (e.updated == cur.updated
+                    && (e.tombstone && !cur.tombstone
+                        || (e.tombstone == cur.tombstone && e.value.flatten() > cur.value.flatten())))
+        },
+    )
 }
 
 /// Canonical ordering key for a device map — entries sorted by field, for the deterministic tie-break below. (This replaced a serialized-bytes comparison: the document codec stamps a creation time, so its bytes are no longer a stable order.)
@@ -556,23 +563,12 @@ fn device_map_canon(d: &DeviceSettings) -> Vec<(&str, Vec<u8>, i64, bool)> {
 
 /// Merge the per-device maps: union by device pubkey, whole-map newest-copy-wins on the map's `updated` (single-writer, so a tie means identical content in practice; the canonical entry ordering breaks it deterministically anyway). A device absent from one side is kept — an offline device's map must survive every merge it isn't present for.
 pub fn merge_device_settings(a: Vec<DeviceSettings>, b: Vec<DeviceSettings>) -> Vec<DeviceSettings> {
-    use std::collections::HashMap;
-    let mut by: HashMap<[u8; 32], DeviceSettings> = HashMap::new();
-    for d in a.into_iter().chain(b.into_iter()) {
-        let replace = match by.get(&d.device_pubkey) {
-            None => true,
-            Some(cur) => {
-                d.updated > cur.updated
-                    || (d.updated == cur.updated && device_map_canon(&d) > device_map_canon(cur))
-            }
-        };
-        if replace {
-            by.insert(d.device_pubkey, d);
-        }
-    }
-    let mut out: Vec<DeviceSettings> = by.into_values().collect();
-    out.sort_by(|x, y| x.device_pubkey.cmp(&y.device_pubkey));
-    out
+    merge_by_key(
+        a,
+        b,
+        |x, y| x.device_pubkey.cmp(&y.device_pubkey),
+        |d, cur| d.updated > cur.updated || (d.updated == cur.updated && device_map_canon(d) > device_map_canon(cur)),
+    )
 }
 
 /// Merge two full fleet states — the one call a puller makes: roster LWW + global-settings LWW + device newest-copy-wins.
@@ -592,13 +588,13 @@ mod tests {
         RosterEntry {
             handle_proof: [hp; 32],
             handle_hash: [hp ^ 0xff; 32],
-            public_identity: [hp.wrapping_add(1); 32],
+            public_identity: [hp + 1; 32],
             published_name: format!("Chosen{hp}"),
             avatar_pin: [hp ^ 0x55; 64],
             added: 100,
             updated,
             tombstone,
-            ceremony_owner: [hp.wrapping_add(2); 32],
+            ceremony_owner: [hp + 2; 32],
             woven: hp % 2 == 0,
             trust_level: hp % 4,
         }

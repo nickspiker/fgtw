@@ -130,6 +130,7 @@ impl RdFrame {
 
     /// `None` for anything that isn't a well-formed RDS1 frame (wrong magic, short).
     pub fn decode(bytes: &[u8]) -> Option<Self> {
+        // WHY/PROOF: frame bytes arrive off the relay from a peer and may be shorter than the header — the fixed slices below would panic.
         if bytes.len() < RD_HEADER_LEN || bytes[0..4] != RD_MAGIC {
             return None;
         }
@@ -242,8 +243,9 @@ impl CandidateOffer {
     /// `count:u8 ‖ (len:u8 ‖ addr-bytes)*` — addresses use traverse's own encoding so the punch path has exactly one address format end to end.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + self.addrs.len() * 19);
-        out.push(self.addrs.len().min(u8::MAX as usize) as u8);
-        for a in self.addrs.iter().take(u8::MAX as usize) {
+        // The offer is our own gathered candidates (a handful of interfaces), far under the u8 count the wire carries.
+        out.push(self.addrs.len() as u8);
+        for a in &self.addrs {
             let b = crate::traverse::wire::socketaddr_to_bytes(a);
             out.push(b.len() as u8);
             out.extend_from_slice(&b);
@@ -258,6 +260,7 @@ impl CandidateOffer {
         for _ in 0..count {
             let (&len, tail) = rest.split_first()?;
             let len = len as usize;
+            // WHY/PROOF: the per-address length byte is peer-supplied and may overrun the frame — split_at would panic.
             if tail.len() < len {
                 return None;
             }

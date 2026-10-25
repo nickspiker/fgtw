@@ -626,6 +626,7 @@ pub fn bindreq_list<T: FgtwTransport>(
     for field in stored.get_fields("req") {
         // Positional: [ke device_pubkey, e6 t, ge device_sig, ge identity_sig] — mirror of the worker's build.
         let v = &field.values;
+        // WHY/PROOF: bind-request rows come from the FGTW response and may be short — indexing would panic; each malformed row is skipped instead.
         let (Some(VsfType::ke(dk)), Some(VsfType::e(et)), Some(VsfType::ge(ds)), Some(VsfType::ge(is))) =
             (v.first(), v.get(1), v.get(2), v.get(3))
         else {
@@ -652,7 +653,7 @@ pub fn bindreq_list<T: FgtwTransport>(
             _ => None,
         };
         let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig, identity_sig: is.clone(), nfc_hash, bundle };
-        if (now - req.t).abs() > BINDREQ_FRESH_OSC {
+        if now.abs_diff(req.t) > BINDREQ_FRESH_OSC as u64 {
             continue; // lapsed — expiry is the only deletion pending records get
         }
         if !req.verify(handle_proof, &identity_pubkey) {

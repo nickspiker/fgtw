@@ -86,6 +86,7 @@ impl PunchMessage {
 
     /// Decode a punch message. `Ok(None)` means "a valid VSF file, but not one of ours" — the caller should pass it to its own dispatch rather than treating it as an error, which is what lets photon share one socket across several message families.
     pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Option<Self>, String> {
+        // WHY/PROOF: datagrams arrive from any sender on the shared socket — a short one would panic the magic slice.
         if bytes.len() < 4 || &bytes[0..3] != "RÅ".as_bytes() || bytes[3] != b'<' {
             return Err("not a VSF file (invalid magic)".to_string());
         }

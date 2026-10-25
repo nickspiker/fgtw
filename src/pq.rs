@@ -109,12 +109,14 @@ impl KeyBundle {
         };
         let mut keys = Vec::with_capacity(count as usize);
         for _ in 0..count {
+            // WHY/PROOF: a key bundle is peer-supplied — a truncated entry header would panic the fixed indexing below.
             if rest.len() < 3 {
                 return Err("key bundle: truncated entry");
             }
             let s = rest[0];
             let n = u16::from_le_bytes([rest[1], rest[2]]) as usize;
             rest = &rest[3..];
+            // WHY/PROOF: the key length is peer-supplied and may run past the bundle — slicing would panic.
             if rest.len() < n {
                 return Err("key bundle: truncated key");
             }

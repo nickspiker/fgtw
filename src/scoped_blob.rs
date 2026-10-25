@@ -188,6 +188,7 @@ pub fn open_value(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Optio
     use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce};
     let key = slot_key(kek_secret, purpose);
     // Read-both: current XChaCha20 ([nonce:24][ct]), then legacy ChaCha20 ([nonce:12][ct]).
+    // WHY/PROOF: sealed bytes are fetched from storage and may be shorter than nonce + tag — the nonce slices below would panic.
     let plain = if sealed.len() >= 24 + 16 {
         XNonce::try_from(&sealed[..24])
             .ok()
@@ -196,6 +197,7 @@ pub fn open_value(kek_secret: &[u8; 32], purpose: &[u8], sealed: &[u8]) -> Optio
         None
     };
     let plain = plain.or_else(|| {
+        // WHY/PROOF: same hostile length, legacy 12-byte nonce layout — the split below would panic.
         if sealed.len() < 12 + 16 {
             return None;
         }
@@ -252,6 +254,7 @@ pub fn open_content_signed(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) ->
 fn open_bare_content(dek: &[u8; 32], blob_id: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
     use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce};
     // Read-both: current XChaCha20 ([nonce:24][ct], blob_id AAD), then legacy ChaCha20 ([nonce:12][ct]).
+    // WHY/PROOF: sealed bytes are fetched from storage and may be shorter than nonce + tag — the nonce slices below would panic.
     if sealed.len() >= 24 + 16 {
         if let Ok(n) = XNonce::try_from(&sealed[..24]) {
             if let Ok(pt) = XChaCha20Poly1305::new((dek).into()).decrypt(
@@ -265,6 +268,7 @@ fn open_bare_content(dek: &[u8; 32], blob_id: &[u8; 32], sealed: &[u8]) -> Optio
             }
         }
     }
+    // WHY/PROOF: same hostile length, legacy 12-byte nonce layout — the split below would panic.
     if sealed.len() < 12 + 16 {
         return None;
     }

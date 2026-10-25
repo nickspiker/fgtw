@@ -5,7 +5,6 @@
 //!
 //! Two channels feed this: a friend's signed pong (`observed_addr`, trusted — the pong is contact-gated, so it comes from someone in our fleet/contacts) and an open `ReflectResponse` from any directory-serving node (untrusted — corroborated by quorum before adoption, so a single lying peer can't poison the address we then publish). See the traversal plan, P0.
 
-use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 /// Distinct untrusted sources that must agree on an address before we adopt it.
@@ -21,7 +20,8 @@ pub struct ReflexiveState {
     v4: Option<SocketAddr>,
     v6: Option<SocketAddr>,
     /// Untrusted observations awaiting corroboration: address → distinct source device pubkeys.
-    votes: HashMap<SocketAddr, HashSet<[u8; 32]>>,
+    /// A handful of racing addresses, each short of a quorum of two, so a plain list searched linearly.
+    votes: Vec<(SocketAddr, Vec<[u8; 32]>)>,
 }
 
 impl ReflexiveState {
@@ -58,8 +58,17 @@ impl ReflexiveState {
         let adopt = if trusted {
             true
         } else {
-            let voters = self.votes.entry(observed).or_default();
-            voters.insert(from);
+            let at = match self.votes.iter().position(|(a, _)| *a == observed) {
+                Some(at) => at,
+                None => {
+                    self.votes.push((observed, Vec::new()));
+                    self.votes.len() - 1
+                }
+            };
+            let voters = &mut self.votes[at].1;
+            if !voters.contains(&from) {
+                voters.push(from);
+            }
             voters.len() >= QUORUM
         };
         if !adopt {
@@ -82,7 +91,7 @@ impl ReflexiveState {
         }
         *slot = Some(observed);
         // Clear this address's pending votes; leave others (a different pending address may still be racing).
-        self.votes.remove(&observed);
+        self.votes.retain(|(a, _)| *a != observed);
         Some(observed)
     }
 

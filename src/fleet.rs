@@ -571,7 +571,8 @@ impl MembershipBlob {
                         return Err(FoldError::BadConsent { index: i });
                     }
                     // The consent must be from THIS ceremony, not a departed device's replayed past.
-                    if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
+                    // abs_diff, not (a - b).abs(): both stamps are peer-supplied, and a crafted consent_t overflowed the subtraction — a panic in debug, and in release a wrap to i64::MIN whose negative abs() passed the window check.
+                    if op.eagle_time.abs_diff(op.consent_t) > CONSENT_WINDOW_OSC as u64 {
                         return Err(FoldError::ConsentStale { index: i });
                     }
                     members.push(op.device_pubkey);
@@ -599,7 +600,7 @@ impl MembershipBlob {
                         if !op.verify_depart_consent(&leaver, floor) {
                             return Err(FoldError::BadConsent { index: i });
                         }
-                        if (op.eagle_time - op.consent_t).abs() > CONSENT_WINDOW_OSC {
+                        if op.eagle_time.abs_diff(op.consent_t) > CONSENT_WINDOW_OSC as u64 {
                             return Err(FoldError::ConsentStale { index: i });
                         }
                     }
@@ -715,6 +716,7 @@ impl MembershipBlob {
 
     /// Is `prior` an exact prefix of this chain? FGTW uses this to accept only forward extensions of the stored chain (optimistic concurrency: a writer who appended to a stale head fails this and re-fetches).
     pub fn extends(&self, prior: &MembershipBlob) -> bool {
+        // WHY/PROOF: either chain may be the stored or the fetched one — a longer `prior` is simply not a prefix, and slicing past our end would panic.
         prior.ops.len() <= self.ops.len() && self.ops[..prior.ops.len()] == prior.ops[..]
     }
 
@@ -1074,6 +1076,7 @@ impl SuccessorRecord {
         }
         let msg = succession_signing_bytes(&self.handle_proof, &old_gh, &self.new_genesis_hash);
         // An egg naming a scheme this build cannot verify is a hard reject, never a skip. Succession re-founds the identity; silently ignoring what cannot be checked is exactly the gap a forged vouch would walk through.
+        // WHY/PROOF: the scheme byte is peer-supplied and Mask is u16 — a shift of 16+ panics in debug and wraps in release, aliasing an unknown scheme onto a known bit; 15 is outside MASK_KNOWN, so it still rejects.
         if self.continuity_eggs.iter().any(|e| !scheme::covers(scheme::MASK_KNOWN, 1 << e.scheme.min(15))) {
             return Err("continuity egg names an unknown scheme".into());
         }
@@ -1156,6 +1159,7 @@ impl SuccessorRecord {
         let mut continuity_eggs = Vec::new();
         for field in section.get_fields("cegg") {
             let v = &field.values;
+            // WHY/PROOF: a succession record is peer-supplied and a cegg may carry fewer than three values — indexing would panic.
             let device_pubkey = take_ke32(v.first().ok_or("cegg: missing device")?, "cegg device")?;
             // Same fallback as the egg-tail scheme decode: the codec may round-trip a small `u` as a narrower type, so accept `u(_, false)` OR anything `u8::from_vsf_type` can read.
             let scheme = match v.get(1) {
@@ -1305,6 +1309,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
         }
     };
     let values = &all[base..];
+    // WHY/PROOF: ops are parsed from a peer-supplied chain — fewer than six values would panic the fixed indexing below; the kind-gated extras below stay `.get` for the same reason.
     if values.len() < 6 {
         return Err(format!("fleet op: need >=6 values, got {}", values.len()));
     }
@@ -1387,6 +1392,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
 
     // Remaining values are (scheme:u, sig:ge) egg pairs.
     let mut sigs = Vec::new();
+    // WHY/PROOF: an op from the wire may end on an odd value — the pair read below indexes i + 1.
     while i + 1 < values.len() {
         let scheme = match &values[i] {
             VsfType::u(v, false) => *v as u8,
