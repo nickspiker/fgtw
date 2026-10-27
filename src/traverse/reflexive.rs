@@ -5,7 +5,8 @@
 //!
 //! Two channels feed this: a friend's signed pong (`observed_addr`, trusted — the pong is contact-gated, so it comes from someone in our fleet/contacts) and an open `ReflectResponse` from any directory-serving node (untrusted — corroborated by quorum before adoption, so a single lying peer can't poison the address we then publish). See the traversal plan, P0.
 
-use std::net::{IpAddr, SocketAddr};
+use alloc::vec::Vec;
+use core::net::{IpAddr, SocketAddr};
 
 /// Distinct untrusted sources that must agree on an address before we adopt it.
 /// Trusted sources (a contact's pong, or the bootstrap seed) bypass this.

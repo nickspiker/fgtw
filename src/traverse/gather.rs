@@ -8,7 +8,7 @@
 //!
 //! The peer-side gather takes a plain [`PeerEndpoint`] slice rather than any caller's contact type. Photon's `Contact` and rustdesk's phonebook `Record` both flatten into that, so neither shape leaks in here — photon's two former entry points differed only in whether a peer's LAN address had to share our `/24`, which is now the explicit [`LanPolicy`].
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::candidate::{Candidate, CandidateKind, CandidateSet};
 

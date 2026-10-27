@@ -9,6 +9,8 @@
 //! The BLE transport (lock word + proximity beacon, below) delivers candidates by radio instead of by eyes — same ceremony, different selector; it ships later.
 
 use vsf::VsfType;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// NFC instant-add commitment: the keyed hash the PUBLIC binding request carries so the sponsor can verify the 32-byte secret `S` served over the tap. Bound to (device_pubkey, t) INSIDE the hash — a relay can't transplant it onto another candidate, because the sponsor recomputes with each candidate's own pubkey+stamp. `S` must be 32 random bytes: the hash is public, so a small preimage space would be brute-forceable offline and void the proximity gate.
 pub fn nfc_secret_hash(secret: &[u8; 32], device_pubkey: &[u8; 32], t: i64) -> [u8; 32] {
@@ -39,7 +41,7 @@ pub fn masked_device_words(device_pubkey: &[u8; 32], identity_seed: &[u8; 32]) -
 
 /// The zero word (digit 0), capitalised to match voca's camelCase encode — the left-pad for keys with leading zeros, so the word count never shrinks and the completeness check stays exact.
 fn zero_word() -> String {
-    let w = std::str::from_utf8(voca::FULL.alphabet[0]).expect("voca words are ASCII");
+    let w = core::str::from_utf8(voca::FULL.alphabet[0]).expect("voca words are ASCII");
     let mut s = String::with_capacity(w.len());
     let mut chars = w.chars();
     if let Some(c) = chars.next() {
@@ -80,7 +82,9 @@ pub fn pair_word_tokens(s: &str) -> usize {
 }
 
 /// Lazy index over the voca FULL alphabet for live spell-checking: one sorted copy, binary-searched for exact membership and partition-pointed for prefix tests. Built once, ~3177 entries.
+#[cfg(feature = "std")]
 static WORD_INDEX: std::sync::OnceLock<Vec<&'static [u8]>> = std::sync::OnceLock::new();
+#[cfg(feature = "std")]
 fn word_index() -> &'static [&'static [u8]] {
     WORD_INDEX.get_or_init(|| {
         let mut sorted: Vec<_> = voca::FULL.alphabet.to_vec();
@@ -90,6 +94,7 @@ fn word_index() -> &'static [&'static [u8]] {
 }
 
 /// Exact membership in the voca FULL alphabet.
+#[cfg(feature = "std")]
 fn is_word(sorted: &[&[u8]], w: &[u8]) -> bool {
     sorted.binary_search(&w).is_ok()
 }
@@ -107,7 +112,7 @@ pub fn pair_word_list(s: &str) -> Vec<String> {
     let mut cur = String::new();
     for c in t.chars() {
         if c.is_ascii_uppercase() && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+            out.push(core::mem::take(&mut cur));
         }
         cur.push(c.to_ascii_lowercase());
     }
@@ -118,6 +123,7 @@ pub fn pair_word_list(s: &str) -> Vec<String> {
 }
 
 /// Live spell-check of a (possibly partial) pairing entry against the voca FULL list. Every completed word must be an exact list member; the final, still-being-typed word passes while it's still a PREFIX of some list word, so nothing flashes red mid-word — but the instant it can't become any list word ("contrav…", "spontani…") it's flagged, and a full 23-word entry (or a trailing space) demands exactness from every token. Case-insensitive. Returns the first offender for the status line.
+#[cfg(feature = "std")]
 pub fn first_bad_pair_word(s: &str) -> Option<String> {
     let words = pair_word_list(s);
     if words.is_empty() {
@@ -169,6 +175,7 @@ pub fn parse_pair_event(bytes: &[u8]) -> Option<(String, [u8; 32])> {
 }
 
 /// True when the entry is fully typed: exactly `PAIR_WORD_COUNT` tokens and EVERY token an exact list member. This is the completeness gate for the network match-check: a bare token count trips on the 23rd word's first character (the token exists from its first letter), firing a decode that then complains "unrecognised word" about a word the user simply hasn't finished typing.
+#[cfg(feature = "std")]
 pub fn pair_entry_complete(s: &str) -> bool {
     let words = pair_word_list(s);
     words.len() == PAIR_WORD_COUNT && {
@@ -239,6 +246,7 @@ pub fn device_name_default(device_pubkey: &[u8; 32], identity_seed: &[u8; 32]) -
 pub const WORD_MAC_LEN: usize = 12;
 
 /// A fresh lock word for ONE ceremony, minted on the OLD device and typed into the new one. Fresh randomness each time, so holding the handle buys an attacker nothing; rerolled on every abort. Lowercase — the entry side lowercases anyway.
+#[cfg(feature = "std")]
 pub fn lock_word() -> String {
     let base = voca::FULL.alphabet.len() as u64;
     // u64 modulo bias over a 3177-word base is ~1e-16 — noise against an 11.6-bit secret.
@@ -247,6 +255,7 @@ pub fn lock_word() -> String {
 }
 
 /// Exact-member spell check for the lock word entry (case/whitespace tolerant), reusing the pairing word index.
+#[cfg(feature = "std")]
 pub fn is_lock_word(s: &str) -> bool {
     let w = s.trim().to_ascii_lowercase();
     is_word(word_index(), w.as_bytes())
@@ -329,7 +338,7 @@ mod tests {
         assert_eq!(first_bad_pair_word("contraversy "), Some("contraversy".into()));
         assert_eq!(first_bad_pair_word("SpontaniousAble"), Some("spontanious".into()));
         // An in-progress word that is still a valid prefix stays green.
-        let first = std::str::from_utf8(voca::FULL.alphabet[100]).unwrap();
+        let first = core::str::from_utf8(voca::FULL.alphabet[100]).unwrap();
         assert_eq!(first_bad_pair_word(&first[..2]), None);
         // Completeness gate: a full generated entry is complete; the same entry cut mid-last-word is NOT, even tho the token count already reads 23.
         assert!(pair_entry_complete(&words));
@@ -367,7 +376,7 @@ mod tests {
             let mut cur = String::new();
             for c in words.chars() {
                 if c.is_ascii_uppercase() && !cur.is_empty() {
-                    v.push(std::mem::take(&mut cur));
+                    v.push(core::mem::take(&mut cur));
                 }
                 cur.push(c);
             }
@@ -384,7 +393,7 @@ mod tests {
         // Wrong word count (incomplete entry) is rejected before any decode.
         assert!(words_to_pair_pubkey("justOneWord").is_err());
         // 23 copies of the LAST alphabet word decode above 2^256 — a valid-looking entry that isn't a key.
-        let last = std::str::from_utf8(voca::FULL.alphabet[voca::FULL.base() - 1]).unwrap();
+        let last = core::str::from_utf8(voca::FULL.alphabet[voca::FULL.base() - 1]).unwrap();
         let too_big = vec![last; PAIR_WORD_COUNT].join(" ");
         assert!(words_to_pair_pubkey(&too_big).is_err());
         // A garbage token fails the decode loudly.
@@ -401,7 +410,7 @@ mod tests {
             assert_eq!(w, w.to_ascii_lowercase(), "minted lowercase: {w}");
         }
         // Case/whitespace tolerance, on a word actually in the list.
-        let real = std::str::from_utf8(voca::FULL.alphabet[100]).unwrap();
+        let real = core::str::from_utf8(voca::FULL.alphabet[100]).unwrap();
         let mut dressed = String::from(" ");
         dressed.push(real.chars().next().unwrap().to_ascii_uppercase());
         dressed.push_str(&real[1..]);

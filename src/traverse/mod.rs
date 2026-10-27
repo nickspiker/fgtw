@@ -10,11 +10,14 @@
 pub mod candidate;
 pub mod gather;
 pub mod reflexive;
+/// Path liveness by wall clock (`Instant`): an OS-timed concern, so `std` only — the codec, candidates and reflexive state below are plain data.
+#[cfg(feature = "std")]
 pub mod session;
 pub mod wire;
 
 pub use candidate::{Candidate, CandidateKind, CandidateSet};
 pub use reflexive::ReflexiveState;
+#[cfg(feature = "std")]
 pub use session::{PeerSession, PunchState, Unreachable, ValidatedPath, KEEPALIVE_INTERVAL, PATH_TTL};
 pub use wire::PunchMessage;
 

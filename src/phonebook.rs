@@ -23,6 +23,8 @@ use blake3::Hasher;
 /// Divides 4 KiB exactly (16 records per block), which keeps a probe inside one read and leaves a block-level Merkle tree an option later without records straddling block boundaries.
 use crate::fleet::{scheme, Egg};
 use crate::pq::{FleetSigner, KeyBundle};
+use alloc::string::String;
+use alloc::vec::Vec;
 
 pub const STRIDE: usize = 256;
 
@@ -812,7 +814,7 @@ impl Record {
 pub struct RegistryView {
     pub count: Option<Record>,
     pub pointers: Vec<Record>,
-    pub blobs: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+    pub blobs: alloc::collections::BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 impl RegistryView {
@@ -942,7 +944,7 @@ impl Slice {
     pub fn to_document(&self) -> Result<Vec<u8>, String> {
         use vsf::VsfType;
         vsf::VsfBuilder::new()
-            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .creation_time_oscillations(crate::now_oscillations())
             .provenance_only()
             .add_inline_field("slice_bits", vec![VsfType::u3(self.slice_bits as u8)])
             .add_inline_field("slice_id", vec![VsfType::u5(self.slice_id)])

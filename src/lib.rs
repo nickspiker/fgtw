@@ -18,8 +18,7 @@
 //! - **client** (feature) — the std HTTP oracle: fetch-then-sign, announce, publish.
 //!   Only real clients enable it; the worker never does.
 //!
-//! The crate is `std` for now: its only consumers (photon and the FGTW worker, a wasm32 cdylib) are both `std`, and the `vsf` codec it rides pulls `std` transitively (via `crypto`/`inspect`).
-//! A `#![no_std]` core is a later step, once a genuinely `no_std` consumer (an embedded signer) exists and `vsf`'s crypto/clock surface is factored for it — until then it would be `alloc::` friction with no `no_std` binary to show for it.
+//! The crate is `no_std` + `alloc` without the `std` feature (on by default): the `no_std` consumer arrived 2026-10-26 — ferros's Photon client folds its fleet's chain, verifies a sponsor's eggs, opens its fan-out wrap and shows its pairing words on a bare-metal phone with no OS clock to stamp a document. Everything a verifier or a joiner needs lives in the base; what needs an OS (the seed oracle, the OS RNG for sealing, std::net, vsf's text tables) sits behind `std`.
 //!
 //! ## What lives here (generic) vs stays in photon (messaging)
 //!
@@ -27,6 +26,30 @@
 //!
 //! **NOT here — stays in photon:** CLUTCH (friendship key exchange), Photon Transfer / the braid, presence ping/pong, contacts/conversations.
 //! That's *messaging*, not *identity* — the calendar doesn't want it.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#[macro_use]
+extern crate alloc;
+
+/// Eagle time now, in oscillations — what every document this crate builds is stamped with. With `std` it is the OS clock (`vsf::eagle_time_oscillations`); without it there is no clock to read, so the embedding tells the crate the time with [`set_clock`] (a bare-metal consumer reads its own RTC first) and this returns the last value set, 0 until then.
+#[cfg(feature = "std")]
+pub fn now_oscillations() -> i64 {
+    vsf::eagle_time_oscillations()
+}
+
+#[cfg(not(feature = "std"))]
+static CLOCK: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// The time a `no_std` embedding knows (eagle oscillations), for the documents this crate stamps — set it before building one.
+#[cfg(not(feature = "std"))]
+pub fn set_clock(oscillations: i64) {
+    CLOCK.store(oscillations, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "std"))]
+pub fn now_oscillations() -> i64 {
+    CLOCK.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Device identity keypair — the deterministic Ed25519 signing key (`Keypair`) fleet ops and attestations are signed with.
 pub mod keys;
@@ -68,12 +91,12 @@ pub fn fanout_blob_epoch_pub(bytes: &[u8]) -> Option<pq::KeyBundle> {
 pub mod fanout;
 
 /// Scoped blobs — one ciphertext, many keyholders: a data key wrapped per reader into a private slot only that reader can find. The sharing primitive for avatars now and attachments later; see photon docs/scoped-blobs.md.
-#[cfg(feature = "fanout")]
+#[cfg(all(feature = "fanout", feature = "std"))]
 pub mod scoped_blob;
 
 /// Fleet-shared encrypted state — the codec for the slot each app writes its shared state into (photon: the contact roster; calendar: events).
 /// Data model + serialize + CRDT merge; the seal-and-push transport is the client's.
-#[cfg(feature = "fanout")]
+#[cfg(all(feature = "fanout", feature = "std"))]
 pub mod fstate;
 
 /// Pairing — the device-ADD ceremony word codec (voca words, fleet-masked device pubkey), spell-check, and the BLE beacon/lock-word primitives for the later radio transport. The binding-request signing bytes live in [`fleet`] (the fold verifies consent there; the worker folds without this feature).

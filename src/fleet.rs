@@ -33,6 +33,8 @@
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use vsf::VsfType;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// Signature-scheme tag (the egg label). Wire-stable: append, never renumber.
 pub mod scheme {
@@ -970,7 +972,7 @@ impl MembershipBlob {
         }
         // Default build carries hp + hb — a provenance-only doc is unverifiable under read_verified, and from_vsf_bytes below refuses to parse one.
         vsf::VsfBuilder::new()
-            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .creation_time_oscillations(crate::now_oscillations())
             .add_section_direct(section)
             .build()
             .map_err(|e| format!("fleet to_vsf: {e}"))
@@ -1131,7 +1133,7 @@ impl SuccessorRecord {
     /// Encode to a complete (unsigned) VSF file — the form served from the succession slot and re-parsed by a contact.
     pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
         vsf::VsfBuilder::new()
-            .creation_time_oscillations(vsf::eagle_time_oscillations())
+            .creation_time_oscillations(crate::now_oscillations())
             .add_section_direct(self.to_section())
             .build()
             .map_err(|e| format!("succession to_vsf: {e}"))

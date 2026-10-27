@@ -8,6 +8,8 @@
 //! **This module is sans-io** like [`crate::traverse`]: envelope build/peel and the stream frame codec live here with tests; the socket pump (tokio/tungstenite) is each app's concern, so `fgtw` stays free of async deps.
 
 use crate::fleet::Egg;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use vsf::types::VsfType;
 
 /// The rustdesk fork's service tag.
@@ -47,7 +49,7 @@ pub fn build_relay_envelope(
         fields.push(("svc".to_string(), VsfType::d(svc.to_string())));
     }
     let unsigned = vsf::VsfBuilder::new()
-        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .creation_time_oscillations(crate::now_oscillations())
         .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section("relay", fields)
         .build()
@@ -229,7 +231,7 @@ mod tests {
 }
 
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 
 /// The addresses a peer can be punched at, offered over the relay pipe.
 ///

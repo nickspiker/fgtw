@@ -19,6 +19,8 @@
 //! [`SigningBundle::derive`] seeds each scheme's keygen from `BLAKE3(fingerprint ‖ scheme)`, so a wiped device on the same hardware re-derives the same Falcon and SPHINCS+ keys — the property the Ed25519 device key already has, extended to every scheme. Without it, "same hardware, same keys" would be true for one scheme out of three, and the stateless-host design would quietly not hold for the PQ half. (The fingerprint itself is hardware-backed on macOS only; see the plan's known-limits note.)
 
 use crate::fleet::{scheme, Egg};
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Domain tag for [`KeyBundle::commit`], so a bundle commitment can never be confused with any other 32-byte hash in the system.
 const COMMIT_DOMAIN: &str = "PHOTON_KEY_BUNDLE_v1";

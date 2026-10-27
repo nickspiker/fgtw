@@ -12,7 +12,9 @@
 //! Both messages carry their crypto in the VSF header (timestamp, signer pubkey, provenance hash, ed25519 signature). The probe is header-only — a name-only TOC entry with no body,
 //! the minimal wire form. The ack adds one `obs` field carrying the address the responder saw the probe arrive from, which is what makes an ack double as a reflexive-address echo.
 
-use std::net::{IpAddr, SocketAddr};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::net::{IpAddr, SocketAddr};
 
 use vsf::file_format::VsfHeader;
 use vsf::types::VsfType;
@@ -145,7 +147,7 @@ pub fn socketaddr_to_bytes(addr: &SocketAddr) -> Vec<u8> {
 pub fn bytes_to_socketaddr(bytes: &[u8]) -> Option<SocketAddr> {
     match bytes.len() {
         6 => {
-            let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+            let ip = IpAddr::V4(core::net::Ipv4Addr::new(
                 bytes[0], bytes[1], bytes[2], bytes[3],
             ));
             Some(SocketAddr::new(
@@ -156,7 +158,7 @@ pub fn bytes_to_socketaddr(bytes: &[u8]) -> Option<SocketAddr> {
         18 => {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&bytes[0..16]);
-            let ip = IpAddr::V6(std::net::Ipv6Addr::from(octets));
+            let ip = IpAddr::V6(core::net::Ipv6Addr::from(octets));
             Some(SocketAddr::new(
                 ip,
                 u16::from_be_bytes([bytes[16], bytes[17]]),

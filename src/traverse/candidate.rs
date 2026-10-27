@@ -8,7 +8,8 @@
 //! 3. **IPv4 LAN host** — same-subnet / hairpin: avoids the router's often-broken hairpin and AP isolation.
 //! 4. **IPv4 reflexive** — the punched-thru public v4 address; the common WAN path.
 
-use std::net::SocketAddr;
+use alloc::vec::Vec;
+use core::net::SocketAddr;
 
 /// What kind of address a candidate is — determines its priority and how it was learned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

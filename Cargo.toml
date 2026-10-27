@@ -21,16 +21,18 @@ crate-type = ["rlib"]
 # The core (fleet fold/verify, fan-out crypto, protocol codec) is what the WASM worker and every client share — always compiled.
 # `fanout` adds the per-member fan-out + roster codec + pairing words (extra crypto deps); a wasm signer can enable it without `client`.
 # `client` adds the std HTTP oracle (fetch-then-sign, announce, publish) that only real clients need — the worker never enables it. It implies `fanout`.
-default = ["client"]
+default = ["std", "client"]
+# `std` is what the host apps and the worker have; without it the crate is `no_std` + `alloc` — the fold, the key bundle and egg verification, the bind request, the fan-out OPEN, the pairing words — for a bare-metal consumer (ferros's Photon client, 2026-10-26). `std` adds the clock-stamped builders' seed mirror, the seal side of the fan-out (an OS RNG), scoped blobs, the fleet-state codec (vsf's text tables), the phonebook/traverse/pipe helpers (std::net), and the pairing word index.
+std = ["vsf/std", "vsf/crypto", "vsf/inspect", "dep:rand", "voca?/std", "num-bigint?/std"]
 # `fanout` pulls the fan-out crypto + roster codec + pairing words and their deps; a wasm signer can enable it without `client`. The worker enables neither (base = fleet fold/verify only), so none of these deps reach its wasm surface.
 # vsf/text-encode is here for the fstate codec's published_name (`x` is Huffman text; the tables are ~9 MB, so this must never ride into the worker — and can't, fstate is cfg'd behind this feature).
-fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand", "dep:voca", "dep:num-bigint", "vsf/text-encode"]
+fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:voca", "dep:num-bigint"]
 # `client` also pulls the PQ SIGNING halves (`fn-dsa` keygen+sign, fips205's RNG). Base carries only the verify-only crates, so the worker can check a three-egg chain without ever holding a signing key or an RNG.
-client = ["fanout", "dep:fn-dsa", "fips205/default-rng"]
+client = ["std", "fanout", "dep:fn-dsa", "fips205/default-rng", "vsf/text-encode"]
 
 [dependencies]
 # vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.
-vsf = { version = "0.10", path = "../vsf", default-features = false, features = ["crypto", "inspect"] }
+vsf = { version = "0.10", path = "../vsf", default-features = false, features = ["crypto-verify"] }
 blake3 = { version = "1", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 # The two post-quantum egg families, VERIFY side — base, because the worker folds chains with the same code clients sign with. Both pure Rust, no build.rs, no C. `fn-dsa-vrfy` is the verify-only crate and declares no RNG; fips205 needs none to verify, so `default-rng` (which is what drags in getrandom) stays off here and is enabled by `client`.
@@ -39,10 +41,11 @@ fips205 = { version = "0.4", default-features = false, features = ["slh_dsa_sha2
 
 # fanout-only. Versions match photon's so the feature union shares one crate copy (not a second).
 x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
-chacha20poly1305 = { version = "0.11.0-rc.2", optional = true }
+chacha20poly1305 = { version = "0.11.0-rc.2", default-features = false, features = ["alloc"], optional = true }
 rand = { version = "0.8", optional = true }
-voca = { version = "0.0.0", optional = true }
-num-bigint = { version = "0.4", optional = true }
+# A path dep like vsf: the registry's 0.0.0 is std-only; the sibling checkout is `no_std` + `alloc` (2026-10-26).
+voca = { version = "0.0.1", path = "../voca", default-features = false, optional = true }
+num-bigint = { version = "0.4", default-features = false, optional = true }
 # client-only: the PQ signing halves. Deterministic keygen seeds a `rand::StdRng` from the machine fingerprint, exactly as the Ed25519 device key derives — so PQ keys re-derive on the same hardware too, and the stateless-host story holds for every scheme, not just one.
 fn-dsa = { version = "0.4", default-features = false, optional = true }
 

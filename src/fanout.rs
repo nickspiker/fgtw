@@ -10,9 +10,13 @@
 //! This is the crypto core; the always-online transport that posts/fetches these blobs (and drives grow/shrink publishes) is the client's job.
 
 use crate::keys::Keypair;
+#[cfg(feature = "std")]
 use ed25519_dalek::VerifyingKey;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// A fresh random fleet key — minted at genesis and on shrink only; devices RECEIVE the current one from the fan-out.
+#[cfg(feature = "std")]
 pub fn new_fleet_key() -> [u8; 32] {
     rand::random()
 }
@@ -36,6 +40,7 @@ pub struct FanoutWrap {
 }
 
 /// Ed25519 device pubkey → its X25519 (Montgomery) counterpart, so we can seal to a key already in the membership chain. The matching secret side is `SigningKey::to_scalar_bytes` (§`fanout_open`); `to_montgomery` and the clamped scalar agree on the same point.
+#[cfg(feature = "std")]
 fn ed_to_x25519_public(ed_pubkey: &[u8; 32]) -> Option<[u8; 32]> {
     Some(VerifyingKey::from_bytes(ed_pubkey).ok()?.to_montgomery().to_bytes())
 }
@@ -73,6 +78,7 @@ fn fanout_keys(
 }
 
 /// Seal `fleet_key` separately to each member ira for `(handle_proof, kfp)`. `members` carries bare ed25519 device pubkeys straight off the membership chain — the caller passes every UNLOCKED member (its own device included); a locked or departed ira is simply omitted and cannot recover the key.
+#[cfg(feature = "std")]
 pub fn fanout_seal(
     handle_proof: &[u8; 32],
     fleet_key: &[u8; 32],
