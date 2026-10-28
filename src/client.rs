@@ -8,8 +8,11 @@ use crate::fanout::{fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, Fa
 use crate::fleet::{
     bindreq_signing_bytes, et_to_osc, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
 };
+#[cfg(feature = "std")]
 use crate::fstate::{fstate_from_bytes, fstate_to_bytes, FleetState};
 use crate::keys::Keypair;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use vsf::VsfType;
 
 /// One HTTP response from FGTW: the status code and the body bytes.
@@ -37,7 +40,7 @@ pub trait FleetSealer {
 fn unsigned_req(section: vsf::VsfSection) -> Result<Vec<u8>, String> {
     // Default build carries hp + hb, so even unsigned requests are verifiable documents.
     vsf::VsfBuilder::new()
-        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .creation_time_oscillations(crate::now_oscillations())
         .add_section_direct(section)
         .build()
         .map_err(|e| format!("fgtw request build: {e}"))
@@ -178,7 +181,7 @@ pub fn ensure_member<T: FgtwTransport>(
     }
     // New fleets found under v2 (no inert identity_sig; docs/identity-succession.md). Existing v1 chains still fold via the retained v1 path.
     let blob =
-        MembershipBlob::genesis_v2(device_key, *handle_proof, identity_seed, vsf::eagle_time_oscillations());
+        MembershipBlob::genesis_v2(device_key, *handle_proof, identity_seed, crate::now_oscillations());
     // A rejected publish is NOT fatal by itself (a racing sibling may have won the slot), but it must not vanish either — the refetch below adjudicates, and the publish error rides along if that also comes up empty.
     let publish_err = publish(t, &blob).err();
     // Trust the network, not ourselves: re-fetch the canonical chain and accept ONLY if it names this device. The fleet slot has no compare-and-set, so two devices racing a fresh handle's genesis both "publish" but the slot settles on ONE — the loser re-reads here, finds it isn't a member, and fails cleanly instead of announcing as a phantom founder.
@@ -220,7 +223,7 @@ pub fn push_checkpoint<T: FgtwTransport>(
         // Someone already checkpointed at-or-past our k (or we skipped one) — the chain, not us, is the truth.
         return Ok(latest);
     }
-    blob.checkpoint(device_key, vsf::eagle_time_oscillations(), k, commit, fanout_epoch);
+    blob.checkpoint(device_key, crate::now_oscillations(), k, commit, fanout_epoch);
     match publish(t, &blob) {
         Ok(()) => Ok(None),
         Err(e) if e == "fleet: stale" => {
@@ -256,7 +259,7 @@ pub fn declare_device<T: FgtwTransport>(
         if crate::fleet::scheme::covers(blob.declared_mask(&me), want) {
             return Ok(()); // already declared at least this much — idempotent
         }
-        blob.declare(signer, vsf::eagle_time_oscillations());
+        blob.declare(signer, crate::now_oscillations());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
@@ -292,9 +295,9 @@ fn lock_op_chain<T: FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, 
             return Ok(()); // already in the wanted state
         }
         if lock {
-            blob.lock(signer, *device, vsf::eagle_time_oscillations());
+            blob.lock(signer, *device, crate::now_oscillations());
         } else {
-            blob.unlock(signer, *device, vsf::eagle_time_oscillations());
+            blob.unlock(signer, *device, crate::now_oscillations());
         }
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
@@ -390,8 +393,8 @@ pub fn bind_device<T: FgtwTransport>(
         }
         // A joiner that posted a bundle is added declared — the only join a promoted fleet accepts.
         match &req.bundle {
-            Some(b) => blob.add_declared(member_key, req.device_pubkey, vsf::eagle_time_oscillations(), req.t, req.device_sig.clone(), b.clone()),
-            None => blob.add(member_key, req.device_pubkey, vsf::eagle_time_oscillations(), req.t, req.device_sig.clone()),
+            Some(b) => blob.add_declared(member_key, req.device_pubkey, crate::now_oscillations(), req.t, req.device_sig.clone(), b.clone()),
+            None => blob.add(member_key, req.device_pubkey, crate::now_oscillations(), req.t, req.device_sig.clone()),
         }
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
@@ -415,7 +418,7 @@ pub fn depart_device<T: FgtwTransport>(
         if !members.contains(&me) {
             return Ok(()); // already out — idempotent
         }
-        blob.depart(device_key, vsf::eagle_time_oscillations());
+        blob.depart(device_key, crate::now_oscillations());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
@@ -445,7 +448,7 @@ pub fn depart_device_consented<T: FgtwTransport>(
         blob.remove_consented(
             approver_key,
             *leaving,
-            vsf::eagle_time_oscillations(),
+            crate::now_oscillations(),
             consent_t,
             consent.clone(),
         );
@@ -463,7 +466,7 @@ pub fn depart_device_consented<T: FgtwTransport>(
 /// Build + POST a device-signed envelope (ke/ge header, canonical scheme) around `section` — the shape the worker's signature-gated ops verify.
 fn signed_req<T: FgtwTransport>(t: &T, device_key: &impl crate::pq::FleetSigner, section: vsf::VsfSection, what: &str) -> Result<FgtwResponse, String> {
     let unsigned = vsf::VsfBuilder::new()
-        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .creation_time_oscillations(crate::now_oscillations())
         .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section_direct(section)
         .build()
@@ -482,7 +485,7 @@ pub fn bindreq_put<T: FgtwTransport>(
     nfc_secret: &[u8; 32],
 ) -> Result<i64, String> {
     use ed25519_dalek::Signer;
-    let now = vsf::eagle_time_oscillations();
+    let now = crate::now_oscillations();
     let me = device_key.keypair().public.to_bytes();
     // NFC commitment computed HERE because it binds the stamp this call mints (all-zero secret = no NFC offered → zero hash).
     let nfc_hash = if *nfc_secret == [0u8; 32] {
@@ -621,7 +624,7 @@ pub fn bindreq_list<T: FgtwTransport>(
         return Err(format!("FGTW transport {}", resp.status));
     }
     let (_, stored) = parse_section(&resp.body)?;
-    let now = vsf::eagle_time_oscillations();
+    let now = crate::now_oscillations();
     let mut out = Vec::new();
     for field in stored.get_fields("req") {
         // Positional: [ke device_pubkey, e6 t, ge device_sig, ge identity_sig] — mirror of the worker's build.
@@ -682,7 +685,7 @@ pub fn post_fanout<T: FgtwTransport>(
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     section.add_field("bl", VsfType::ge(fanout_to_bytes(revision, &kfp, &device_key.keypair().public.to_bytes(), &epoch_pub, wraps)));
     let unsigned = vsf::VsfBuilder::new()
-        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .creation_time_oscillations(crate::now_oscillations())
         .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section_direct(section)
         .build()
@@ -894,6 +897,7 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
 // ── Fleet state transport ──
 
 /// Publish the fleet-shared state (roster + settings layers): seal it under the fleet key and PUT it to the membership-gated slot. The envelope is device-signed (ke/gm header, every scheme the writer holds at the envelope tier) so FGTW checks the writer against the folded fleet chain — any fleet device may write.
+#[cfg(feature = "std")]
 pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     t: &T,
     s: &S,
@@ -906,9 +910,9 @@ pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     let mut section = vsf::VsfSection::new("fstate_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     section.add_field("bl", VsfType::ge(sealed));
-    section.add_field("t", VsfType::e(vsf::types::EtType::e6(vsf::eagle_time_oscillations())));
+    section.add_field("t", VsfType::e(vsf::types::EtType::e6(crate::now_oscillations())));
     let unsigned = vsf::VsfBuilder::new()
-        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .creation_time_oscillations(crate::now_oscillations())
         .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
         .add_section_direct(section)
         .build()
@@ -925,6 +929,7 @@ pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
 }
 
 /// Fetch + open the fleet-shared state (None if none published yet; an old roster-only blob reads as settings-empty). The GET is unauthenticated — the payload is ciphertext only fleet members can open — so the pull just needs the fleet key.
+#[cfg(feature = "std")]
 pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
     t: &T,
     s: &S,

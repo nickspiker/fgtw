@@ -266,13 +266,14 @@ impl FleetSigner for crate::keys::Keypair {
     }
 }
 
-#[cfg(feature = "client")]
+#[cfg(feature = "sign")]
 pub use signing::{epoch_bundle, SigningBundle};
 
-#[cfg(feature = "client")]
+#[cfg(feature = "sign")]
 mod signing {
     use super::{scheme, Egg, FleetSigner, KeyBundle};
     use crate::keys::Keypair;
+    use alloc::vec::Vec;
     use rand::{rngs::StdRng, SeedableRng};
 
     /// One device's secret keys across every scheme it can sign with.

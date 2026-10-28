@@ -51,6 +51,33 @@ pub fn now_oscillations() -> i64 {
     CLOCK.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Thirty-two fresh random bytes — a fleet key, a fan-out ephemeral. With `std` the OS RNG (`rand`); without it the entropy source the embedding registers with [`set_entropy`] (a bare-metal consumer's kernel entropy).
+#[cfg(feature = "std")]
+pub fn random32() -> [u8; 32] {
+    rand::random()
+}
+
+#[cfg(not(feature = "std"))]
+static ENTROPY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The entropy a `no_std` embedding supplies for the keys this crate mints — register it before minting or sealing anything.
+#[cfg(not(feature = "std"))]
+pub fn set_entropy(fill: fn(&mut [u8])) {
+    ENTROPY.store(fill as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Panics when no entropy source was registered — fail loud: a key minted from a fixed pattern would be a skeleton key.
+#[cfg(not(feature = "std"))]
+pub fn random32() -> [u8; 32] {
+    let p = ENTROPY.load(core::sync::atomic::Ordering::Acquire);
+    assert!(p != 0, "fgtw: no entropy source registered (set_entropy) — refusing to mint a key from nothing");
+    // SAFETY: ENTROPY is only ever stored from a `fn(&mut [u8])` in set_entropy, and is nonzero here, so the usize is that function pointer.
+    let fill: fn(&mut [u8]) = unsafe { core::mem::transmute::<usize, fn(&mut [u8])>(p) };
+    let mut out = [0u8; 32];
+    fill(&mut out);
+    out
+}
+
 /// Device identity keypair — the deterministic Ed25519 signing key (`Keypair`) fleet ops and attestations are signed with.
 pub mod keys;
 
@@ -58,6 +85,9 @@ pub mod keys;
 /// The authority: valid signature + hash-chain link + signer-was-a-prior-member.
 /// The one source of truth shared by the worker (verify) and clients (fetch-then-sign).
 pub mod fleet;
+
+/// The attest verdict — resume, join, mint or wait, from every chain this device can see (its own, its LAN peers', the seed's); one pure function so every client decides identically.
+pub mod attest;
 /// Multi-scheme signing: key bundles, scheme-dispatched verification (base), and the deterministic signing side (`client`). The worker verifies three-egg chains with this.
 pub mod pq;
 
@@ -122,5 +152,5 @@ pub mod blob {}
 /// The FGTW client oracle: fetch-then-sign, publish, pairing, fan-out + roster transport, epoch rotation.
 /// Transport- and AEAD-agnostic via the [`client::FgtwTransport`] + [`client::FleetSealer`] traits — the app injects its own HTTP + roster crypto, so this crate stays reqwest-free.
 /// Gated behind the `client` feature; the worker never compiles it.
-#[cfg(feature = "client")]
+#[cfg(feature = "protocol")]
 pub mod client;
