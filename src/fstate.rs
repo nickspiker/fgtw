@@ -38,6 +38,9 @@ pub struct RosterEntry {
     pub trust_level: u8,
     /// The friend's own chosen display name, adopted from their pong. Synced like the avatar pin so a fresh sibling shows real names instantly instead of pseudonyms until each friend happens to come online. Zero trust — the pinned key carries the trust; empty renders the keyed pseudonym.
     pub published_name: String,
+    /// They have added us too (the consent gate, 2026-08-25): whichever fleet device hears the friend's knock records it here, so the device running the ceremony learns it on the next merge even when the knock never reached it (2026-10-29: Josh knocked one desktop, the MacBook owned the ceremony, and the handshake waited forever).
+    /// Absent on the wire reads as true — entries written before this field are grandfathered friendships, as a stored contact without the field is.
+    pub consent: bool,
 }
 
 // Version history (the bump is the flag-day: an old blob fails the read, the roster re-syncs from live contacts and the settings re-push — both are resyncable caches, so a bump costs one re-push).
@@ -207,6 +210,8 @@ fn roster_section_bytes(entries: &[RosterEntry]) -> Vec<u8> {
                     VsfType::u3(e.trust_level),
                     label("name"),
                     VsfType::x(e.published_name.clone()),
+                    label("consent"),
+                    VsfType::u3(e.consent as u8),
                 ],
             )
             .expect("roster row");
@@ -259,6 +264,8 @@ fn decode_roster_section(sec: &SectionBuilder) -> Vec<RosterEntry> {
             woven: woven != 0,
             trust_level,
             published_name,
+            // Absent = an entry written before the field: a grandfathered friendship, mutual.
+            consent: get_u3(&m, "consent").is_none_or(|v| v != 0),
         });
     }
     out
@@ -498,6 +505,7 @@ fn roster_entry_canon(e: &RosterEntry) -> impl Ord + '_ {
         e.woven,
         e.trust_level,
         &e.published_name,
+        e.consent,
     )
 }
 
@@ -597,7 +605,20 @@ mod tests {
             ceremony_owner: [hp + 2; 32],
             woven: hp % 2 == 0,
             trust_level: hp % 4,
+            consent: hp % 3 != 0,
         }
+    }
+
+    /// "They have added us" survives the wire both ways: a WeAsked entry stays unconsented, so the ceremony owner never arms on a stale default.
+    #[test]
+    fn consent_rides_the_roster() {
+        let mut asked = roster_entry(3, 200, false);
+        asked.consent = false;
+        let mut mutual = roster_entry(4, 200, false);
+        mutual.consent = true;
+        let back = roster_from_bytes(&roster_to_bytes(&[asked, mutual])).unwrap();
+        assert!(!back.iter().find(|e| e.handle_proof == [3; 32]).unwrap().consent);
+        assert!(back.iter().find(|e| e.handle_proof == [4; 32]).unwrap().consent);
     }
 
     /// The pre-v6 blobs still sitting in live slots must read as ABSENT, not as an error — an error aborts pull-merge-push and no v6 device could ever re-seed the slot.
