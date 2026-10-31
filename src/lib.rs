@@ -138,11 +138,10 @@ pub mod phonebook;
 pub mod traverse;
 pub mod pipe;
 
-/// The FGTW wire protocol — the GENERIC messages: announce/challenge, fleet ops, avatar, blob.
-/// The photon-specific messages (chat, CLUTCH, PT) stay in photon; `protocol.rs` gets SPLIT.
-/// no_std codec.
-/// ⏳ migrate the generic half of photon `protocol.rs`.
-pub mod protocol {}
+/// The FGTW wire protocol — the GENERIC frames between fleet devices: the LAN beacon, the binding and departure requests, the membership chain and fan-out over the mesh (2026-10-31). no_std codec, behind `fanout` (the pairing commitments and words).
+/// The photon-specific messages (chat, CLUTCH, PT) stay in photon; announce/challenge, avatar and blob are still photon's ⏳.
+#[cfg(feature = "fanout")]
+pub mod protocol;
 
 /// Avatar + blob content storage on FGTW (put/get, per-identity, rate-limited).
 /// Generic.

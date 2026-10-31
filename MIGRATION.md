@@ -37,7 +37,9 @@ The current client/worker duplication — photon `fleet.rs` fold ↔ `fgtw-boots
    The whole fetch-then-sign oracle (fetch/publish/ensure_member/bind/unbind/current_members, pairing post/fetch/matched/poll, fan-out post/fetch/rotate/recover, roster push/pull) — transport-agnostic via the `FgtwTransport` (post bytes → {status, body}) + `FleetSealer` (roster AEAD) traits.
    The crate owns ALL protocol logic (404/409/epoch/freshness/sig checks) and stays reqwest-free; photon supplies `PhotonTransport` (pooled reqwest + short errors) + `PhotonSealer` (kete) and keeps same-signature wrappers so call sites are unchanged.
    The wire format is unchanged. photon + worker green.
-5. **`fgtw::protocol`. — DEFERRED (2026-07-04 decision).**
+5. **`fgtw::protocol`. — the fleet and pairing slice DONE 2026-10-31; the rest DEFERRED (2026-07-04 decision).**
+   Done: the frames between fleet devices — the LAN beacon (`pt_disc`), the binding request and `bind_req`, the departure request (`depart_req`, its consent eggs and approval words), `fleet_req` / `fleet_resp` / `fanout_resp` — no_std behind `fanout`, signer-generic, time passed in. Photon's builders are call shapes over it and ferros's `photon_core` re-exports it; the wire is unchanged (`depart_req` pinned against photon's hand codec; ferros's photon-interop parses both ways). Why now: ferros needed the same frames and had copied them; a third client (Mahere) would have made it three copies.
+   Still deferred:
    SPLIT `protocol.rs` — generic codec here, photon msgs stay.
    Held back deliberately: `FgtwMessage` is one enum mixing DHT + generic-FGTW + photon-messaging variants (chat/status/avatar), so splitting it is an architecture choice (two enums + tag dispatch / whole-enum-to-crate / generic variants + opaque `App(bytes)`) that sits ON the messaging boundary. Do it AS PART of the messaging rework, once that structure is decided — splitting the enum before then risks redoing it.
 6. **`fgtw::blob`** + DHT (`node`/`peer_store`/`relay`) + finish `fingerprint` (reconcile with `tohu`). **— DEFERRED until a consumer needs them.**
@@ -45,7 +47,7 @@ The current client/worker duplication — photon `fleet.rs` fold ↔ `fgtw-boots
 7. **Worker depends on `fgtw`; photon depends on `fgtw`.**
    Photon's `network/fgtw/` shrinks to the messaging layer + thin re-exports.
 
-## Status: paused after M3 (2026-07-04)
+## Status: paused after M3 (2026-07-04); step 5's fleet and pairing slice done 2026-10-31
 
 Steps 0–4 above are **DONE** — the whole non-messaging substrate (device keys, the fleet membership chain, fan-out crypto, roster codec, pairing words, and the fetch-then-sign client oracle) is in the crate, shared by photon + the worker, wire format unchanged.
 That was the goal: extract the substrate so the messaging rework lands on a clean boundary.
@@ -54,6 +56,6 @@ Steps 5–6 are deferred per the reasons above — 5 rides with the messaging re
 ## Invariants during the move
 
 - Each step compiles **photon** (`scripts/dev.sh` / `cargo check --features development`) AND the **worker** (`cargo check --target wasm32-unknown-unknown` in `/fgtw-bootstrap`) before commit.
-- The crate is **`std` for now** — its only consumers (photon, and the worker, a wasm32 cdylib) are both `std`, and the `vsf` codec it rides pulls `std` via `crypto`/`inspect` in every real build. A `#![no_std]` core is deferred until a genuinely `no_std` consumer exists; the `fanout` feature keeps its extra crypto deps `alloc`-friendly so that door stays open.
+- The crate was **`std`** until 2026-10-26, when ferros became the `no_std` consumer: the base, `fanout`, `sign` and `protocol` build without `std`. The original note: — its only consumers (photon, and the worker, a wasm32 cdylib) are both `std`, and the `vsf` codec it rides pulls `std` via `crypto`/`inspect` in every real build. A `#![no_std]` core is deferred until a genuinely `no_std` consumer exists; the `fanout` feature keeps its extra crypto deps `alloc`-friendly so that door stays open.
 - The wire format does not change — this is a code move, not a protocol change.
   A mid-migration photon must still talk to the deployed worker.
