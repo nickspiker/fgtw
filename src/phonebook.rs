@@ -4,6 +4,7 @@
 //!
 //! PRIMARY (identity → device set)   `IdentityCount` at `key_identity(handle_proof)`, `DevicePointer` at `key_pointer(handle_proof, i)` for dense `i ∈ [0, N)`.
 //! SECONDARY (device → address)      `DeviceAddress` at `key_address(device_pubkey)`.
+//! SECONDARY (device → every address)  `DeviceAddressSet` at `key_address_set(device_pubkey)`, pointing at a VSF set of every address the device has (docs/addresses.md in photon).
 //!
 //! Split so that an address change — the overwhelmingly common write — touches ONE slot in place: same key, same length, no run shift, no lock, no epoch bump.
 //! Membership changes are rare and are the only thing that moves anything.
@@ -55,10 +56,13 @@ pub const EDGE_MARGIN: usize = 34;
 const DOMAIN_IDENTITY: &[u8] = b"PHOTON_PB_IDENTITY_v1";
 const DOMAIN_POINTER: &[u8] = b"PHOTON_PB_POINTER_v1";
 const DOMAIN_ADDRESS: &[u8] = b"PHOTON_PB_ADDRESS_v1";
+const DOMAIN_ADDRESS_SET: &[u8] = b"PHOTON_PB_ADDRSET_v1";
 
 // Signing domains, separate from the key domains so a signature can never be replayed as a key preimage or vice versa.
 /// The device's own claim: "I consent to be a device of this identity, and I am at this address."
 pub const SIGN_ADDRESS: &[u8] = b"PHOTON_PB_ADDR_SIG_v2";
+/// The device's own claim: "I consent to be a device of this identity, and I am at every address in this set."
+pub const SIGN_ADDRESS_SET: &[u8] = b"PHOTON_PB_ADDRSET_SIG_v1";
 /// A current member's claim: "I placed this device's pointer at this index at this epoch."
 pub const SIGN_PLACEMENT: &[u8] = b"PHOTON_PB_PLACE_SIG_v2";
 /// A current member's claim: "the device count for this identity is N as of this epoch."
@@ -69,6 +73,12 @@ pub const SIGN_DEPART: &[u8] = b"PHOTON_PB_DEPART_SIG_v2";
 const DOMAIN_EGGS: &str = "PHOTON_PB_EGGS_v1";
 /// Policy cap on an egg blob a reader will fetch and hash — the one bound, since the pointer carries no length. Two full three-scheme lists are ~17 KB; anything larger is not a record's eggs.
 pub const EGGS_BLOB_MAX: usize = 32 * 1024;
+/// Content address of an address-set blob: `derive_key(domain, blob)`, the same scheme as the eggs but its own domain, so a set can never stand in for an egg blob or the reverse.
+const DOMAIN_ADDRESS_SET_BLOB: &str = "PHOTON_PB_ADDRSET_BLOB_v1";
+/// The most addresses one set carries. A phone with a LAN v4, a reflexive v4 and v6, a handful of global v6 (stable plus temporaries) and a VPN sits near eight; thirty-two is room for a busy desktop, not for a spray of decoys.
+pub const ADDRESS_SET_MAX: usize = 1 << 5;
+/// Policy cap on a set blob a reader will fetch, hash and parse — the one bound, since the pointer carries no length. A full set of `ADDRESS_SET_MAX` entries encodes well under this.
+pub const ADDRESS_SET_BLOB_MAX: usize = 1 << 13;
 
 /// What kind of record occupies a slot.
 /// Stored as the first byte, so a slice dump is interpretable without external context (the phonebook is enumerable by design).
@@ -87,6 +97,10 @@ pub enum RecordKind {
     /// SECONDARY: where this device is.
     /// `key_address(device_pubkey)`.
     DeviceAddress = 3,
+    /// SECONDARY: every address this device can be reached at, as a set behind a content-addressed pointer.
+    /// `key_address_set(device_pubkey)`.
+    /// Beside `DeviceAddress`, never instead of it: a build that predates this kind reads its byte as Empty and keeps resolving thru kind 3.
+    DeviceAddressSet = 4,
 }
 
 impl RecordKind {
@@ -96,6 +110,7 @@ impl RecordKind {
             1 => RecordKind::IdentityCount,
             2 => RecordKind::DevicePointer,
             3 => RecordKind::DeviceAddress,
+            4 => RecordKind::DeviceAddressSet,
             _ => return None,
         })
     }
@@ -128,6 +143,14 @@ pub fn key_pointer(handle_proof: &[u8; 32], index: u32) -> Key {
 pub fn key_address(device_pubkey: &[u8; 32]) -> Key {
     let mut h = Hasher::new();
     h.update(DOMAIN_ADDRESS);
+    h.update(device_pubkey);
+    *h.finalize().as_bytes()
+}
+
+/// `key_address_set(device_pubkey)` — where a device's address SET lives. Keyed on the device alone, like [`key_address`], under its own domain.
+pub fn key_address_set(device_pubkey: &[u8; 32]) -> Key {
+    let mut h = Hasher::new();
+    h.update(DOMAIN_ADDRESS_SET);
     h.update(device_pubkey);
     *h.finalize().as_bytes()
 }
@@ -207,6 +230,9 @@ const DA_TIMESTAMP: usize = 99; // ..107  i64 LE eagle-time; the monotonic guard
 const DA_EGGS: usize = 107; // ..139  pointer to the device's own eggs
 const DA_LOCAL_PORT: usize = 139; // ..141  u16 LE: the port the device LISTENS on at `local_ip` (2026-10-15); 0 = not stated (records minted before it). The public `port` is the NAT's mapping and says nothing about the LAN side — a LAN candidate built from it could never connect.
 
+// DeviceAddressSet layout (SECONDARY). Shares DeviceAddress's offsets for the device, handle, timestamp and eggs, so the accessors that read them serve both kinds; only the set pointer is its own. 139 used, 117 reserved.
+const AS_SET: usize = 65; // ..97   content address of the set blob; covered by the signature, so the set is too
+
 // The epoch offsets are the same as the single-signature layout's, so a stored v1 record still reads its epoch correctly and the slot's monotonic guard lets a v2 write replace it; its verification fails (no blob hashes to a 64-byte signature), which every reader treats as absence.
 
 fn rd32(b: &[u8; STRIDE], at: usize) -> [u8; 32] {
@@ -247,6 +273,7 @@ impl Record {
                 rd_u32(&self.0, DP_INDEX),
             )),
             RecordKind::DeviceAddress => Some(key_address(&rd32(&self.0, DA_DEVICE))),
+            RecordKind::DeviceAddressSet => Some(key_address_set(&rd32(&self.0, DA_DEVICE))),
         }
     }
 
@@ -259,7 +286,7 @@ impl Record {
             RecordKind::Empty => i64::MIN,
             RecordKind::IdentityCount => rd_i64(&self.0, IC_EPOCH),
             RecordKind::DevicePointer => rd_i64(&self.0, DP_EPOCH),
-            RecordKind::DeviceAddress => rd_i64(&self.0, DA_TIMESTAMP),
+            RecordKind::DeviceAddress | RecordKind::DeviceAddressSet => rd_i64(&self.0, DA_TIMESTAMP),
         }
     }
 
@@ -325,7 +352,7 @@ impl Record {
     }
     pub fn device_pubkey(&self) -> [u8; 32] {
         match self.kind() {
-            RecordKind::DeviceAddress => rd32(&self.0, DA_DEVICE),
+            RecordKind::DeviceAddress | RecordKind::DeviceAddressSet => rd32(&self.0, DA_DEVICE),
             _ => rd32(&self.0, DP_DEVICE),
         }
     }
@@ -338,7 +365,7 @@ impl Record {
         match self.kind() {
             RecordKind::IdentityCount => rd32(&self.0, IC_EGGS),
             RecordKind::DevicePointer => rd32(&self.0, DP_EGGS),
-            RecordKind::DeviceAddress => rd32(&self.0, DA_EGGS),
+            RecordKind::DeviceAddress | RecordKind::DeviceAddressSet => rd32(&self.0, DA_EGGS),
             RecordKind::Empty => [0u8; 32],
         }
     }
@@ -393,7 +420,7 @@ impl Record {
 
     pub fn handle_proof(&self) -> [u8; 32] {
         match self.kind() {
-            RecordKind::DeviceAddress => rd32(&self.0, DA_HANDLE),
+            RecordKind::DeviceAddress | RecordKind::DeviceAddressSet => rd32(&self.0, DA_HANDLE),
             _ => rd32(&self.0, IC_HANDLE), // IC_HANDLE == DP_HANDLE == 1
         }
     }
@@ -431,6 +458,46 @@ impl Record {
             v.extend_from_slice(b"local_port");
             v.extend_from_slice(&lp.to_le_bytes());
         }
+        v
+    }
+
+    // ── DeviceAddressSet ──
+    pub fn new_device_address_set(device_pubkey: &[u8; 32], handle_proof: &[u8; 32], set_ptr: &[u8; 32], timestamp: i64, eggs_ptr: &[u8; 32]) -> Self {
+        let mut b = [0u8; STRIDE];
+        b[0] = RecordKind::DeviceAddressSet as u8;
+        b[DA_DEVICE..DA_DEVICE + 32].copy_from_slice(device_pubkey);
+        b[DA_HANDLE..DA_HANDLE + 32].copy_from_slice(handle_proof);
+        b[AS_SET..AS_SET + 32].copy_from_slice(set_ptr);
+        b[DA_TIMESTAMP..DA_TIMESTAMP + 8].copy_from_slice(&timestamp.to_le_bytes());
+        b[DA_EGGS..DA_EGGS + 32].copy_from_slice(eggs_ptr);
+        Record(b)
+    }
+    /// Mint a SIGNED address-set record in one step, as [`sign_device_address`](Self::sign_device_address) does for one address: encode the set, point at it, sign, point at the eggs.
+    /// Returns the record, its egg blob and its set blob — all three go to storage.
+    /// `timestamp` stamps the set too, and is the slot's monotonic guard: the set a device publishes REPLACES the one before it whole, so an address it no longer has simply is not in the next one.
+    pub fn sign_device_address_set(signer: &impl FleetSigner, mask: scheme::Mask, handle_proof: &[u8; 32], entries: &[SetAddr], timestamp: i64) -> (Self, Vec<u8>, Vec<u8>) {
+        let device_pubkey = signer.keypair().public.to_bytes();
+        let set = address_set_blob(entries, timestamp);
+        let set_ptr = address_set_ptr(&set);
+        let unsigned = Self::new_device_address_set(&device_pubkey, handle_proof, &set_ptr, timestamp, &[0u8; 32]);
+        let eggs = signer.eggs(&unsigned.address_set_signing_bytes(), mask);
+        let blob = eggs_blob(&[&eggs]);
+        (Self::new_device_address_set(&device_pubkey, handle_proof, &set_ptr, timestamp, &eggs_ptr(&blob)), blob, set)
+    }
+    /// The content address of this record's set blob.
+    pub fn set_ptr(&self) -> [u8; 32] {
+        rd32(&self.0, AS_SET)
+    }
+    /// The bytes a DEVICE signs to claim membership and every address in its set: domain ‖ handle_proof ‖ device_pubkey ‖ set_ptr ‖ timestamp.
+    /// The set is covered thru its content address, so a substituted or edited set does not hash to what was signed.
+    /// No slot or index, for the same portability `address_signing_bytes` keeps.
+    pub fn address_set_signing_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(SIGN_ADDRESS_SET.len() + 32 + 32 + 32 + 8);
+        v.extend_from_slice(SIGN_ADDRESS_SET);
+        v.extend_from_slice(&rd32(&self.0, DA_HANDLE));
+        v.extend_from_slice(&rd32(&self.0, DA_DEVICE));
+        v.extend_from_slice(&self.set_ptr());
+        v.extend_from_slice(&self.epoch().to_le_bytes());
         v
     }
 
@@ -511,6 +578,113 @@ pub fn eggs_blob_lists(blob: &[u8], n: usize) -> Option<Vec<Vec<Egg>>> {
 /// The content address a record stores for its blob.
 pub fn eggs_ptr(blob: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new_derive_key(DOMAIN_EGGS).update(blob).finalize().as_bytes()
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// ADDRESS SETS — every address a device has, behind a content-addressed pointer.
+//
+// One 256-byte slot holds one v6 and one LAN address at most; a device can have several of each (two or four global v6, a reflexive v4 and v6, a VPN, a Wi-Fi Direct group). So the set lives out of the slot, as the eggs do: a complete VSF document, one `addr` section per address, its content address in the record and under the device's signature.
+// Staleness is the publish itself: every set replaces the last whole, the slot's epoch guard refuses an older one, and within a set `seen` orders the entries so a reader tries the freshest first. Nothing ages on a timer.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// What an address in a set is to the device that published it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrKind {
+    /// Bound on one of the device's own interfaces: a LAN v4, a global v6 (stable or temporary), a VPN.
+    Interface = 0,
+    /// Where the outside world saw the device — a NAT's mapping, v4 or v6, from a reflexive probe.
+    Reflexive = 1,
+    /// The Wi-Fi Direct group address, present only while a group is up.
+    WifiDirect = 2,
+    /// A kind this build does not know: a newer writer's. Still an address worth trying, so it is kept, never dropped.
+    Unknown = 255,
+}
+
+impl AddrKind {
+    fn from_u64(n: u64) -> Self {
+        match n {
+            0 => AddrKind::Interface,
+            1 => AddrKind::Reflexive,
+            2 => AddrKind::WifiDirect,
+            _ => AddrKind::Unknown,
+        }
+    }
+}
+
+/// One address of a device's set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetAddr {
+    pub addr: core::net::SocketAddr,
+    pub kind: AddrKind,
+    /// Eagle time (oscillations) the device last saw itself at this address.
+    pub seen: i64,
+}
+
+/// The section name each address rides in.
+const ADDR_SECTION: &str = "addr";
+
+/// Encode a set as a complete VSF document stamped `timestamp`: one `addr` section per entry, the IP as its honest type (`ni` v4, `nj` v6), the port as `np`, the kind as an unsigned, `seen` as Eagle time.
+/// More than [`ADDRESS_SET_MAX`] entries is the caller's bug, and panics: a reader would refuse the set, and the device would be unreachable without a word.
+pub fn address_set_blob(entries: &[SetAddr], timestamp: i64) -> Vec<u8> {
+    use vsf::VsfType;
+    assert!(entries.len() <= ADDRESS_SET_MAX, "an address set of {} entries is over the cap every reader holds", entries.len());
+    let mut b = vsf::VsfBuilder::new().creation_time_oscillations(timestamp).provenance_only();
+    for e in entries {
+        let ip = match e.addr.ip() {
+            core::net::IpAddr::V4(v4) => VsfType::ni(v4.octets()),
+            core::net::IpAddr::V6(v6) => VsfType::nj(v6.octets()),
+        };
+        b = b.add_section(
+            ADDR_SECTION,
+            alloc::vec![
+                (String::from("ip"), ip),
+                (String::from("port"), VsfType::np(e.addr.port())),
+                (String::from("kind"), VsfType::u(e.kind as usize, false)),
+                (String::from("seen"), VsfType::e(vsf::types::EtType::e6(e.seen))),
+            ],
+        );
+    }
+    b.build().expect("an address set of typed fields always encodes")
+}
+
+/// The content address a set record stores for its set blob.
+pub fn address_set_ptr(blob: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(DOMAIN_ADDRESS_SET_BLOB).update(blob).finalize().as_bytes()
+}
+
+/// Read a set back, freshest first. `None` when the document does not verify, holds more than [`ADDRESS_SET_MAX`] entries, or an entry lacks its address or port — a malformed set is absence, never a partial read.
+/// A missing `kind` or `seen` reads as `Unknown` / 0, so a field a newer writer moves does not lose the address.
+pub fn address_set_entries(blob: &[u8]) -> Option<Vec<SetAddr>> {
+    use vsf::VsfType;
+    // WHY/PROOF: the blob is peer-written — the cap bounds the parse before any of it is trusted.
+    if blob.len() > ADDRESS_SET_BLOB_MAX {
+        return None;
+    }
+    let (header, end) = vsf::verification::read_verified(blob, None).ok()?;
+    let sections = header.sections(blob, end).ok()?;
+    let mut out = Vec::new();
+    for s in sections.iter().filter(|s| s.name == ADDR_SECTION) {
+        let ip = match s.get_field("ip").and_then(|f| f.values.first())? {
+            VsfType::ni(b) => core::net::IpAddr::from(*b),
+            VsfType::nj(b) => core::net::IpAddr::from(*b),
+            _ => return None,
+        };
+        let port = match s.get_field("port").and_then(|f| f.values.first())? {
+            VsfType::np(p) => *p,
+            _ => return None,
+        };
+        out.push(SetAddr {
+            addr: core::net::SocketAddr::new(ip, port),
+            kind: s.uint("kind").map(AddrKind::from_u64).unwrap_or(AddrKind::Unknown),
+            seen: s.eagle("seen").unwrap_or(0),
+        });
+    }
+    // WHY/PROOF: peer-written — a set past the cap is not a device's addresses, and every reader would spend a candidate per entry.
+    if out.len() > ADDRESS_SET_MAX {
+        return None;
+    }
+    out.sort_by(|a, b| b.seen.cmp(&a.seen));
+    Some(out)
 }
 
 /// How a reader judges a record's eggs: for a given signer, which bundle verifies it and which schemes its egg list must cover — or `None` for the anchor alone (Ed25519 from the key named in the record, nothing more required).
@@ -762,6 +936,20 @@ impl Record {
     }
     pub fn verify_address(&self, blob: &[u8]) -> bool {
         self.verify_address_with(blob, &EggPolicy::anchor_only())
+    }
+
+    /// The set record's check: the device signed it (as [`verify_address_with`](Self::verify_address_with), and with the same caveat — a signature is not membership), the set blob is within its cap and hashes to the signed pointer, and it parses as a set.
+    /// A set that fails any of these is absence, never a partial read.
+    pub fn verify_address_set_with(&self, eggs: &[u8], set: &[u8], policy: &EggPolicy<'_>) -> bool {
+        self.kind() == RecordKind::DeviceAddressSet
+            // WHY/PROOF: the set is peer-written — the cap bounds the work spent hashing and parsing hostile input.
+            && set.len() <= ADDRESS_SET_BLOB_MAX
+            && address_set_ptr(set) == self.set_ptr()
+            && address_set_entries(set).is_some()
+            && self.verify_list(eggs, 0, 1, &self.device_pubkey(), &self.address_set_signing_bytes(), policy)
+    }
+    pub fn verify_address_set(&self, eggs: &[u8], set: &[u8]) -> bool {
+        self.verify_address_set_with(eggs, set, &EggPolicy::anchor_only())
     }
 
     /// The placement was signed by the device that claims to have made it.
@@ -1336,6 +1524,64 @@ mod tests {
         assert_eq!(minted.0, expected.0, "the one-step mint must equal the two-step");
         assert_eq!(blob, blob2);
         assert_eq!(minted.key(), Some(key_address(&pk(&dev))), "keyed by device pubkey alone");
+    }
+
+    fn sample_set() -> Vec<SetAddr> {
+        use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        let v6 = |last: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));
+        alloc::vec![
+            SetAddr { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23)), 4383), kind: AddrKind::Interface, seen: 10 },
+            SetAddr { addr: SocketAddr::new(v6(1), 4383), kind: AddrKind::Interface, seen: 30 },
+            SetAddr { addr: SocketAddr::new(v6(2), 4383), kind: AddrKind::Interface, seen: 20 },
+            SetAddr { addr: SocketAddr::new(v6(3), 4383), kind: AddrKind::Interface, seen: 40 },
+            SetAddr { addr: SocketAddr::new(v6(4), 4383), kind: AddrKind::Interface, seen: 5 },
+            SetAddr { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 51234), kind: AddrKind::Reflexive, seen: 50 },
+        ]
+    }
+
+    /// FOUR v6 ADDRESSES (Nick 2026-11-01: "I could have two ipv6 addy's per device, or four"): a set carries every one, signs, verifies, and reads back freshest first, under its own key.
+    #[test]
+    fn an_address_set_carries_every_address_and_verifies() {
+        let dev = kp(5);
+        let hp = [6u8; 32];
+        let entries = sample_set();
+        let (rec, eggs, set) = Record::sign_device_address_set(&dev, B, &hp, &entries, 77);
+        assert!(rec.verify_address_set(&eggs, &set));
+        assert_eq!(rec.kind(), RecordKind::DeviceAddressSet);
+        assert_eq!(rec.key(), Some(key_address_set(&pk(&dev))));
+        assert_ne!(rec.key(), Some(key_address(&pk(&dev))), "the set lives beside the single-address record, never on top of it");
+        assert_eq!((rec.device_pubkey(), rec.handle_proof(), rec.epoch()), (pk(&dev), hp, 77));
+        let back = address_set_entries(&set).expect("a set we encoded reads back");
+        assert_eq!(back.len(), entries.len());
+        assert!(back.windows(2).all(|w| w[0].seen >= w[1].seen), "freshest first");
+        for e in &entries {
+            assert!(back.contains(e), "every address survives the round trip: {:?}", e);
+        }
+        assert!(set.len() < ADDRESS_SET_BLOB_MAX);
+    }
+
+    /// The set is under the signature thru its pointer: another set, an edited set, or a record re-pointed at another set does not verify.
+    #[test]
+    fn a_substituted_address_set_does_not_verify() {
+        let dev = kp(6);
+        let (rec, eggs, set) = Record::sign_device_address_set(&dev, B, &[1u8; 32], &sample_set(), 9);
+        let other = address_set_blob(&sample_set()[..2], 9);
+        assert!(!rec.verify_address_set(&eggs, &other), "a different set does not hash to the signed pointer");
+        let repointed = Record::new_device_address_set(&pk(&dev), &[1u8; 32], &address_set_ptr(&other), 9, &rec.eggs_ptr());
+        assert!(!repointed.verify_address_set(&eggs, &other), "re-pointing breaks the signature");
+        let mut edited = set.clone();
+        let last = edited.len() - 1;
+        edited[last] ^= 1;
+        assert!(!rec.verify_address_set(&eggs, &edited));
+        assert!(!rec.verify_address(&eggs), "a set record is not an address record");
+    }
+
+    /// An older build reads kind 4 as Empty, so publishing the set beside the single-address record breaks no reader in the field.
+    #[test]
+    fn an_old_reader_sees_a_set_record_as_empty() {
+        let (rec, _, _) = Record::sign_device_address_set(&kp(7), B, &[2u8; 32], &sample_set(), 3);
+        assert_eq!(rec.0[0], 4);
+        assert_eq!(RecordKind::from_byte(5), None, "an unknown kind byte is what an old reader's from_byte gives Empty for");
     }
 
     /// The record crosses the wire to the seed as its raw 256 bytes (the blob beside it) and is reconstructed there before `verify_address` runs.
