@@ -6,7 +6,7 @@
 //! Envelopes are device-signed VSF documents: the header reserves one egg per scheme at the envelope tier (`pq::envelope_mask`), `pq::sign_envelope` fills them over the file hash, and the reader verifies the anchor egg (`vsf::verification::read_verified`) before reading a field.
 //! The wire format is the one photon shipped; moving it here changed no byte.
 
-use crate::fleet::{bindreq_signing_bytes, scheme, BindRequest};
+use crate::fleet::{scheme, BindRequest};
 use crate::pq::{eggs_from_bytes, eggs_to_bytes, envelope_mask, reserve_eggs, sign_envelope, FleetSigner, KeyBundle};
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -107,14 +107,19 @@ pub fn field_ge(section: &VsfSection, name: &str) -> Option<Vec<u8>> {
 /// This device's binding request for fleet `handle_proof`, stamped `t`: "I consent to join", signed by the device with one egg per scheme it holds (its bundle rides along), co-signed by `Ed25519(identity_seed)` (the registry's handle-knowledge gate). `nfc_secret` is the tap's secret S when the device serves one: the request then commits to it (`pair::nfc_secret_hash` over this device and `t`); all zero = no tap offered.
 /// Built once and sent two ways with the same stamp — to the seed's registry and as a `bind_req` frame to sponsors heard on the LAN — so `t` is the Add's `consent_t` and the BLE beacon's stamp alike.
 pub fn bind_request(signer: &(impl FleetSigner + ?Sized), identity_seed: &[u8; 32], handle_proof: &[u8; 32], t: i64, nfc_secret: &[u8; 32]) -> BindRequest {
+    bind_request_plated(signer, identity_seed, handle_proof, t, nfc_secret, None)
+}
+
+/// [`bind_request`] with the joiner's plate (see `fleet::FleetOp::plate`): both signatures then cover the plate (`fleet::bindreq_signing_bytes_plated`), so the sponsor puts it on the Add as the joiner's own word.
+pub fn bind_request_plated(signer: &(impl FleetSigner + ?Sized), identity_seed: &[u8; 32], handle_proof: &[u8; 32], t: i64, nfc_secret: &[u8; 32], plate: Option<[u8; 32]>) -> BindRequest {
     use ed25519_dalek::Signer;
     let me = signer.keypair().public.to_bytes();
     let nfc_hash = if *nfc_secret == [0u8; 32] { [0u8; 32] } else { crate::pair::nfc_secret_hash(nfc_secret, &me, t) };
-    let msg = bindreq_signing_bytes(handle_proof, &me, t);
+    let msg = crate::fleet::bindreq_signing_bytes_plated(handle_proof, &me, t, plate.as_ref());
     let bundle = signer.bundle();
     let mask = bundle.as_ref().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE);
     let identity_key = ed25519_dalek::SigningKey::from_bytes(identity_seed);
-    BindRequest { device_pubkey: me, t, device_sig: signer.eggs(&msg, mask), bundle, identity_sig: identity_key.sign(&msg).to_bytes().to_vec(), nfc_hash }
+    BindRequest { device_pubkey: me, t, device_sig: signer.eggs(&msg, mask), bundle, identity_sig: identity_key.sign(&msg).to_bytes().to_vec(), plate, nfc_hash }
 }
 
 /// The `bind_req` frame: the request's fields (hp, dk, t, ds consent eggs, is identity co-sign, kb bundle, nh NFC commitment) for fleet `hp`, in an envelope signed by the request's own device. A sponsor verifies the request exactly as a registry row (`BindRequest::verify` + freshness).
@@ -127,6 +132,9 @@ pub fn bind_req(req: &BindRequest, handle_proof: &[u8; 32], signer: &(impl Fleet
     section.add_field("is", VsfType::ge(req.identity_sig.clone()));
     if let Some(b) = &req.bundle {
         section.add_field("kb", VsfType::ge(b.to_bytes()));
+    }
+    if let Some(p) = &req.plate {
+        section.add_field("pl", VsfType::hb(p.to_vec()));
     }
     section.add_field("nh", VsfType::hb(req.nfc_hash.to_vec()));
     signed_frame(section, signer, time)
@@ -158,7 +166,11 @@ pub fn parse_bind_req(bytes: &[u8]) -> Result<([u8; 32], BindRequest, [u8; 32]),
         Some(VsfType::hb(h)) if h.len() == 32 => h.as_slice().try_into().map_err(|_| "bind_req nh")?,
         _ => [0u8; 32],
     };
-    Ok((hp, BindRequest { device_pubkey, t, device_sig, bundle, identity_sig, nfc_hash }, sender))
+    let plate: Option<[u8; 32]> = match first("pl") {
+        Some(VsfType::hb(p)) if p.len() == 32 => Some(p.as_slice().try_into().map_err(|_| "bind_req pl")?),
+        _ => None,
+    };
+    Ok((hp, BindRequest { device_pubkey, t, device_sig, bundle, identity_sig, plate, nfc_hash }, sender))
 }
 
 // ── Leaving: the departure request ──
@@ -310,7 +322,7 @@ mod tests {
     fn bind_req_fleet_and_fanout_frames_round_trip() {
         let kp = Keypair::from_seed(&[0x55u8; 32]);
         let hp = [0x66u8; 32];
-        let req = BindRequest { device_pubkey: kp.public.to_bytes(), t: 123_456, device_sig: vec![Egg { scheme: scheme::ED25519, sig: vec![9u8; 64] }], bundle: None, identity_sig: vec![8u8; 64], nfc_hash: [7u8; 32] };
+        let req = BindRequest { device_pubkey: kp.public.to_bytes(), t: 123_456, device_sig: vec![Egg { scheme: scheme::ED25519, sig: vec![9u8; 64] }], bundle: None, identity_sig: vec![8u8; 64], plate: Some([5u8; 32]), nfc_hash: [7u8; 32] };
         let frame = bind_req(&req, &hp, &kp, 1).unwrap();
         assert_eq!(parse_bind_req(&frame).unwrap(), (hp, req, kp.public.to_bytes()));
         assert_eq!(parse_fleet_req(&fleet_req(&hp, &kp, 1).unwrap()).unwrap(), (hp, kp.public.to_bytes()));

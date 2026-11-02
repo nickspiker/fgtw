@@ -133,6 +133,8 @@ pub struct FleetOp {
     pub version: OpVersion,
     /// ADD and DECLARE only: the subject device's full public-key bundle. Carried in the chain — not just committed — because the worker holds nothing else and must be able to verify the PQ eggs on every later op by this device. `None` on every other kind, and on an Add whose device has declared nothing yet. Outside the chain the bundle is named by [`KeyBundle::commit`](crate::pq::KeyBundle::commit).
     pub bundle: Option<crate::pq::KeyBundle>,
+    /// GENESIS, ADD and DECLARE only, v3 only: the subject device's PLATE, the stable public name of its hardware (Android `BLAKE3(Widevine id ‖ signing certificate)`, Linux `BLAKE3` of the TPM endorsement key). It survives a wipe where the device key does not, so a wiped device coming back under a new key is still the same plate, and a plate the fleet has locked is recognised wherever the chain is read. Self-declared on genesis and declare; on add it is the joiner's own, bound under the joiner's consent signature, never the sponsor's claim.
+    pub plate: Option<[u8; 32]>,
 }
 
 /// Domain tag so a fleet-op signature can never be confused with any other signature in the system. v1 = the sovereign-records break (consent egg on Add, self-departure-only Remove).
@@ -140,6 +142,8 @@ const SIGNING_DOMAIN_V1: &[u8] = b"PHOTON_FLEET_OP_v1";
 
 /// v2 = LENGTH-FRAMED preimages (see [`frame_into`]), the prerequisite for eggs of differing lengths.
 const SIGNING_DOMAIN_V2: &[u8] = b"PHOTON_FLEET_OP_v2";
+/// v3 = v2 plus the subject's PLATE framed after the bundle on genesis, add and declare (2026-11-02). Minted only when an op carries a plate, so a fleet with no plated device keeps writing v2.
+const SIGNING_DOMAIN_V3: &[u8] = b"PHOTON_FLEET_OP_v3";
 
 /// Which preimage rule an op's signatures were made under. A PER-OP property, never a global one.
 ///
@@ -156,6 +160,8 @@ pub enum OpVersion {
     V1 = 1,
     /// Length-framed preimages; the shape eggs of differing lengths require.
     V2 = 2,
+    /// v2 plus the subject's plate, framed after the bundle on genesis, add and declare. The only version an op may carry a plate under.
+    V3 = 3,
 }
 
 impl OpVersion {
@@ -163,6 +169,7 @@ impl OpVersion {
         match self {
             OpVersion::V1 => SIGNING_DOMAIN_V1,
             OpVersion::V2 => SIGNING_DOMAIN_V2,
+            OpVersion::V3 => SIGNING_DOMAIN_V3,
         }
     }
 
@@ -170,9 +177,20 @@ impl OpVersion {
         match b {
             1 => Some(OpVersion::V1),
             2 => Some(OpVersion::V2),
+            3 => Some(OpVersion::V3),
             _ => None,
         }
     }
+
+    /// Whether this version frames its preimage (v2 and later); v1 appends the single Ed25519 consent bare.
+    fn framed(self) -> bool {
+        self != OpVersion::V1
+    }
+}
+
+/// The op kinds a plate may ride on: the ones that name a device by its own hand or its sponsor's.
+fn plate_kind(kind: OpKind) -> bool {
+    matches!(kind, OpKind::Genesis | OpKind::Add | OpKind::Declare)
 }
 
 /// Append a variable-length element to a preimage as `u32 LE length ‖ bytes`.
@@ -196,6 +214,20 @@ pub fn bindreq_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], 
     v.extend_from_slice(handle_proof);
     v.extend_from_slice(device_pubkey);
     v.extend_from_slice(&t.to_le_bytes());
+    v
+}
+
+/// [`bindreq_signing_bytes`] when the joiner declares a plate: a v2 domain and the plate appended, so a request with a plate and one without can never share a preimage. Without a plate the v1 bytes are unchanged, so every existing joiner and sponsor keeps verifying.
+pub fn bindreq_signing_bytes_plated(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], t: i64, plate: Option<&[u8; 32]>) -> Vec<u8> {
+    let Some(plate) = plate else {
+        return bindreq_signing_bytes(handle_proof, device_pubkey, t);
+    };
+    let mut v = Vec::with_capacity(18 + 64 + 8 + 32);
+    v.extend_from_slice(b"PHOTON_BINDREQ_v2");
+    v.extend_from_slice(handle_proof);
+    v.extend_from_slice(device_pubkey);
+    v.extend_from_slice(&t.to_le_bytes());
+    v.extend_from_slice(plate);
     v
 }
 
@@ -231,6 +263,8 @@ pub struct BindRequest {
     pub bundle: Option<crate::pq::KeyBundle>,
     /// `Ed25519(identity_seed)`'s signature over the same bytes — an ANTI-SPAM gate on the pending-request slot: posting requires knowing the handle STRING, which `handle_proof` (public, it is the slot key) does not. NOTE: this is NOT "only the owner can enter the set" — `identity_seed = BLAKE3(handle)` is public-derivable, and entering the member set still requires a member sponsor's Add. Checked against the chain's genesis identity pubkey; never enters the chain itself. See docs/fleet-identity-remediation.md.
     pub identity_sig: Vec<u8>,
+    /// The joiner's PLATE, when its hardware has one (see [`FleetOp::plate`]). Covered by both signatures thru [`bindreq_signing_bytes_plated`], so the sponsor carries it onto the Add as the joiner's own word.
+    pub plate: Option<[u8; 32]>,
     /// NFC instant-add commitment: `pair::nfc_secret_hash(S, device_pubkey, t)` where `S` is the 32-byte random secret the joiner serves over the NFC tap. All-zero = no NFC offered. DELIBERATELY OUTSIDE `bindreq_signing_bytes` — those bytes are the chain's consent verification forever (every future fold re-checks consent_sig against them), so a new field there is a protocol-wide flag-day; the binding lives inside the keyed hash instead (recomputed per candidate with ITS pubkey+t), so a tampered/transplanted hash simply never matches — fail-closed, never wrong-device.
     pub nfc_hash: [u8; 32],
 }
@@ -238,7 +272,7 @@ pub struct BindRequest {
 impl BindRequest {
     /// Verify both signatures: the device's own consent, and the identity co-signature under `identity_pubkey`. NOTE: the identity co-signature is a handle-knowledge ANTI-SPAM gate, NOT an ownership/membership gate (see the `identity_sig` field doc and docs/fleet-identity-remediation.md). The worker screens writes with this; the old device re-checks at list time. Actual membership still requires a member sponsor's Add.
     pub fn verify(&self, handle_proof: &[u8; 32], identity_pubkey: &[u8; 32]) -> bool {
-        let msg = bindreq_signing_bytes(handle_proof, &self.device_pubkey, self.t);
+        let msg = bindreq_signing_bytes_plated(handle_proof, &self.device_pubkey, self.t, self.plate.as_ref());
         let subject = self.bundle.clone().unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&self.device_pubkey));
         // The bundle must be this device's, and the consent must cover every scheme in it — declaring a key is proving it.
         subject.ed25519() == self.device_pubkey
@@ -263,9 +297,10 @@ impl FleetOp {
         b.extend_from_slice(&self.identity_pubkey); // bound in so the device sig also commits to the identity key (it can't be swapped)
         b.extend_from_slice(&self.consent_t.to_le_bytes());
         // Bound in so the consent can't be swapped under the sponsor's egg. v1 appends the single Ed25519 signature bare, so v1 preimages stay byte-identical; v2 frames the egg-list blob (see `frame_into`).
-        match self.version {
-            OpVersion::V1 => b.extend_from_slice(self.consent.first().map(|e| e.sig.as_slice()).unwrap_or(&[])),
-            OpVersion::V2 => frame_into(&mut b, &crate::pq::eggs_to_bytes(&self.consent)),
+        if self.version.framed() {
+            frame_into(&mut b, &crate::pq::eggs_to_bytes(&self.consent));
+        } else {
+            b.extend_from_slice(self.consent.first().map(|e| e.sig.as_slice()).unwrap_or(&[]));
         }
         // Checkpoint fields append KIND-GATED: every pre-checkpoint op kind keeps byte-identical signing bytes, so chains signed by pre-2026-08-12 builds still verify — an unconditional append would break every deployed fleet's signatures at once.
         if self.kind == OpKind::Checkpoint {
@@ -274,9 +309,13 @@ impl FleetOp {
             b.extend_from_slice(&self.ckpt_fanout_epoch.to_le_bytes());
         }
         // The key bundle, bound in so a device's advertised capability can't be edited under its own signature. Kind-gated like the checkpoint triple, v2-only because no v1 op ever carried it, and ALWAYS framed — an absent bundle frames as zero bytes, so "no bundle" and "some bundle" can never share a preimage.
-        if self.version == OpVersion::V2 && matches!(self.kind, OpKind::Add | OpKind::Declare) {
+        if self.version.framed() && matches!(self.kind, OpKind::Add | OpKind::Declare) {
             let bytes = self.bundle.as_ref().map(|k| k.to_bytes()).unwrap_or_default();
             frame_into(&mut b, &bytes);
+        }
+        // The plate, v3 only and kind-gated like the bundle, framed so an absent plate (empty frame) and a present one can never collide; v2 bytes stay byte-identical.
+        if self.version == OpVersion::V3 && plate_kind(self.kind) {
+            frame_into(&mut b, self.plate.as_ref().map(|p| p.as_slice()).unwrap_or(&[]));
         }
         b
     }
@@ -287,22 +326,19 @@ impl FleetOp {
     pub fn chain_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&self.signing_bytes());
-        match self.version {
-            OpVersion::V1 => {
-                for egg in &self.sigs {
-                    h.update(&[egg.scheme]);
-                    h.update(&egg.sig);
-                }
-                h.update(&self.identity_sig);
+        if self.version.framed() {
+            h.update(&(self.sigs.len() as u32).to_le_bytes());
+            for egg in &self.sigs {
+                h.update(&[egg.scheme]);
+                frame_hash(&mut h, &egg.sig);
             }
-            OpVersion::V2 => {
-                h.update(&(self.sigs.len() as u32).to_le_bytes());
-                for egg in &self.sigs {
-                    h.update(&[egg.scheme]);
-                    frame_hash(&mut h, &egg.sig);
-                }
-                frame_hash(&mut h, &self.identity_sig);
+            frame_hash(&mut h, &self.identity_sig);
+        } else {
+            for egg in &self.sigs {
+                h.update(&[egg.scheme]);
+                h.update(&egg.sig);
             }
+            h.update(&self.identity_sig);
         }
         *h.finalize().as_bytes()
     }
@@ -317,7 +353,8 @@ impl FleetOp {
 
     /// Verify the ADD consent binding: `consent_sig` is the ADDED device's own signature over its binding request — the subject signing its own membership. Forging it requires the device's private key, which is what makes conscription (and the ownership squat) impossible.
     fn verify_consent(&self, subject: &crate::pq::KeyBundle, required: scheme::Mask) -> bool {
-        let msg = bindreq_signing_bytes(&self.handle_proof, &self.device_pubkey, self.consent_t);
+        // The joiner's consent covers its plate when it declared one, so the plate on the Add is the joiner's own word, not the sponsor's.
+        let msg = bindreq_signing_bytes_plated(&self.handle_proof, &self.device_pubkey, self.consent_t, self.plate.as_ref());
         crate::pq::verify_eggs(&self.consent, subject, &msg, required)
     }
 
@@ -369,6 +406,8 @@ struct FoldState {
     floor: scheme::Mask,
     bundles: Vec<([u8; 32], crate::pq::KeyBundle)>,
     locked: Vec<[u8; 32]>,
+    /// Every plate a device ever declared, keyed by device, the newest declaration winning. Kept for departed devices too: a plate locked or departed stays known.
+    plates: Vec<([u8; 32], [u8; 32])>,
 }
 
 /// Why a blob failed to fold. Surfaced so the UI/logs can say *what* was wrong, not just "invalid".
@@ -395,6 +434,8 @@ pub enum FoldError {
     CheckpointOutOfSequence { index: usize },
     /// Bundle fields on an op kind that never carries them — only Add and Declare do.
     StrayBundle { index: usize },
+    /// A plate on an op kind that never carries one (only genesis, add and declare do), or under a version whose signature does not cover it (only v3 does).
+    StrayPlate { index: usize },
     /// A declared scheme mask that is internally impossible: missing Ed25519 (every device has it), naming a scheme this build cannot verify, or claiming schemes with no commitment to the keys behind them.
     BadBundle { index: usize },
     /// A Declare signed by somebody other than its subject. A device may raise its OWN capability and nobody else's.
@@ -455,6 +496,8 @@ impl MembershipBlob {
         let mut locked: Vec<[u8; 32]> = Vec::new();
         // What each member has declared it can sign with — the full public bundle, so later ops by that device can be verified against it. Absent = Ed25519 alone: no special "undeclared" state, because every device genuinely holds an Ed25519 key.
         let mut bundles: Vec<([u8; 32], crate::pq::KeyBundle)> = Vec::new();
+        // Each device's plate as it last declared it (see FleetOp::plate), never dropped: a locked or departed device's plate is exactly the one worth remembering.
+        let mut plates: Vec<([u8; 32], [u8; 32])> = Vec::new();
         // The fleet's capability floor, RATCHETED. It only ever rises, so a device joining with less cannot drag the fleet back to single-egg — that op simply does not fold.
         let mut floor: scheme::Mask = scheme::MASK_BASE;
         let mut expected_prev = [0u8; 32];
@@ -486,6 +529,16 @@ impl MembershipBlob {
             }
             if !matches!(op.kind, OpKind::Add | OpKind::Declare) && op.bundle.is_some() {
                 return Err(FoldError::StrayBundle { index: i });
+            }
+            // A plate rides only the kinds that name a device, and only under v3, the one preimage that covers it; anywhere else it would be an unsigned claim.
+            if op.plate.is_some() && (!plate_kind(op.kind) || op.version != OpVersion::V3) {
+                return Err(FoldError::StrayPlate { index: i });
+            }
+            if let Some(p) = op.plate {
+                match plates.iter_mut().find(|(d, _)| *d == op.device_pubkey) {
+                    Some(slot) => slot.1 = p,
+                    None => plates.push((op.device_pubkey, p)),
+                }
             }
             // A carried bundle must belong to the op's subject: its Ed25519 entry IS the device key the chain names. (Well-formedness — known schemes, right lengths, Ed25519 present — was enforced at parse by `KeyBundle::from_bytes`.)
             if let Some(b) = &op.bundle {
@@ -657,12 +710,31 @@ impl MembershipBlob {
             floor |= live;
             expected_prev = op.chain_hash();
         }
-        Ok(FoldState { members, floor, bundles, locked })
+        Ok(FoldState { members, floor, bundles, locked, plates })
     }
 
     /// The devices the chain has LOCKED OUT: still members, but excluded from the floor and from signing. What a host checks beside the epoch proof, and what a fleet UI shows as "locked".
     pub fn locked_out(&self) -> Result<Vec<[u8; 32]>, FoldError> {
         self.fold_inner().map(|f| f.locked)
+    }
+
+    /// The plate `device` last declared (see [`FleetOp::plate`]), current member or not; `None` if it never declared one or the chain does not fold.
+    pub fn declared_plate(&self, device: &[u8; 32]) -> Option<[u8; 32]> {
+        self.fold_inner()
+            .ok()
+            .and_then(|f| f.plates.into_iter().find(|(d, _)| d == device).map(|(_, p)| p))
+    }
+
+    /// Every `(device, plate)` the chain has ever been told, departed devices included.
+    pub fn plates(&self) -> Result<Vec<([u8; 32], [u8; 32])>, FoldError> {
+        self.fold_inner().map(|f| f.plates)
+    }
+
+    /// The plates of the devices the chain has LOCKED OUT: the hardware the owner declared stolen or lost. A device answering under any key from one of these plates is that hardware, whatever it now calls itself.
+    pub fn locked_plates(&self) -> Result<Vec<[u8; 32]>, FoldError> {
+        self.fold_inner().map(|f| {
+            f.plates.into_iter().filter(|(d, _)| f.locked.contains(d)).map(|(_, p)| p).collect()
+        })
     }
 
     /// The public-key bundle the chain holds for `device` — what any consent, vouch or handshake from that device is verified against. `None` if it has never declared, which means Ed25519 alone (the device key the chain already names).
@@ -771,36 +843,24 @@ impl MembershipBlob {
 
     /// Add `new_device` carrying its public key bundle — the join a promoted fleet requires, since `add` (no bundle) is refused as `BelowFloor` once the floor has risen. The `consent` must be signed with every scheme in `bundle`: that is the joiner proving it holds the keys the sponsor is adding it with.
     pub fn add_declared(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent: Vec<Egg>, bundle: crate::pq::KeyBundle) {
-        let sign_with: scheme::Mask = self.declared_mask(&device_key.keypair().public.to_bytes());
-        let hp = self.handle_proof().unwrap_or([0u8; 32]);
-        let op = sign_op(
-            device_key,
-            hp,
-            self.head(),
-            OpKind::Add,
-            new_device,
-            eagle_time,
-            device_key.keypair().public.to_bytes(),
-            [0u8; 32],
-            None,
-            Some((consent_t, consent)),
-            None,
-            Some(bundle),
-            sign_with,
-        );
-        self.ops.push(op);
+        self.add_with(device_key, new_device, eagle_time, consent_t, consent, Some(bundle), None);
     }
 
     /// A member publishes its own key bundle, raising what it can sign with.
     ///
     /// Self-signed by construction: `sign_op` is handed the declaring device's key as both signer and subject, so a device can only ever raise its OWN capability. When the last member declares a scheme, [`scheme_floor`](MembershipBlob::scheme_floor) gains that bit on its own — that is the whole promotion, with nothing published to announce it.
     pub fn declare(&mut self, device_key: &impl crate::pq::FleetSigner, eagle_time: i64) {
+        self.declare_plated(device_key, eagle_time, None);
+    }
+
+    /// [`declare`](Self::declare) with the device's own plate (see [`FleetOp::plate`]): the declaration is v3 when a plate is given, and the plate is self-signed like the bundle.
+    pub fn declare_plated(&mut self, device_key: &impl crate::pq::FleetSigner, eagle_time: i64, plate: Option<[u8; 32]>) {
         let hp = self.ops[0].handle_proof;
         let pk = device_key.keypair().public.to_bytes();
         // A signer with nothing beyond Ed25519 declares the Ed25519-only bundle — legal, and a no-op for the floor.
         let bundle = device_key.bundle().unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&pk));
         let sign_with: scheme::Mask = bundle.mask();
-        let op = sign_op(
+        let op = sign_op_plated(
             device_key,
             hp,
             self.head(),
@@ -813,6 +873,7 @@ impl MembershipBlob {
             None,
             None,
             Some(bundle),
+            plate,
             sign_with,
         );
         self.ops.push(op);
@@ -843,11 +904,22 @@ impl MembershipBlob {
         identity_seed: &[u8; 32],
         eagle_time: i64,
     ) -> Self {
+        Self::genesis_v2_plated(device_key, handle_proof, identity_seed, eagle_time, None)
+    }
+
+    /// [`genesis_v2`](Self::genesis_v2) with the founding device's plate (see [`FleetOp::plate`]); the op is v3 when a plate is given.
+    pub fn genesis_v2_plated(
+        device_key: &impl crate::pq::FleetSigner,
+        handle_proof: [u8; 32],
+        identity_seed: &[u8; 32],
+        eagle_time: i64,
+        plate: Option<[u8; 32]>,
+    ) -> Self {
         let sign_with: scheme::Mask = scheme::MASK_BASE;
         let pk = device_key.keypair().public.to_bytes();
         let identity_pubkey =
             ed25519_dalek::SigningKey::from_bytes(identity_seed).verifying_key().to_bytes();
-        let op = sign_op(
+        let op = sign_op_plated(
             device_key,
             handle_proof,
             [0u8; 32],
@@ -860,6 +932,7 @@ impl MembershipBlob {
             None,
             None,
             None,
+            plate,
             sign_with,
         );
         MembershipBlob { ops: vec![op] }
@@ -867,9 +940,15 @@ impl MembershipBlob {
 
     /// Append an Add: the sponsor `device_key` (a current member) signs, carrying the added device's consent — `(consent_t, consent_sig)` straight off its binding request. Without valid consent the result won't fold.
     pub fn add(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent: Vec<Egg>) {
+        self.add_with(device_key, new_device, eagle_time, consent_t, consent, None, None);
+    }
+
+    /// The one Add builder: the joiner's bundle (if it declared one) and its plate (if its hardware has one), both from the joiner's own signed binding request. Plated adds are v3.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with(&mut self, device_key: &impl crate::pq::FleetSigner, new_device: [u8; 32], eagle_time: i64, consent_t: i64, consent: Vec<Egg>, bundle: Option<crate::pq::KeyBundle>, plate: Option<[u8; 32]>) {
         let sign_with: scheme::Mask = self.declared_mask(&device_key.keypair().public.to_bytes());
         let hp = self.handle_proof().unwrap_or([0u8; 32]);
-        let op = sign_op(
+        let op = sign_op_plated(
             device_key,
             hp,
             self.head(),
@@ -881,7 +960,8 @@ impl MembershipBlob {
             None,
             Some((consent_t, consent)),
             None,
-            None,
+            bundle,
+            plate,
             sign_with,
         );
         self.ops.push(op);
@@ -1202,12 +1282,34 @@ fn sign_op(
     // `sign_with`: which schemes to sign under — what the chain knows the signer holds (see `FleetSigner::eggs`). Builders derive it from the chain; a Declare uses its own bundle's mask.
     sign_with: scheme::Mask,
 ) -> FleetOp {
+    sign_op_plated(signer, handle_proof, prev_hash, kind, device_pubkey, eagle_time, signer_pubkey, identity_pubkey, identity_signer, consent, checkpoint, bundle, None, sign_with)
+}
+
+/// [`sign_op`] with the subject's plate: a plated op is minted v3, the one preimage that covers the plate; without a plate the op stays v2, byte for byte what it was.
+#[allow(clippy::too_many_arguments)]
+fn sign_op_plated(
+    signer: &impl crate::pq::FleetSigner,
+    handle_proof: [u8; 32],
+    prev_hash: [u8; 32],
+    kind: OpKind,
+    device_pubkey: [u8; 32],
+    eagle_time: i64,
+    signer_pubkey: [u8; 32],
+    identity_pubkey: [u8; 32],
+    identity_signer: Option<&ed25519_dalek::SigningKey>,
+    consent: Option<(i64, Vec<Egg>)>,
+    checkpoint: Option<(u64, [u8; 32], u64)>,
+    bundle: Option<crate::pq::KeyBundle>,
+    plate: Option<[u8; 32]>,
+    sign_with: scheme::Mask,
+) -> FleetOp {
     use ed25519_dalek::Signer;
     let (consent_t, consent) = consent.unwrap_or((0, Vec::new()));
     let (ckpt_k, ckpt_commit, ckpt_fanout_epoch) = checkpoint.unwrap_or((0, [0u8; 32], 0));
     let mut op = FleetOp {
-        // Newly minted ops are v2 — framed preimages, the shape multi-scheme eggs need. Existing ops keep whatever version they were written under.
-        version: OpVersion::V2,
+        // Newly minted ops are v2 — framed preimages, the shape multi-scheme eggs need — or v3 when they carry a plate. Existing ops keep whatever version they were written under.
+        version: if plate.is_some() { OpVersion::V3 } else { OpVersion::V2 },
+        plate,
         bundle,
         handle_proof,
         prev_hash,
@@ -1234,17 +1336,19 @@ fn sign_op(
 
 /// The consent as it rides the wire: a v1 op carries its single Ed25519 signature bare (so existing bytes are untouched); a v2 op carries the framed egg-list blob.
 fn consent_to_wire(op: &FleetOp) -> Vec<u8> {
-    match op.version {
-        OpVersion::V1 => op.consent.first().map(|e| e.sig.clone()).unwrap_or_default(),
-        OpVersion::V2 => crate::pq::eggs_to_bytes(&op.consent),
+    if op.version.framed() {
+        crate::pq::eggs_to_bytes(&op.consent)
+    } else {
+        op.consent.first().map(|e| e.sig.clone()).unwrap_or_default()
     }
 }
 
 /// Inverse of [`consent_to_wire`], keyed on the op's version.
 fn consent_from_wire(version: OpVersion, bytes: &[u8]) -> Result<Vec<Egg>, String> {
-    match version {
-        OpVersion::V1 => Ok(vec![Egg { scheme: scheme::ED25519, sig: bytes.to_vec() }]),
-        OpVersion::V2 => crate::pq::eggs_from_bytes(bytes).map_err(|e| format!("fleet op: consent {e}")),
+    if version.framed() {
+        crate::pq::eggs_from_bytes(bytes).map_err(|e| format!("fleet op: consent {e}"))
+    } else {
+        Ok(vec![Egg { scheme: scheme::ED25519, sig: bytes.to_vec() }])
     }
 }
 
@@ -1287,6 +1391,10 @@ fn op_field_values(op: &FleetOp) -> Vec<VsfType> {
     // ADD / DECLARE: the key bundle as one opaque `ge`. It never appears at this position otherwise — the egg tail always starts with a `u` scheme — so type discriminates it, the same trick the genesis and consented-remove splits use. Omitted when there is no bundle, so an Add from an undeclared device encodes byte-identically to before.
     if let (OpKind::Add | OpKind::Declare, Some(bundle)) = (op.kind, &op.bundle) {
         values.push(VsfType::ge(bundle.to_bytes()));
+    }
+    // GENESIS / ADD / DECLARE, v3: the plate as one `hb`, after the bundle; the egg tail starts with a `u`, so the type tells them apart.
+    if let (true, Some(plate)) = (plate_kind(op.kind), op.plate) {
+        values.push(VsfType::hb(plate.to_vec()));
     }
     for egg in &op.sigs {
         values.push(VsfType::u(egg.scheme as usize, false));
@@ -1391,6 +1499,17 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
             i += 1;
         }
     }
+    // The plate, an `hb` on the kinds that carry one. Refused outright under any version but v3: nothing else signed it.
+    let mut plate = None;
+    if plate_kind(kind) {
+        if let Some(v @ VsfType::hb(_)) = values.get(i) {
+            if version != OpVersion::V3 {
+                return Err("fleet op: a plate under a version that does not sign it".into());
+            }
+            plate = Some(take_hb32(v, "plate")?);
+            i += 1;
+        }
+    }
 
     // Remaining values are (scheme:u, sig:ge) egg pairs.
     let mut sigs = Vec::new();
@@ -1413,6 +1532,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     Ok(FleetOp {
         version,
         bundle,
+        plate,
         handle_proof,
         prev_hash,
         kind,
@@ -1876,6 +1996,43 @@ mod tests {
         let forged = sign_op(a.keypair(), HP, blob.head(), OpKind::Declare, pk(b.keypair()), 300, pk(a.keypair()), [0u8; 32], None, None, None, Some(b.public()), scheme::MASK_BASE);
         blob.ops.push(forged);
         assert_eq!(blob.fold(), Err(FoldError::DeclareNotSelfSigned { index: 2 }));
+    }
+
+    /// A device's plate rides genesis, add and declare under v3, folds to `declared_plate` and `locked_plates`, survives the wire, cannot be put on an Add by the sponsor, and is refused anywhere a signature does not cover it.
+    #[test]
+    fn plates_fold_lock_and_round_trip() {
+        let (a, b) = bundles();
+        let (pa, pb) = ([0xAAu8; 32], [0xBBu8; 32]);
+        let mut blob = MembershipBlob::genesis_v2_plated(&a, HP, &SEED, 100, Some(pa));
+        assert_eq!(blob.ops[0].version, OpVersion::V3);
+        let bpk = pk(b.keypair());
+        let t = 190;
+        let consent = b.eggs(&bindreq_signing_bytes_plated(&HP, &bpk, t, Some(&pb)), b.public().mask());
+        blob.add_with(&a, bpk, 200, t, consent, Some(b.public()), Some(pb));
+        assert_eq!(blob.fold().unwrap(), vec![pk(a.keypair()), bpk]);
+        assert_eq!(blob.declared_plate(&pk(a.keypair())), Some(pa));
+        assert_eq!(blob.declared_plate(&bpk), Some(pb));
+        // The sponsor cannot change the plate the joiner signed: its consent no longer verifies.
+        let mut forged = blob.clone();
+        forged.ops[1].plate = Some([0xCCu8; 32]);
+        let msg = forged.ops[1].signing_bytes();
+        forged.ops[1].sigs = a.eggs(&msg, scheme::MASK_BASE);
+        assert_eq!(forged.fold(), Err(FoldError::BadConsent { index: 1 }));
+        // A declare carries the plate again; one without leaves the known plate standing.
+        blob.declare_plated(&a, 300, Some(pa));
+        blob.declare(&b, 400);
+        assert_eq!(blob.declared_plate(&bpk), Some(pb));
+        // Locking b makes its plate a locked plate.
+        blob.lock(&a, bpk, 500);
+        assert_eq!(blob.locked_plates().unwrap(), vec![pb]);
+        assert_eq!(blob.plates().unwrap().len(), 2);
+        let round = MembershipBlob::from_vsf_bytes(&blob.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(round, blob);
+        // A plate under v2 is an unsigned claim: refused in the fold and on the wire.
+        let mut stray = MembershipBlob::genesis_v2(&a, HP, &SEED, 100);
+        stray.ops[0].plate = Some(pa);
+        assert_eq!(stray.fold(), Err(FoldError::StrayPlate { index: 0 }));
+        assert!(MembershipBlob::from_vsf_bytes(&stray.to_vsf_bytes().unwrap()).is_err());
     }
 
     /// A Declare without a bundle, or carrying a bundle that belongs to a different device, is malformed.
@@ -2360,6 +2517,7 @@ mod tests {
             identity_sig: identity_key.sign(&msg).to_bytes().to_vec(),
             nfc_hash: [0u8; 32],
             bundle: Some(b.public()),
+            plate: None,
         };
         assert!(full.verify(&HP, &identity_pubkey), "three eggs over a three-scheme bundle");
         // Same bundle, Ed25519-only consent: the claim outruns the proof.
@@ -2388,6 +2546,7 @@ mod tests {
             identity_sig: identity_key.sign(&msg).to_bytes().to_vec(),
             nfc_hash: [0u8; 32],
             bundle: None,
+            plate: None,
         };
         assert!(req.verify(&HP, &identity_pubkey));
         // Wrong fleet, wrong identity key, tampered stamp — each leg fails.
