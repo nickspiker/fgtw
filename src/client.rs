@@ -157,6 +157,7 @@ pub fn ensure_member<T: FgtwTransport>(
     handle_proof: &[u8; 32],
     identity_seed: &[u8; 32],
     plate: Option<[u8; 32]>,
+    plate_kind: u8,
 ) -> Result<(), String> {
     let me = device_key.keypair().public.to_bytes();
     // A fold ERROR is indeterminate (corrupt/stale-format chain), NOT "not a member" — the two used to collapse into the same enroll-from-another-device message, hiding the real fault.
@@ -182,7 +183,7 @@ pub fn ensure_member<T: FgtwTransport>(
     }
     // New fleets found under v2 (no inert identity_sig; docs/identity-succession.md). Existing v1 chains still fold via the retained v1 path.
     let blob =
-        MembershipBlob::genesis_v2_plated(device_key, *handle_proof, identity_seed, crate::now_oscillations(), plate);
+        MembershipBlob::genesis_v2_plated(device_key, *handle_proof, identity_seed, crate::now_oscillations(), plate, plate_kind);
     // A rejected publish is NOT fatal by itself (a racing sibling may have won the slot), but it must not vanish either — the refetch below adjudicates, and the publish error rides along if that also comes up empty.
     let publish_err = publish(t, &blob).err();
     // Trust the network, not ourselves: re-fetch the canonical chain and accept ONLY if it names this device. The fleet slot has no compare-and-set, so two devices racing a fresh handle's genesis both "publish" but the slot settles on ONE — the loser re-reads here, finds it isn't a member, and fails cleanly instead of announcing as a phantom founder.
@@ -249,6 +250,7 @@ pub fn declare_device<T: FgtwTransport>(
     signer: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     plate: Option<[u8; 32]>,
+    plate_kind: u8,
 ) -> Result<(), String> {
     let me = signer.keypair().public.to_bytes();
     let want = signer.bundle().map(|b| b.mask()).unwrap_or(crate::fleet::scheme::MASK_BASE);
@@ -259,11 +261,12 @@ pub fn declare_device<T: FgtwTransport>(
             return Err("this device is not a current member, so it cannot declare".into());
         }
         // Idempotent: the chain already holds at least this capability, and this plate when the device has one.
-        let plate_known = plate.is_none() || blob.declared_plate(&me) == plate;
+        let plate_known = (plate.is_none() || blob.declared_plate(&me) == plate)
+            && (plate_kind == crate::fleet::plate::UNSTATED || blob.declared_plate_kind(&me) == plate_kind);
         if crate::fleet::scheme::covers(blob.declared_mask(&me), want) && plate_known {
             return Ok(());
         }
-        blob.declare_plated(signer, crate::now_oscillations(), plate);
+        blob.declare_plated(signer, crate::now_oscillations(), plate, plate_kind);
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
@@ -396,7 +399,7 @@ pub fn bind_device<T: FgtwTransport>(
             return Ok(()); // already in — idempotent
         }
         // The joiner's bundle (the only join a promoted fleet accepts) and its plate ride its own signed request onto the Add.
-        blob.add_with(member_key, req.device_pubkey, crate::now_oscillations(), req.t, req.device_sig.clone(), req.bundle.clone(), req.plate);
+        blob.add_with(member_key, req.device_pubkey, crate::now_oscillations(), req.t, req.device_sig.clone(), req.bundle.clone(), req.plate, req.plate_kind);
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue, // someone else extended; re-fetch + retry
@@ -485,6 +488,7 @@ pub fn bindreq_put<T: FgtwTransport>(
     handle_proof: &[u8; 32],
     nfc_secret: &[u8; 32],
     plate: Option<[u8; 32]>,
+    plate_kind: u8,
 ) -> Result<i64, String> {
     use ed25519_dalek::Signer;
     let now = crate::now_oscillations();
@@ -495,7 +499,7 @@ pub fn bindreq_put<T: FgtwTransport>(
     } else {
         crate::pair::nfc_secret_hash(nfc_secret, &me, now)
     };
-    let msg = crate::fleet::bindreq_signing_bytes_plated(handle_proof, &me, now, plate.as_ref());
+    let msg = crate::fleet::bindreq_signing_bytes_plated(handle_proof, &me, now, plate.as_ref(), plate_kind);
     let identity_key = ed25519_dalek::SigningKey::from_bytes(identity_seed);
     let mut section = vsf::VsfSection::new("bindreq_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
@@ -509,9 +513,12 @@ pub fn bindreq_put<T: FgtwTransport>(
     if let Some(b) = &bundle {
         section.add_field("kb", VsfType::ge(b.to_bytes()));
     }
-    // The joiner's plate, covered by both signatures above (see fleet::FleetOp::plate).
+    // The joiner's plate and its kind, covered by both signatures above (see fleet::FleetOp::plate).
     if let Some(p) = &plate {
         section.add_field("pl", VsfType::hb(p.to_vec()));
+    }
+    if plate_kind != crate::fleet::plate::UNSTATED {
+        section.add_field("pk", VsfType::u(plate_kind as usize, false));
     }
     // NFC commitment (all-zero = none) — outside the signing bytes by design (see BindRequest::nfc_hash).
     section.add_field("nh", VsfType::hb(nfc_hash.to_vec()));
@@ -656,6 +663,7 @@ pub fn bindreq_list<T: FgtwTransport>(
         // The optional tail, by TYPE: a `ge` is the joiner's key bundle (a bundle that does not parse is a malformed request, skipped), an `hb` its plate. Neither is positional, so either may be absent.
         let mut bundle = None;
         let mut plate: Option<[u8; 32]> = None;
+        let mut plate_kind = crate::fleet::plate::UNSTATED;
         let mut malformed = false;
         for extra in v.iter().skip(5) {
             match extra {
@@ -664,13 +672,14 @@ pub fn bindreq_list<T: FgtwTransport>(
                     Err(_) => malformed = true,
                 },
                 VsfType::hb(p) if p.len() == 32 => plate = Some(p.as_slice().try_into().unwrap()),
+                VsfType::u(k, false) => plate_kind = *k as u8,
                 _ => {}
             }
         }
         if malformed {
             continue;
         }
-        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig, identity_sig: is.clone(), nfc_hash, bundle, plate };
+        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig, identity_sig: is.clone(), nfc_hash, bundle, plate, plate_kind };
         if now.abs_diff(req.t) > BINDREQ_FRESH_OSC as u64 {
             continue; // lapsed — expiry is the only deletion pending records get
         }
@@ -1008,7 +1017,7 @@ mod tests {
         let t = Capture(std::cell::RefCell::new(Vec::new()));
         let device = crate::pq::SigningBundle::derive(b"a joiner with every scheme");
         assert_eq!(device.public().mask(), crate::fleet::scheme::MASK_ALL);
-        let _ = bindreq_put(&t, &device, &[7u8; 32], &[9u8; 32], &[0u8; 32], None);
+        let _ = bindreq_put(&t, &device, &[7u8; 32], &[9u8; 32], &[0u8; 32], None, crate::fleet::plate::UNSTATED);
         let n = t.0.borrow().len();
         assert!(n > 4096, "a full bundle outgrew the old cap ({n} bytes) — the case this guards");
         assert!(n <= crate::fleet::BINDREQ_MAX_BYTES, "a full-bundle bindreq is {n} bytes, over the worker cap");
