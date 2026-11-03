@@ -110,10 +110,6 @@ Use the SIM like they designed it. The eUICC is a certified secure element with 
 
 **Guests.** An identity is born only on ferros, Glyph or a PIPE, where the owner provisions the secret and the OS that takes the handle is the owner's. Everything else, a Photon on Android or on a desktop, is a guest of the fleet: a device key bound in by a sovereign device and revocable from one, able to message and be messaged, unable to mint, vouch, add devices or hold recovery material. A captured guest loses its own sessions and nothing else. Android on a ferros Pixel is the owner's choice (no restrictions, opt in after attest, never the default, supervised by the hypervisor and unsupported), and it is a guest like any other.
 
-**Pilot.** Fifty Pixel 8 Pros, software PIPE, profile-bound handles, three months, paid from the fiat float. Not a thousand. Build the PIPE watch in parallel so a hardware tier exists before strangers join.
-
-**Backhaul and Seabrook.** Seabrook CBRS was a thought experiment: it may happen, it is low on the list, and Verizon has a pending contract to build a site there within months, so it is not the gap it looked like (Nick, 2 Nov 2026: "I'm not after small"). The plan is sized to the sponsor network, not to one beach. The PUD seats keep their value on their own: Grays Harbor PUD is the open-access wholesale fibre utility for that county and must sell on non-discriminatory terms, Kitsap PUD is the same seat at home, and registering FGTW as a service provider on both makes it a legal ISP with no plant to build.
-
 ## Regulatory posture
 
 Data only with no PSTN touch point drops roughly a dozen federal regimes to three filings and a label. Mobile broadband is an information service after the Sixth Circuit's January 2025 ruling, not a Title II common carrier service.
@@ -167,7 +163,7 @@ Ranked by what kills the plan if it is missing. The first three cost nothing but
 | 2 | The entity | Without it there is no one to sign a sponsor contract, take a patent assignment or hold a PUD seat | Kaitiaki sign the UNA. Counsel reviews |
 | 3 | An explanation that survives without Nick | Everyone who understands the plan learned it from him talking. A one-pager that a branch owner can repeat to a home office | This document, cut to one page |
 | 4 | The TOKEN non-provisional, 24 Jun 2027 | Hard date. Attorney cost in the low five figures. Conflicts with the no-money principle and has to be resolved | Nobody at the table. Flag it |
-| 5 | One verifier that is not Nick | Passless has a demo, code and spec, and zero third parties accepting it. Edward Jones has said they are interested | The Edward Jones branch owner, routed to whoever at home office said it |
+| 5 | One verifier that is not Nick | Passless has a demo, code and spec, and zero third parties accepting it. | No idea |
 | 6 | A sponsor conversation | FGTW needs an MVNE or regional operator willing to hold the HSS and download profiles | The Nomad (Kalispell) connection. Technical contact, not sales |
 | 7 | Users outside the family | Fifty strangers on Photon who Nick does not support personally | Digital creator friends, not telecom people |
 
