@@ -28,21 +28,20 @@ Each piece is labelled at its true confidence. Running means it works today on r
 | Piece | What it is | Status |
 | --- | --- | --- |
 | TOKEN / passless | User-sovereign credential, no password, no account, no server | Running. Working demo, open code, 88-page spec. Provisional filed 24 Jun 2026 |
-| Photon | Messaging, Wave (voice), Beam (video), bridge (remote access) over CLUTCH | Running. Live with real contacts since Jul 2026. Beam in progress. Five other devs |
+| Photon | Messaging, Wave (voice), Beam (video), bridge (remote access) over CLUTCH | Running. Live with real contacts since Jul 2026. Beam in progress. |
 | CLUTCH | 8-primitive post-quantum key exchange | Running. Spec v3.0 draft |
 | ferros | Capability OS, bare metal, modem as untrusted peripheral | Running on Pixel 8 Pro: display, touch, all cores, cameras, data-only eSIM. No GPU, no carrier voice |
 | PIPE | 3-pin isolated enclave, owner-provisioned secret | Software only. Silicon Verilog bit-exact with the software. Provisional filed 17 Jun 2026 |
 | Spirix | Two's complement floating point | Silicon-verified on FPGA. Non-provisional filed 14 May 2026, Track One |
 | ISOMEM | Pageless memory protection | Provisional filed 16 May 2026 |
-| FGTW network | Data-only utility, handle-gated, sponsor carrier underneath | Designed. No sponsor, no entity, no users |
-| Seabrook CBRS | Donated band 48 coverage, first thing FGTW serves | Designed. SAS provider being chosen |
-| Glyph | Portless sovereign phone, PIPE inside, no unlock ceremonies | Designed. Spec drafted Aug 2026. Years 9-12 hardware |
+| FGTW network | Data-only utility, handle-gated, sponsor carrier underneath | Specification designed, scaffolding code written and deployed |
+| Glyph | The full meal deal | Designed. Spec drafted Aug 2026. Years 9-12 hardware |
 | Dumb watch | 3 mm e-ink notification watch, \~1 yr battery | Prototype works. Candidate hardware PIPE anchor for Pixels |
 | Phase 3 and 4 | Carriers commoditize, sovereignty becomes ambient | Bet |
 
 ## Entities
 
-FGTW is a Wyoming nonprofit association. It starts as a UNA and becomes a DUNA at 100 members. The DAO LLC in earlier plans is dropped: an LLC's members own it by statute, and that contradicts the no-owner invariant.
+FGTW is probably going to be born as a Wyoming nonprofit association. It likely starts as a UNA and becomes a DUNA at 100 members. Still in founding stages and pending legal evaluation.
 
 | Entity | Form | Holds | Why this form |
 | --- | --- | --- | --- |
@@ -75,7 +74,7 @@ One human, one membership, no founder clause. Nick qualifies the same way everyo
 
 The keys leave Nick's hands the day the governing body is solid, and they do not come back. Until then he is the single point of failure, and fixing that is the first job of the kaitiaki.
 
-**Order of authority.** The governing principles (text) are the source of authority. The Rust governance program implements them. Where the program and the text disagree, the text wins and the program gets fixed. A court reads text.
+**Order of authority.** The governing principles are the source of authority. The Rust governance program implements them. Where the program and the text disagree, the text wins and the program gets fixed. A court reads text.
 
 **What members decide by vote:** price, sponsor, administrators, admission disputes, amendments to anything not in the invariants. Proposal, vote, timelock, then the program executes. No unilateral change-of-terms, ever. That is the Verizon clause, inverted.
 
