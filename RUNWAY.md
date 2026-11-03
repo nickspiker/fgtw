@@ -134,6 +134,8 @@ Data only with no PSTN touch point drops roughly a dozen federal regimes to thre
 
 **911 on Glyph.** It cannot dial 911 and no rule requires a data device to. Tell people plainly: Glyph is a data device like a tablet. Carry a phone or run a VoIP app with a registered address.
 
+**Payments.** Tap to pay is EMV over NFC, and host card emulation needs no secure element and no Google: Visa and Mastercard issue device tokens to registered token requestors, which is how Curve, Garmin and the banks' own wallets pay without Google Wallet. The route is DUMB PIPE Inc. as a token requestor (the fiat entity, the one that signs contracts) and a wallet of ferros's own, keyed to the handle: keys issued the way the networks want them issued, on a device whose security argument they can read, bringing them transactions they do not have today. It is a certification and a contract, nothing else. Until it exists, the wallets that do not demand Google's integrity verdict are the ones to run as APKs on ferros. What FGTW never does: fake a Play Integrity verdict or a device attestation to obtain a token. Lying to a financial institution's security control to get a payment credential is a fraud question, not a terms-of-service one, and no ferros or hypervisor code hides root or spoofs a device for anyone (Nick, 2 Nov 2026: "if it means breaking the law, nope").
+
 ## Runway
 
 &#91;embedded content: FGTW runway · 5 phases, 1 hard gate\]
@@ -181,6 +183,8 @@ None of this document is legal advice. These are the questions a lawyer earns th
 - [ ] 501(c)(12) fit, if ever: member-income test with global membership, and whether rate reduction counts as returning savings at cost
 - [ ] Patent assignment path: Nick to DUMB PIPE Inc., and the patent non-assertion pledge for conforming passless implementations
 - [ ] NZ absolute novelty: which Glyph details are unfiled and must not be disclosed at Kaitiakitanga before filing
+- [ ] Token requestor registration with Visa (VTS) and Mastercard (MDES) by DUMB PIPE Inc.: eligibility, certification, PCI scope, and whether a wallet that only holds network tokens for the user's own cards is a money transmitter or an MSB
+- [ ] The line between a terms breach and a crime when a device presents a false integrity verdict or attestation to a payment network, so the written policy (never) rests on counsel's words, not ours
 
 **Sources**
 
