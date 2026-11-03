@@ -108,9 +108,11 @@ Use the SIM like they designed it. The eUICC is a certified secure element with 
 | Pixel + watch | Pixel 8 Pro on ferros, dumb watch with PIPE paired over Photon Transport | Hardware PIPE in the watch | Full FGTW service |
 | Pixel | Pixel 8 Pro on ferros | Software PIPE | Photon, Wave, Beam. Bring your own data, or pilot service |
 
+**Guests.** An identity is born only on ferros, Glyph or a PIPE, where the owner provisions the secret and the OS that takes the handle is the owner's. Everything else, a Photon on Android or on a desktop, is a guest of the fleet: a device key bound in by a sovereign device and revocable from one, able to message and be messaged, unable to mint, vouch, add devices or hold recovery material. A captured guest loses its own sessions and nothing else. Android on a ferros Pixel is the owner's choice (no restrictions, opt in after attest, never the default, supervised by the hypervisor and unsupported), and it is a guest like any other.
+
 **Pilot.** Fifty Pixel 8 Pros, software PIPE, profile-bound handles, three months, paid from the fiat float. Not a thousand. Build the PIPE watch in parallel so a hardware tier exists before strangers join.
 
-**Backhaul.** Seabrook CBRS radios need fibre behind them. Grays Harbor PUD is the open-access wholesale fibre utility for that county and must sell on non-discriminatory terms. First question to them: does the current build reach the North Beach. Kitsap PUD is the same seat at home. Registering FGTW as a service provider on both makes it a legal ISP with no plant to build.
+**Backhaul and Seabrook.** Seabrook CBRS was a thought experiment: it may happen, it is low on the list, and Verizon has a pending contract to build a site there within months, so it is not the gap it looked like (Nick, 2 Nov 2026: "I'm not after small"). The plan is sized to the sponsor network, not to one beach. The PUD seats keep their value on their own: Grays Harbor PUD is the open-access wholesale fibre utility for that county and must sell on non-discriminatory terms, Kitsap PUD is the same seat at home, and registering FGTW as a service provider on both makes it a legal ISP with no plant to build.
 
 ## Regulatory posture
 
@@ -147,10 +149,10 @@ The only hard-dated gate is the TOKEN non-provisional, 24 June 2027. Everything 
 1. Kaitiakitanga convenes (4 Nov 2026). Governing principles drafted from the invariants and membership rules above.
 2. A second person can run everything. Repos, domains, Cloudflare, filings, recovery share.
 3. Wyoming UNA formed by the kaitiaki. Governing principles signed on a dated record.
-4. Sponsor conversation opened with a regional operator. Grays Harbor PUD asked whether fibre reaches the North Beach.
+4. Sponsor conversation opened with a regional operator. The PUD service-provider seats taken.
 5. TOKEN non-provisional filed. Funding for it resolved, by someone else paying or by Nick accepting the cost.
 6. Fifty-Pixel pilot on software PIPE, three months. PIPE watch built in parallel.
-7. Seabrook CBRS live on PUD backhaul, the first thing FGTW serves.
+7. First service on the sponsor network. (Seabrook CBRS, if ever, is a later and smaller thing.)
 8. Membership crosses 100. UNA converts to DUNA. Press go: Nick's keys destroyed on a dated record.
 
 Steps 1 to 3 need no money and no outside party. Steps 4 to 7 need a sponsor and a fiat float. Step 8 needs 100 humans who have passed the membership test.
