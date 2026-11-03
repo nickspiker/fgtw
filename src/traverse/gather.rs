@@ -41,7 +41,10 @@ pub fn public_kind(addr: &SocketAddr) -> CandidateKind {
 /// `::`, which is the relay sentinel a relayed message carries. If it leaks in, the punch
 /// "validates" a path to `0.0.0.0` (it round-trips locally), which then poisons all addressing: sends go nowhere while the path looks `Some`.
 pub fn is_bogus_addr(addr: &SocketAddr) -> bool {
-    addr.ip().is_unspecified()
+    // An address no peer can be reached at: the unspecified relay sentinel, loopback, multicast, the v4 broadcast, or port zero (security audit NET-06: gossip and reflexive paths admitted all of these). Private and link-local ranges are the LAN and stay.
+    let ip = addr.ip();
+    let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+    ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || broadcast || addr.port() == 0
 }
 
 /// The Wi-Fi Direct group subnet Android's group owner always uses (192.168.49.0/24).

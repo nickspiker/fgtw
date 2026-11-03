@@ -11,6 +11,8 @@ use core::net::{IpAddr, SocketAddr};
 /// Distinct untrusted sources that must agree on an address before we adopt it.
 /// Trusted sources (a contact's pong, or the bootstrap seed) bypass this.
 const QUORUM: usize = 2;
+/// Pending addresses kept at once; a real device sees one or two candidates, never more.
+const MAX_PENDING: usize = 1 << 3;
 
 /// This node's own reflexive address, per family, with a quorum buffer for untrusted claims.
 ///
@@ -62,6 +64,10 @@ impl ReflexiveState {
             let at = match self.votes.iter().position(|(a, _)| *a == observed) {
                 Some(at) => at,
                 None => {
+                    // Bounded (security audit NET-07): every unsolicited claim used to open a new slot and stay, so the list and the scan over it grew without end. The oldest pending address gives way.
+                    if self.votes.len() >= MAX_PENDING {
+                        self.votes.remove(0);
+                    }
                     self.votes.push((observed, Vec::new()));
                     self.votes.len() - 1
                 }
