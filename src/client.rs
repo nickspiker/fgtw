@@ -156,6 +156,16 @@ pub fn ensure_member<T: FgtwTransport>(
     device_key: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
     identity_seed: &[u8; 32],
+) -> Result<(), String> {
+    ensure_member_plated(t, device_key, handle_proof, identity_seed, None, crate::fleet::plate::UNSTATED)
+}
+
+/// [`ensure_member`] with the founding device's plate and what it names, carried by the genesis when this call founds the fleet.
+pub fn ensure_member_plated<T: FgtwTransport>(
+    t: &T,
+    device_key: &impl crate::pq::FleetSigner,
+    handle_proof: &[u8; 32],
+    identity_seed: &[u8; 32],
     plate: Option<[u8; 32]>,
     plate_kind: u8,
 ) -> Result<(), String> {
@@ -246,6 +256,15 @@ pub fn push_checkpoint<T: FgtwTransport>(
 ///
 /// Signs with the bundle's full scheme set (a Declare proves possession of every key it names). A bare `Keypair` signer declares the Ed25519-only bundle, which is legal and a no-op for the floor. Idempotent when the chain already holds an equal-or-greater bundle for this device.
 pub fn declare_device<T: FgtwTransport>(
+    t: &T,
+    signer: &impl crate::pq::FleetSigner,
+    handle_proof: &[u8; 32],
+) -> Result<(), String> {
+    declare_device_plated(t, signer, handle_proof, None, crate::fleet::plate::UNSTATED)
+}
+
+/// [`declare_device`] with the device's plate and what it names (`fleet::FleetOp::plate`); the unplated form is what a consumer with no plate calls.
+pub fn declare_device_plated<T: FgtwTransport>(
     t: &T,
     signer: &impl crate::pq::FleetSigner,
     handle_proof: &[u8; 32],
@@ -482,6 +501,17 @@ fn signed_req<T: FgtwTransport>(t: &T, device_key: &impl crate::pq::FleetSigner,
 /// NEW device: post (or refresh) its binding request — "I, `device_key`, consent to join fleet `handle_proof`" — signed by the device key AND co-signed by `Ed25519(identity_seed)` (the registry write gate; the worker checks it against the chain's genesis identity pubkey). Re-post at ~3.5 min while the words screen is up; the stamp lapses at 5.
 /// Returns the `eagle_time` (oscillations) this call stamped and published — the SAME value the sponsor reads back in [`bindreq_list`], so the caller can derive the proximity beacon ([`beacon_id`]) from the exact published offer state.
 pub fn bindreq_put<T: FgtwTransport>(
+    t: &T,
+    device_key: &impl crate::pq::FleetSigner,
+    identity_seed: &[u8; 32],
+    handle_proof: &[u8; 32],
+    nfc_secret: &[u8; 32],
+) -> Result<i64, String> {
+    bindreq_put_plated(t, device_key, identity_seed, handle_proof, nfc_secret, None, crate::fleet::plate::UNSTATED)
+}
+
+/// [`bindreq_put`] with the joiner's plate and what it names, covered by both signatures.
+pub fn bindreq_put_plated<T: FgtwTransport>(
     t: &T,
     device_key: &impl crate::pq::FleetSigner,
     identity_seed: &[u8; 32],
@@ -1017,7 +1047,7 @@ mod tests {
         let t = Capture(std::cell::RefCell::new(Vec::new()));
         let device = crate::pq::SigningBundle::derive(b"a joiner with every scheme");
         assert_eq!(device.public().mask(), crate::fleet::scheme::MASK_ALL);
-        let _ = bindreq_put(&t, &device, &[7u8; 32], &[9u8; 32], &[0u8; 32], None, crate::fleet::plate::UNSTATED);
+        let _ = bindreq_put(&t, &device, &[7u8; 32], &[9u8; 32], &[0u8; 32]);
         let n = t.0.borrow().len();
         assert!(n > 4096, "a full bundle outgrew the old cap ({n} bytes) — the case this guards");
         assert!(n <= crate::fleet::BINDREQ_MAX_BYTES, "a full-bundle bindreq is {n} bytes, over the worker cap");
