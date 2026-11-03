@@ -76,7 +76,7 @@ The keys leave Nick's hands the day the governing body is solid, and they do not
 
 **Order of authority.** The governing principles are the source of authority. The Rust governance program implements them. Where the program and the text disagree, the text wins and the program gets fixed. A court reads text.
 
-**What members decide by vote:** price, sponsor, administrators, admission disputes, amendments to anything not in the invariants. Proposal, vote, timelock, then the program executes. No unilateral change-of-terms, ever. That is the Verizon clause, inverted.
+**What members decide by vote:** price, sponsor, administrators, admission disputes, amendments to anything not in the invariants. Proposal, vote, timelock, then the program executes. No unilateral change-of-terms, ever.
 
 **What administrators do:** operational tasks at the direction of the membership, as the statute puts it. They cannot admit, remove, or spend outside a passed proposal.
 
