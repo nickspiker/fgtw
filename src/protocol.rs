@@ -244,10 +244,10 @@ pub fn depart_consent(signer: &(impl FleetSigner + ?Sized), handle_proof: &[u8; 
 
 /// The three approval words the leaving device shows, from `nonce` (the caller's randomness: this crate has no RNG on bare metal): the nonce reduced to three voca words' worth, encoded, and left-padded with the capitalised zero word to exactly three.
 pub fn depart_words(nonce: u64) -> String {
-    let base = voca::FULL.alphabet.len() as u64;
+    let base = voca::FULL.alphabet().len() as u64;
     let mut words = voca::encode(num_bigint::BigUint::from(nonce % base.pow(3)));
     while crate::pair::pair_word_tokens(&words) < 3 {
-        let w0 = core::str::from_utf8(voca::FULL.alphabet[0]).expect("voca words are ASCII");
+        let w0 = core::str::from_utf8(voca::FULL.alphabet()[0]).expect("voca words are ASCII");
         let mut z = String::new();
         let mut cs = w0.chars();
         if let Some(c) = cs.next() {
