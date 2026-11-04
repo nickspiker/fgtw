@@ -6,7 +6,7 @@
 
 use crate::fanout::{fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
 use crate::fleet::{
-    et_to_osc, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
+    et_to_osc, Adoption, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
 };
 #[cfg(feature = "std")]
 use crate::fstate::{fstate_from_bytes, fstate_to_bytes, FleetState};
@@ -214,6 +214,13 @@ pub fn ensure_member_plated<T: FgtwTransport>(
     }
 }
 
+/// The stamp for the op this device is about to append to `blob`: now, or the tip's stamp if that is later. An honest op never precedes the tip, so the tip only ever advances along an honest chain and a sibling's clock running behind cannot make a reader's freshness tripwire miss it.
+fn stamp_after(blob: &MembershipBlob) -> i64 {
+    let head = blob.ops.last().map(|op| op.eagle_time).unwrap_or(0);
+    // WHY/PROOF: `max` is the rule, not a guard — a device whose clock trails the tip (skew between members, or a member that stamped ahead) would otherwise append a stamp below the tip, and the tripwire readers compare tips, so the op must carry the later of the two to be seen as new.
+    crate::now_oscillations().max(head)
+}
+
 /// Append a Checkpoint op and publish it. The worker's forward-extension gate is the single-winner rule: a stale push means a sibling advanced the chain first, so refetch and adjudicate.
 /// `Ok(None)` = our op landed (we are the minter for `k`). `Ok(Some((k, commit, fanout_epoch)))` = a competing checkpoint at-or-past our k already rides the chain — the caller discards its candidate and adopts the winner's. `Err` = transport trouble, or a racing MEMBERSHIP op made the head stale — the caller re-arms on its next edge with a fresh fetch.
 pub fn push_checkpoint<T: FgtwTransport>(
@@ -235,7 +242,7 @@ pub fn push_checkpoint<T: FgtwTransport>(
         // Someone already checkpointed at-or-past our k (or we skipped one) — the chain, not us, is the truth.
         return Ok(latest);
     }
-    blob.checkpoint(device_key, crate::now_oscillations(), k, commit, fanout_epoch);
+    blob.checkpoint(device_key, stamp_after(&blob), k, commit, fanout_epoch);
     match publish(t, &blob) {
         Ok(()) => Ok(None),
         Err(e) if e == "fleet: stale" => {
@@ -285,7 +292,7 @@ pub fn declare_device_plated<T: FgtwTransport>(
         if crate::fleet::scheme::covers(blob.declared_mask(&me), want) && plate_known {
             return Ok(());
         }
-        blob.declare_plated(signer, crate::now_oscillations(), plate, plate_kind);
+        blob.declare_plated(signer, stamp_after(&blob), plate, plate_kind);
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
@@ -320,10 +327,11 @@ fn lock_op_chain<T: FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, 
         if locked.contains(device) == lock {
             return Ok(()); // already in the wanted state
         }
+        let at = stamp_after(&blob);
         if lock {
-            blob.lock(signer, *device, crate::now_oscillations());
+            blob.lock(signer, *device, at);
         } else {
-            blob.unlock(signer, *device, crate::now_oscillations());
+            blob.unlock(signer, *device, at);
         }
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
@@ -374,7 +382,7 @@ pub fn current_members_verified<T: FgtwTransport>(
     }
 }
 
-/// The current member set plus the chain-tip eagle time — a monotonic freshness guard. A consumer adopts a fold only when its tip is `>=` the last one adopted, so a stale (pre-removal) read served by R2 eventual consistency can't overwrite a fresh post-removal set. No fleet yet ⇒ `(empty, 0)`.
+/// The current member set plus the chain-tip eagle time. The tip is REPORTED, never a gate: a consumer that adopted only folds whose tip was `>=` its last could be wedged by one member's far-future stamp (security audit FGTW-03), so adoption goes by chain extension — [`current_fleet_adopting`] — and the tip rides along for display and the freshness tripwire. No fleet yet ⇒ `(empty, 0)`.
 pub fn current_members_with_ts<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
@@ -399,6 +407,35 @@ pub fn current_members_full<T: FgtwTransport>(
     }
 }
 
+/// One folded read of a fleet chain, with the verdict a consumer gates adoption on.
+pub struct FleetRead {
+    /// How `chain` relates to the one the caller last adopted: structure, never tip time.
+    pub verdict: Adoption,
+    /// The fetched chain, folded; what the caller keeps as "adopted" when the verdict lands it, so its next read can be judged against it.
+    pub chain: MembershipBlob,
+    pub members: Vec<[u8; 32]>,
+    /// The tip op's stamp, for display and the freshness tripwire only.
+    pub tip: i64,
+    /// The generation id (the genesis hash).
+    pub genesis: [u8; 32],
+}
+
+/// The fold read a consumer ADOPTS BY CHAIN EXTENSION: fetch, fold, and judge the chain against `adopted`, the one last adopted for this slot (`None` before any). The caller lands the read when [`FleetRead::verdict`] [`lands`](Adoption::lands) (first, extended, unchanged) and keeps `chain` as the new adopted copy; a `Stale` read is a lagging seed and is dropped; `Fork` and `DifferentGenesis` go to the caller's own fork and succession rules. Tip time never decides any of it (security audit FGTW-03: one member stamping the far future made every later honest fold read as stale, its own Remove included). `Ok(None)` = no chain exists for the slot.
+pub fn current_fleet_adopting<T: FgtwTransport>(
+    t: &T,
+    handle_proof: &[u8; 32],
+    adopted: Option<&MembershipBlob>,
+) -> Result<Option<FleetRead>, String> {
+    let Some(chain) = fetch(t, handle_proof)? else { return Ok(None) };
+    let (members, tip) = chain.fold_with_ts().map_err(|e| format!("stored fleet invalid: {e:?}"))?;
+    if chain.genesis_handle_proof() != Some(*handle_proof) {
+        return Err("fleet chain is not for this handle_proof slot — refusing it".into());
+    }
+    let verdict = chain.adoption(adopted);
+    let genesis = chain.genesis_hash().unwrap_or([0u8; 32]);
+    Ok(Some(FleetRead { verdict, chain, members, tip, genesis }))
+}
+
 /// Existing-device side of device-ADD: bind the device a verified binding request names, signed by this (member) device and carrying the request's device signature as the consent egg. `req` must have been screened by the matcher (full word match + `BindRequest::verify`) — the fold re-verifies the consent regardless, so a garbage request can't enter the chain even if a caller skips the screen.
 pub fn bind_device<T: FgtwTransport>(
     t: &T,
@@ -418,7 +455,7 @@ pub fn bind_device<T: FgtwTransport>(
             return Ok(()); // already in — idempotent
         }
         // The joiner's bundle (the only join a promoted fleet accepts) and its plate ride its own signed request onto the Add.
-        blob.add_with(member_key, req.device_pubkey, crate::now_oscillations(), req.t, req.device_sig.clone(), req.bundle.clone(), req.plate, req.plate_kind);
+        blob.add_with(member_key, req.device_pubkey, stamp_after(&blob), req.t, req.device_sig.clone(), req.bundle.clone(), req.plate, req.plate_kind);
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue, // someone else extended; re-fetch + retry
@@ -441,7 +478,7 @@ pub fn depart_device<T: FgtwTransport>(
         if !members.contains(&me) {
             return Ok(()); // already out — idempotent
         }
-        blob.depart(device_key, crate::now_oscillations());
+        blob.depart(device_key, stamp_after(&blob));
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
@@ -468,13 +505,8 @@ pub fn depart_device_consented<T: FgtwTransport>(
         if !members.contains(leaving) {
             return Ok(()); // already out — idempotent
         }
-        blob.remove_consented(
-            approver_key,
-            *leaving,
-            crate::now_oscillations(),
-            consent_t,
-            consent.clone(),
-        );
+        let at = stamp_after(&blob);
+        blob.remove_consented(approver_key, *leaving, at, consent_t, consent.clone());
         match publish(t, &blob) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains("stale") => continue,
@@ -1014,6 +1046,66 @@ pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An honest op never precedes the tip: a chain whose tip sits ahead of this clock is stamped at the tip, and one behind it is stamped now.
+    #[test]
+    fn stamp_after_never_precedes_the_tip() {
+        let a = Keypair::from_seed(&[1u8; 32]);
+        let far = crate::fleet::OP_TIME_MAX_OSC - 1;
+        let ahead = MembershipBlob::genesis(&a, [0xab; 32], &[0xcd; 32], far);
+        assert_eq!(stamp_after(&ahead), far);
+        let behind = MembershipBlob::genesis(&a, [0xab; 32], &[0xcd; 32], 100);
+        let now = crate::now_oscillations();
+        assert!(stamp_after(&behind) >= now, "a tip in the past stamps now");
+        assert!(stamp_after(&MembershipBlob::default()) >= now, "no tip stamps now");
+    }
+
+    /// The adopting read lands a first fold and an extension, and refuses a lagging prefix and a fork, whatever the tips say.
+    #[test]
+    fn adopting_read_is_gated_by_extension_not_tip() {
+        struct Serve(std::cell::RefCell<Vec<u8>>);
+        impl FgtwTransport for Serve {
+            fn post(&self, _body: Vec<u8>) -> Result<FgtwResponse, String> {
+                Ok(FgtwResponse { status: 200, body: self.0.borrow().clone() })
+            }
+        }
+        use crate::pq::FleetSigner;
+        let a = Keypair::from_seed(&[1u8; 32]);
+        let b = Keypair::from_seed(&[2u8; 32]);
+        let hp = [0xab; 32];
+        let base = MembershipBlob::genesis(&a, hp, &[0xcd; 32], 100);
+        // A far-future tip, then an honest op with a smaller stamp.
+        let mut poisoned = base.clone();
+        poisoned.checkpoint(&a, crate::fleet::OP_TIME_MAX_OSC - 1, 1, [0x11; 32], 1);
+        let mut healed = poisoned.clone();
+        let t = 190;
+        let consent = b.eggs(&crate::fleet::bindreq_signing_bytes(&hp, &b.public.to_bytes(), t), crate::fleet::scheme::MASK_BASE);
+        healed.add(&a, b.public.to_bytes(), 200, t, consent);
+        let serve = Serve(std::cell::RefCell::new(poisoned.to_vsf_bytes().unwrap()));
+
+        let first = current_fleet_adopting(&serve, &hp, None).unwrap().unwrap();
+        assert_eq!(first.verdict, Adoption::First);
+        assert_eq!(first.tip, crate::fleet::OP_TIME_MAX_OSC - 1);
+
+        *serve.0.borrow_mut() = healed.to_vsf_bytes().unwrap();
+        let next = current_fleet_adopting(&serve, &hp, Some(&first.chain)).unwrap().unwrap();
+        assert_eq!(next.verdict, Adoption::Extended);
+        assert!(next.verdict.lands());
+        assert!(next.tip < first.tip, "the tip went backwards and the read still lands");
+        assert_eq!(next.members, vec![a.public.to_bytes(), b.public.to_bytes()]);
+
+        *serve.0.borrow_mut() = poisoned.to_vsf_bytes().unwrap();
+        let lag = current_fleet_adopting(&serve, &hp, Some(&next.chain)).unwrap().unwrap();
+        assert_eq!(lag.verdict, Adoption::Stale);
+        assert!(!lag.verdict.lands());
+
+        let mut fork = base.clone();
+        fork.checkpoint(&a, 300, 1, [0x22; 32], 1);
+        *serve.0.borrow_mut() = fork.to_vsf_bytes().unwrap();
+        let forked = current_fleet_adopting(&serve, &hp, Some(&next.chain)).unwrap().unwrap();
+        assert_eq!(forked.verdict, Adoption::Fork);
+        assert!(!forked.verdict.lands());
+    }
 
     /// Emma, 2026-10-17: the green confirm's grow was signed Ed25519-only and the worker refused it below the floor of a fleet whose members all declared Falcon. A fan-out publish by a full-bundle device must carry the envelope tier the worker demands.
     #[test]

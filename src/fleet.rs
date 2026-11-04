@@ -30,6 +30,7 @@
 //! - **Add is bilateral**: the sponsor's egg authorises, and the op carries the added device's own consent — its binding-request signature ([`bindreq_signing_bytes`]) as `consent_sig`. An op without valid consent does not fold, so conscription (and the virgin-pubkey ownership squat it enabled) is structurally impossible.
 //! - **Remove is self-signed departure ONLY**: `signer == device`, no exceptions. Nobody can be expelled; eviction is withholding (re-key around the device), never erasure.
 //! - Consent freshness: `|eagle_time − consent_t| ≤` [`CONSENT_WINDOW_OSC`], so a departed device's ancient consent can't be replayed to re-add it.
+//! - Stamp sanity: every op's `eagle_time` is non-negative and below [`OP_TIME_MAX_OSC`], judged against the number alone and never a clock; a consumer adopts a fetched chain by EXTENSION ([`Adoption`]), never by tip time, so no member can throw the tip into the future and have every later honest op read as stale.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use vsf::VsfType;
@@ -294,6 +295,11 @@ pub fn departreq_signing_bytes(handle_proof: &[u8; 32], device_pubkey: &[u8; 32]
 /// How far an Add's `eagle_time` may sit from its consent stamp: 1 hour — generous for a live ceremony (the request re-posts every ~3.5 min anyway), fatal for replaying a departed device's ancient consent.
 pub const CONSENT_WINDOW_OSC: i64 = 3600 * vsf::OSCILLATIONS_PER_SECOND as i64;
 
+/// The first `eagle_time` no op may carry: `1 << 62` oscillations, about a century after the Eagle epoch.
+/// Derivation: [`vsf::OSCILLATIONS_PER_SECOND`] = 1_420_407_826 ≈ `1 << 30.4`, so `1 << 62` oscillations ≈ `1 << 31.6` s ≈ 3.2e9 s ≈ 103 years, and every real stamp until long after this code is gone sits below it.
+/// A sanity bound judged against nothing but the number itself, never a clock, so every device folds a chain to the same verdict; it is not a freshness rule, and adoption is gated by chain extension instead ([`Adoption`]).
+pub const OP_TIME_MAX_OSC: i64 = 1 << 62;
+
 /// Binding requests older than this are lapsed (worker refuses at put, skips at list; clients skip too). The author refreshes at ~3.5 min while its ceremony screen is up; an abandoned ceremony self-cleans by expiry — the worker NEVER consumes a request (no third-party deletion, per the sovereign-records rule).
 pub const BINDREQ_FRESH_OSC: i64 = 300 * vsf::OSCILLATIONS_PER_SECOND as i64;
 
@@ -481,6 +487,8 @@ pub enum FoldError {
     BadConsent { index: usize },
     /// An Add's consent stamp sits outside [`CONSENT_WINDOW_OSC`] of the op — a replayed ancient consent.
     ConsentStale { index: usize },
+    /// An op's `eagle_time` is negative or at least [`OP_TIME_MAX_OSC`] — a crafted stamp (`i64::MAX`, a negative) that no clock ever produced. Every kind is held to it, genesis included.
+    ImpossibleTime { index: usize },
     /// A non-Add op carries consent fields it has no business carrying.
     StrayConsent { index: usize },
     /// A non-Checkpoint op carries checkpoint fields it has no business carrying.
@@ -524,6 +532,30 @@ pub enum FoldError {
     LockMalformed { index: usize },
     AddExistingMember { index: usize },
     RemoveNonMember { index: usize },
+}
+
+/// How a chain just fetched relates to the one a consumer last adopted for the same slot — what adoption is gated on, in place of tip time (security audit FGTW-03: one member's far-future stamp made every later honest fold read as stale, its own Remove included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adoption {
+    /// Nothing adopted yet: the first fold lands.
+    First,
+    /// The adopted chain is a strict prefix of this one: it only grew, so it lands.
+    Extended,
+    /// Op for op the chain already adopted: nothing new, and landing it again is harmless.
+    Unchanged,
+    /// This chain is a strict prefix of the adopted one: a lagging read (R2 eventual consistency, a peer behind the seed), refused.
+    Stale,
+    /// Same genesis, neither a prefix of the other: two members appended at once with nothing to serialise them; the caller's fork rule decides.
+    Fork,
+    /// A different genesis under the same slot: a re-claimant of a freed name, a stranger to the pinned generation; the caller's succession rule decides.
+    DifferentGenesis,
+}
+
+impl Adoption {
+    /// Does this verdict land the fetched chain as-is, with no further rule to consult?
+    pub fn lands(self) -> bool {
+        matches!(self, Adoption::First | Adoption::Extended | Adoption::Unchanged)
+    }
 }
 
 /// The fleet membership blob: the ordered op chain.
@@ -570,6 +602,10 @@ impl MembershipBlob {
             }
             if op.prev_hash != expected_prev {
                 return Err(FoldError::BrokenChain { index: i });
+            }
+            // WHY/PROOF: a chain is input from another device, and a stamp of i64::MAX or below zero is a crafted value no clock produced; left in, it rode the tip into every consumer's freshness compare and made each later honest op read as stale (security audit FGTW-03), and it is judged against the number alone so every device reaches the same verdict without reading a clock.
+            if op.eagle_time < 0 || op.eagle_time >= OP_TIME_MAX_OSC {
+                return Err(FoldError::ImpossibleTime { index: i });
             }
             // Structural checks before the sig check: only genesis carries an identity binding, only Add carries consent, only Checkpoint carries the epoch triple (all are in signing_bytes, so a stray one would otherwise surface as a confusing BadSignature).
             if op.kind != OpKind::Genesis && (op.identity_pubkey != [0u8; 32] || !op.identity_sig.is_empty()) {
@@ -844,6 +880,7 @@ impl MembershipBlob {
     }
 
     /// Fold to the current member set AND return the tip op's eagle time (the timestamp of the last applied op). `(members, tip_et)`. The freshness signal a consumer uses to never regress to a stale (pre-removal) view of someone's membership: a fold with an older tip than one already adopted is ignored. `tip_et` is 0 only for the impossible empty-but-Ok case (fold errors on empty).
+    /// The tip is a REPORT, not a gate: any member stamps whatever its clock (or its malice) says, so a consumer that refused a fold with a smaller tip than its last could be wedged by one far-future op (security audit FGTW-03); adopt by [`adoption`](MembershipBlob::adoption) instead, and carry the tip only for display and the freshness tripwire.
     pub fn fold_with_ts(&self) -> Result<(Vec<[u8; 32]>, i64), FoldError> {
         let members = self.fold()?;
         let tip = self.ops.last().map(|op| op.eagle_time).unwrap_or(0);
@@ -869,6 +906,24 @@ impl MembershipBlob {
     pub fn extends(&self, prior: &MembershipBlob) -> bool {
         // WHY/PROOF: either chain may be the stored or the fetched one — a longer `prior` is simply not a prefix, and slicing past our end would panic.
         prior.ops.len() <= self.ops.len() && self.ops[..prior.ops.len()] == prior.ops[..]
+    }
+
+    /// How this chain, just fetched, relates to `adopted`, the one a consumer last adopted for the same slot — the verdict adoption is gated on. Structure, never tip time: the chain only growing is what "fresher" means, and no stamp a member chooses can change it.
+    pub fn adoption(&self, adopted: Option<&MembershipBlob>) -> Adoption {
+        let Some(old) = adopted else { return Adoption::First };
+        if self.genesis_hash() != old.genesis_hash() {
+            return Adoption::DifferentGenesis;
+        }
+        if self.ops.len() == old.ops.len() && self.extends(old) {
+            return Adoption::Unchanged;
+        }
+        if self.extends(old) {
+            return Adoption::Extended;
+        }
+        if old.extends(self) {
+            return Adoption::Stale;
+        }
+        Adoption::Fork
     }
 
     /// Does the genesis identity key equal `Ed25519(identity_seed)`, the canonical key derived from the handle?
@@ -2609,6 +2664,101 @@ mod tests {
         assert_eq!(parsed, blob);
         assert_eq!(parsed.fold().unwrap(), vec![pk(&a), pk(&b)]);
         assert_eq!(parsed.latest_checkpoint(), Some((1, [0x33; 32], 9)));
+    }
+
+    /// FGTW-03: a far-future stamp below the sanity bound FOLDS (an idle fleet must never be bricked by a gap rule), a later honest op with a smaller stamp folds after it, and that longer chain is adopted because it EXTENDS the earlier one, whatever the tips say. Impossible stamps, `i64::MAX` and negatives, are refused for every kind, genesis included, and the refusal surfaces from `fold_with_ts`.
+    #[test]
+    fn far_future_tip_folds_and_extension_not_tip_time_gates_adoption() {
+        let a = key(1);
+        let b = key(2);
+        let mut base = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        base.add(&a, pk(&b), 200, t, s);
+
+        // b (say, stolen) locks a with a stamp decades out, one below the bound: it folds.
+        let far = OP_TIME_MAX_OSC - 1;
+        let mut poisoned = base.clone();
+        poisoned.lock(&b, pk(&a), far);
+        assert_eq!(poisoned.fold_with_ts().unwrap().1, far);
+        // The honest Remove of b, stamped at real time, folds on top of it with a SMALLER tip.
+        let mut healed = poisoned.clone();
+        healed.depart(&b, 300);
+        let (members, tip) = healed.fold_with_ts().unwrap();
+        assert_eq!(members, vec![pk(&a)]);
+        assert_eq!(tip, 300);
+        // And it is adopted, because the chain grew: the tip going backwards is no reason to refuse it.
+        assert_eq!(healed.adoption(Some(&poisoned)), Adoption::Extended);
+        assert!(healed.adoption(Some(&poisoned)).lands());
+
+        // The crafted values are refused for every kind.
+        let mut lock = base.clone();
+        lock.lock(&b, pk(&a), i64::MAX);
+        assert_eq!(lock.fold(), Err(FoldError::ImpossibleTime { index: 2 }));
+        assert_eq!(lock.fold_with_ts(), Err(FoldError::ImpossibleTime { index: 2 }));
+        let mut ckpt = base.clone();
+        ckpt.checkpoint(&a, OP_TIME_MAX_OSC, 1, [0x11; 32], 1);
+        assert_eq!(ckpt.fold(), Err(FoldError::ImpossibleTime { index: 2 }));
+        let mut leave = base.clone();
+        leave.depart(&b, -1);
+        assert_eq!(leave.fold(), Err(FoldError::ImpossibleTime { index: 2 }));
+        let c = key(3);
+        let (tc, sc) = consent_for(&c, i64::MAX);
+        let mut add = base.clone();
+        add.add(&a, pk(&c), i64::MAX, tc, sc);
+        assert_eq!(add.fold(), Err(FoldError::ImpossibleTime { index: 2 }));
+        let mut unlock = base.clone();
+        unlock.lock(&a, pk(&b), 300);
+        unlock.unlock(&a, pk(&b), i64::MIN);
+        assert_eq!(unlock.fold(), Err(FoldError::ImpossibleTime { index: 3 }));
+        assert_eq!(MembershipBlob::genesis(&a, HP, &SEED, i64::MAX).fold(), Err(FoldError::ImpossibleTime { index: 0 }));
+        assert_eq!(MembershipBlob::genesis(&a, HP, &SEED, -1).fold(), Err(FoldError::ImpossibleTime { index: 0 }));
+        // Zero is a stamp, not a sentinel, and the last value below the bound passes too.
+        assert!(MembershipBlob::genesis(&a, HP, &SEED, 0).fold().is_ok());
+        assert_eq!(MembershipBlob::genesis(&a, HP, &SEED, far).fold_with_ts().unwrap().1, far);
+    }
+
+    /// Adoption is a verdict on structure: first, grown, same, lagging, forked or a different generation. A chain that is not an extension of the adopted one never lands on its own.
+    #[test]
+    fn adoption_lands_only_a_first_fold_or_an_extension() {
+        let a = key(1);
+        let b = key(2);
+        let c = key(3);
+        let base = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let mut grown = base.clone();
+        let (t, s) = consent_for(&b, 190);
+        grown.add(&a, pk(&b), 200, t, s);
+        let mut fork = base.clone();
+        let (tc, sc) = consent_for(&c, 190);
+        fork.add(&a, pk(&c), 200, tc, sc);
+        let other = MembershipBlob::genesis(&a, HP, &SEED, 101);
+
+        assert_eq!(grown.adoption(None), Adoption::First);
+        assert_eq!(grown.adoption(Some(&base)), Adoption::Extended);
+        assert_eq!(grown.adoption(Some(&grown)), Adoption::Unchanged);
+        assert_eq!(base.adoption(Some(&grown)), Adoption::Stale);
+        assert_eq!(fork.adoption(Some(&grown)), Adoption::Fork);
+        assert_eq!(other.adoption(Some(&base)), Adoption::DifferentGenesis);
+        for refused in [Adoption::Stale, Adoption::Fork, Adoption::DifferentGenesis] {
+            assert!(!refused.lands());
+        }
+    }
+
+    /// A monotonic chain of every kind folds and the tip is the last stamp.
+    #[test]
+    fn monotonic_stamps_of_every_kind_fold_to_the_last_tip() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t, s) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t, s);
+        blob.checkpoint(&b, 300, 1, [0x11; 32], 1);
+        blob.lock(&a, pk(&b), 400);
+        blob.unlock(&a, pk(&b), 500);
+        blob.checkpoint(&a, 600, 2, [0x22; 32], 2);
+        blob.depart(&b, 700);
+        let (members, tip) = blob.fold_with_ts().unwrap();
+        assert_eq!(members, vec![pk(&a)]);
+        assert_eq!(tip, 700);
     }
 
     /// The registry door applies the same rule as the fold: a request that declares a bundle must consent with every scheme in it. This is what lets the worker refuse an unprovable bundle before a sponsor ever sees it.
