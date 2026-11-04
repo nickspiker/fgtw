@@ -111,21 +111,26 @@ pub fn new_blob_id() -> [u8; 32] {
     rand::random()
 }
 
-/// Seal one reader's slot: `(blob_id, dek)` encrypted under a key derived from the secret we share with them. ~80 bytes on the wire.
+/// Seal one reader's slot: `(blob_id, dek)` encrypted under a key derived from the secret we share with them, as `[nonce:24][ct+tag]`, ~104 bytes on the wire.
 pub fn seal_slot(
     kek_secret: &[u8; 32],
     purpose: &[u8],
     contents: &SlotContents,
 ) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305};
+    use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
     let key = slot_key(kek_secret, purpose);
     let mut plain = [0u8; 64];
     plain[..32].copy_from_slice(&contents.blob_id);
     plain[32..].copy_from_slice(&contents.dek);
-    // Fixed nonce is safe because the key is unique per (reader secret, purpose) AND the plaintext is re-sealed only when the DEK changes — a rewrite under the same key carries the same 64 bytes, so no two distinct plaintexts ever share a nonce. XChaCha20 (24-byte zero nonce) since the 2026-08-18 migration; open_slot read-boths the legacy 12-byte ChaCha form.
-    XChaCha20Poly1305::new((&key).into())
-        .encrypt((&[0u8; 24]).into(), plain.as_slice())
-        .map_err(|_| "scoped: slot seal failed".to_string())
+    // A fresh random 24-byte nonce per seal, prefixed, exactly as seal_value and seal_content do.
+    // Until 2026-11-03 the nonce was all zeros on the argument that the 64 bytes only change when the DEK does; but every republish mints a new DEK and blob id and re-seals every retained reader under the SAME slot key, so two distinct plaintexts shared one key and nonce (security audit FGTW-02: an observer of both slots plus a removed reader's old DEK XORs out the new one, defeating the removal the republish was for).
+    let nonce_bytes: [u8; 24] = rand::random();
+    let mut out = nonce_bytes.to_vec();
+    let ct = XChaCha20Poly1305::new((&key).into())
+        .encrypt(&XNonce::from(nonce_bytes), plain.as_slice())
+        .map_err(|_| "scoped: slot seal failed".to_string())?;
+    out.extend_from_slice(&ct);
+    Ok(out)
 }
 
 /// Open our own slot. `None` when the bytes are not ours to read (wrong secret, wrong purpose, tampered, or an empty/absent slot).
@@ -133,27 +138,24 @@ pub fn open_slot(kek_secret: &[u8; 32], purpose: &[u8], stored: &[u8]) -> Option
     open_slot_signed(kek_secret, purpose, stored).map(|(c, _)| c)
 }
 
-/// [`open_slot`] with who signed it: `Some(signed)` for the VSF envelope, `None` for a bare slot written before it (which no signer can be pinned on). RETIRE with photon 0.133: the bare branch.
-pub fn open_slot_signed(kek_secret: &[u8; 32], purpose: &[u8], stored: &[u8]) -> Option<(SlotContents, Option<Signed>)> {
-    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
-    // The signed VSF envelope (section `slot`, field `wrap`), or a bare slot written before it.
-    let (unwrapped, signed) = if is_vsf(stored) {
-        let (sealed, signed) = open_envelope("slot", "wrap", stored).ok()?;
-        (Some(sealed), Some(signed))
-    } else {
-        (None, None)
-    };
-    let sealed = unwrapped.as_deref().unwrap_or(stored);
+/// [`open_slot`] with who signed it. A stored slot is always the signed VSF envelope (section `slot`, field `wrap`); the bare pre-envelope form stopped being read on 2026-11-03, overdue since photon 0.133.
+pub fn open_slot_signed(kek_secret: &[u8; 32], purpose: &[u8], stored: &[u8]) -> Option<(SlotContents, Signed)> {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305, XNonce};
+    let (sealed, signed) = open_envelope("slot", "wrap", stored).ok()?;
     let key = slot_key(kek_secret, purpose);
-    // Read-both: current XChaCha20 (24-byte zero nonce), then legacy ChaCha20 (12-byte zero nonce).
-    let plain = XChaCha20Poly1305::new((&key).into())
-        .decrypt((&[0u8; 24]).into(), sealed)
-        .ok()
-        .or_else(|| {
-            ChaCha20Poly1305::new((&key).into())
-                .decrypt((&[0u8; 12]).into(), sealed)
-                .ok()
-        })?;
+    // The current layout first: [nonce:24][ct+tag], the ciphertext of 64 bytes plus the tag.
+    // WHY/PROOF: the slot is fetched from storage and may be any length — the 24-byte split below would panic on a shorter one.
+    let plain = if sealed.len() >= 24 + 16 {
+        XNonce::try_from(&sealed[..24])
+            .ok()
+            .and_then(|n| XChaCha20Poly1305::new((&key).into()).decrypt(&n, &sealed[24..]).ok())
+    } else {
+        None
+    };
+    // MIGRATION-EXPIRES: 2027-02-01 — slots sealed before 2026-11-03 under the all-zero XChaCha nonce, and before 2026-08-18 under the all-zero 12-byte ChaCha nonce, still open until every publisher has republished once; delete both branches and the test that synthesises them.
+    let plain = plain
+        .or_else(|| XChaCha20Poly1305::new((&key).into()).decrypt((&[0u8; 24]).into(), sealed.as_slice()).ok())
+        .or_else(|| ChaCha20Poly1305::new((&key).into()).decrypt((&[0u8; 12]).into(), sealed.as_slice()).ok())?;
     if plain.len() != 64 {
         return None;
     }
@@ -239,15 +241,10 @@ pub fn open_content(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) -> Option
     open_content_signed(dek, blob_id, stored).map(|(c, _)| c)
 }
 
-/// [`open_content`] with who signed it: `Some(signed)` for the VSF envelope, `None` for a bare object written before it. RETIRE with photon 0.133: the bare branch.
-pub fn open_content_signed(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) -> Option<(Vec<u8>, Option<Signed>)> {
-    let (unwrapped, signed) = if is_vsf(stored) {
-        let (sealed, signed) = open_envelope("blob", "content", stored).ok()?;
-        (Some(sealed), Some(signed))
-    } else {
-        (None, None)
-    };
-    open_bare_content(dek, blob_id, unwrapped.as_deref().unwrap_or(stored)).map(|c| (c, signed))
+/// [`open_content`] with who signed it. A stored object is always the signed VSF envelope (section `blob`, field `content`); the bare pre-envelope form stopped being read on 2026-11-03, overdue since photon 0.133.
+pub fn open_content_signed(dek: &[u8; 32], blob_id: &[u8; 32], stored: &[u8]) -> Option<(Vec<u8>, Signed)> {
+    let (sealed, signed) = open_envelope("blob", "content", stored).ok()?;
+    open_bare_content(dek, blob_id, &sealed).map(|c| (c, signed))
 }
 
 /// Decrypt the bare `[nonce][ciphertext]` of a content object.
@@ -343,7 +340,7 @@ mod tests {
         let blob = seal_content_doc(&contents.dek, &contents.blob_id, b"pixels", &dev(), 1).unwrap();
         assert!(is_vsf(slot) && is_vsf(&blob));
         assert_eq!(open_envelope("blob", "content", &blob).unwrap().1, Signed { signer: *dev().public.as_bytes(), stamp: 1 });
-        assert_eq!(open_slot_signed(&kek, b"avatar", slot).unwrap().1.unwrap().signer, *dev().public.as_bytes());
+        assert_eq!(open_slot_signed(&kek, b"avatar", slot).unwrap().1.signer, *dev().public.as_bytes());
         assert_eq!(open_slot(&kek, b"avatar", slot).unwrap(), contents);
         assert_eq!(open_content(&contents.dek, &contents.blob_id, &blob).unwrap(), b"pixels");
         for i in [0usize, blob.len() / 2, blob.len() - 1] {
@@ -354,34 +351,58 @@ mod tests {
         assert!(open_envelope("slot", "wrap", &blob).is_err(), "a blob is not a slot");
     }
 
-    /// The bare form written before the envelope still opens (read-both); nothing writes it any more.
+    /// The bare form written before the envelope is refused: a stored object with no signer is nobody's.
     #[test]
-    fn bare_objects_written_before_the_envelope_still_open() {
+    fn bare_objects_written_before_the_envelope_are_refused() {
         let kek = secret(1);
         let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
         let bare_slot = seal_slot(&kek, b"avatar", &contents).unwrap();
         let bare_blob = seal_content(&contents.dek, &contents.blob_id, b"old").unwrap();
-        assert_eq!(open_slot_signed(&kek, b"avatar", &bare_slot).unwrap(), (contents.clone(), None));
-        assert_eq!(open_content(&contents.dek, &contents.blob_id, &bare_blob).unwrap(), b"old");
+        assert!(open_slot_signed(&kek, b"avatar", &bare_slot).is_none());
+        assert!(open_content(&contents.dek, &contents.blob_id, &bare_blob).is_none());
     }
 
-    /// Legacy 12-byte-nonce ChaCha20 blobs (slot, value, content) must still open — the read-both migration path. Each is synthesized directly under the same derived key the new sealer uses.
+    /// Two seals of one slot under one key never share a nonce (FGTW-02): the prefixed nonces differ, so the ciphertexts of one plaintext differ, and both open.
+    #[test]
+    fn every_slot_seal_draws_its_own_nonce() {
+        let kek = secret(1);
+        let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
+        let a = seal_slot(&kek, b"avatar", &contents).unwrap();
+        let b = seal_slot(&kek, b"avatar", &contents).unwrap();
+        assert_eq!(a.len(), 24 + 64 + 16);
+        assert_ne!(a[..24], b[..24], "two seals drew the same nonce");
+        assert_ne!(a[24..], b[24..], "the same plaintext sealed twice must not repeat its ciphertext");
+        for sealed in [a, b] {
+            let doc = envelope("slot", "wrap", sealed, &dev(), 1).unwrap();
+            assert_eq!(open_slot(&kek, b"avatar", &doc).unwrap(), contents);
+        }
+    }
+
+    /// MIGRATION-EXPIRES: 2027-02-01 — slots sealed under the two retired fixed-nonce layouts still open through the signed envelope; delete with the two legacy branches in open_slot_signed.
+    #[test]
+    fn opens_fixed_nonce_slots_sealed_before_the_random_nonce() {
+        use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305};
+        let kek = secret(1);
+        let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
+        let mut plain = [0u8; 64];
+        plain[..32].copy_from_slice(&contents.blob_id);
+        plain[32..].copy_from_slice(&contents.dek);
+        let key = slot_key(&kek, b"avatar");
+        let zero_x = XChaCha20Poly1305::new((&key).into()).encrypt((&[0u8; 24]).into(), plain.as_slice()).unwrap();
+        let zero_c = ChaCha20Poly1305::new((&key).into()).encrypt((&[0u8; 12]).into(), plain.as_slice()).unwrap();
+        for sealed in [zero_x, zero_c] {
+            let doc = envelope("slot", "wrap", sealed, &dev(), 1).unwrap();
+            assert_eq!(open_slot(&kek, b"avatar", &doc).unwrap(), contents);
+        }
+    }
+
+    /// Legacy 12-byte-nonce ChaCha20 values and content must still open — the read-both migration path. Each is synthesized directly under the same derived key the new sealer uses.
     #[test]
     fn opens_legacy_12byte_nonce_formats() {
         use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
         let kek = secret(1);
         let dek = new_dek();
         let blob_id = new_blob_id();
-
-        // slot: fixed [0;12] nonce, no prefix.
-        let contents = SlotContents { blob_id, dek };
-        let mut plain = [0u8; 64];
-        plain[..32].copy_from_slice(&blob_id);
-        plain[32..].copy_from_slice(&dek);
-        let legacy_slot = ChaCha20Poly1305::new((&slot_key(&kek, b"avatar")).into())
-            .encrypt((&[0u8; 12]).into(), plain.as_slice())
-            .unwrap();
-        assert_eq!(open_slot(&kek, b"avatar", &legacy_slot).unwrap(), contents);
 
         // value: [nonce:12][ct].
         let value = [0x9au8; 32];
@@ -404,7 +425,8 @@ mod tests {
             .unwrap();
         let mut legacy_content = n2.to_vec();
         legacy_content.extend_from_slice(&ct2);
-        assert_eq!(open_content(&dek, &blob_id, &legacy_content).unwrap(), content);
+        let doc = envelope("blob", "content", legacy_content, &dev(), 1).unwrap();
+        assert_eq!(open_content(&dek, &blob_id, &doc).unwrap(), content);
     }
 
     /// The round trip every reader performs: find my slot, unwrap the key, open the one shared ciphertext.
@@ -460,7 +482,7 @@ mod tests {
     fn content_is_bound_to_its_address() {
         let dek = new_dek();
         let blob_id = new_blob_id();
-        let sealed = seal_content(&dek, &blob_id, b"pixels").unwrap();
+        let sealed = seal_content_doc(&dek, &blob_id, b"pixels", &dev(), 1).unwrap();
         assert_eq!(open_content(&dek, &blob_id, &sealed).unwrap(), b"pixels");
         assert!(open_content(&dek, &new_blob_id(), &sealed).is_none());
         assert!(open_content(&new_dek(), &blob_id, &sealed).is_none());
@@ -476,12 +498,14 @@ mod tests {
         let a = secret(1);
         let b = secret(2);
         let contents = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
-        let sealed_content = seal_content(&contents.dek, &contents.blob_id, b"pixels").unwrap();
+        let sealed_content = seal_content_doc(&contents.dek, &contents.blob_id, b"pixels", &dev(), 1).unwrap();
 
         let before = slot_writes(&[a], b"avatar", &contents, &dev(), 1).unwrap();
         let after = slot_writes(&[a, b], b"avatar", &contents, &dev(), 1).unwrap();
 
-        assert_eq!(before[0], after[0], "an existing reader's slot is byte-identical");
+        // The existing reader's slot keeps its address and opens to the same contents; its bytes differ, since every seal draws its own nonce (FGTW-02).
+        assert_eq!(before[0].address, after[0].address, "an existing reader's slot keeps its address");
+        assert_eq!(open_slot(&a, b"avatar", &after[0].sealed).unwrap(), contents);
         // The content never moved: the same bytes still open under the same key.
         assert!(open_content(&contents.dek, &contents.blob_id, &sealed_content).is_some());
         // And the newcomer reads the same content through their own slot.
@@ -499,7 +523,7 @@ mod tests {
         let removed_slot = open_slot(&go, b"avatar", &old_writes[1].sealed).unwrap();
 
         let v1 = SlotContents { blob_id: new_blob_id(), dek: new_dek() };
-        let new_content = seal_content(&v1.dek, &v1.blob_id, b"new pixels").unwrap();
+        let new_content = seal_content_doc(&v1.dek, &v1.blob_id, b"new pixels", &dev(), 1).unwrap();
         let new_writes = slot_writes(&[stay], b"avatar", &v1, &dev(), 1).unwrap();
         assert_eq!(new_writes.len(), 1);
 
