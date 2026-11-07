@@ -892,6 +892,22 @@ impl MembershipBlob {
         self.fold().map(|m| m.contains(device_pubkey)).unwrap_or(false)
     }
 
+    /// Was `device_pubkey` a member at eagle time `t`: the chain folded thru its ops stamped at or before `t`, in chain order.
+    /// The walk stops at the first op stamped after `t`, so a member's far-future stamp only ever shortens the history read, never lengthens it.
+    /// A device the WHOLE chain has locked out answers false at every `t`: whoever holds a stolen key can date a record to before the theft, so nothing it signed is vouched for.
+    /// For a record a departed device signed while it was a member (a phone that moved to a new key, a device that left): judge it by the fleet it signed in, not the fleet of today.
+    pub fn was_member_at(&self, device_pubkey: &[u8; 32], t: i64) -> bool {
+        if self.locked_out().map(|l| l.contains(device_pubkey)).unwrap_or(true) {
+            return false;
+        }
+        let upto = self.ops.iter().take_while(|op| op.eagle_time <= t).count();
+        if upto == 0 {
+            return false;
+        }
+        let prefix = MembershipBlob { ops: self.ops[..upto].to_vec() };
+        prefix.fold().map(|m| m.contains(device_pubkey)).unwrap_or(false)
+    }
+
     /// The hash the NEXT op must reference as `prev_hash` (the tail link, or `[0;32]` if empty).
     pub fn head(&self) -> [u8; 32] {
         self.ops.last().map(|op| op.chain_hash()).unwrap_or([0u8; 32])
@@ -1794,6 +1810,27 @@ mod tests {
         assert_eq!(blob.fold().unwrap(), vec![pk(&b), pk(&c)]);
         assert!(!blob.is_member(&pk(&a)));
         assert!(blob.is_member(&pk(&c)));
+    }
+
+    /// A departed device was a member between its add and its departure, and at no other time; a locked device is a member at no time.
+    #[test]
+    fn was_member_at_reads_the_fleet_a_record_was_signed_in() {
+        let a = key(1);
+        let b = key(2);
+        let c = key(3);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let (t1, s1) = consent_for(&b, 190);
+        blob.add(&a, pk(&b), 200, t1, s1);
+        blob.depart(&b, 300);
+        assert!(!blob.was_member_at(&pk(&b), 150), "before its add");
+        assert!(blob.was_member_at(&pk(&b), 250), "between its add and its departure");
+        assert!(!blob.was_member_at(&pk(&b), 350), "after its departure");
+        assert!(blob.was_member_at(&pk(&a), 100) && blob.was_member_at(&pk(&a), 999), "the founder, from genesis on");
+        assert!(!blob.was_member_at(&pk(&a), 99), "nobody before the genesis");
+        let (t2, s2) = consent_for(&c, 390);
+        blob.add(&a, pk(&c), 400, t2, s2);
+        blob.lock(&a, pk(&c), 500);
+        assert!(!blob.was_member_at(&pk(&c), 450), "a locked device vouches for nothing, whatever date its record names");
     }
 
     #[test]
