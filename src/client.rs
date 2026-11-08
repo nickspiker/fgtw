@@ -215,7 +215,7 @@ pub fn ensure_member_plated<T: FgtwTransport>(
 }
 
 /// The stamp for the op this device is about to append to `blob`: now, or the tip's stamp if that is later. An honest op never precedes the tip, so the tip only ever advances along an honest chain and a sibling's clock running behind cannot make a reader's freshness tripwire miss it.
-fn stamp_after(blob: &MembershipBlob) -> i64 {
+pub(crate) fn stamp_after(blob: &MembershipBlob) -> i64 {
     let head = blob.ops.last().map(|op| op.eagle_time).unwrap_or(0);
     // WHY/PROOF: `max` is the rule, not a guard — a device whose clock trails the tip (skew between members, or a member that stamped ahead) would otherwise append a stamp below the tip, and the tripwire readers compare tips, so the op must carry the later of the two to be seen as new.
     crate::now_oscillations().max(head)

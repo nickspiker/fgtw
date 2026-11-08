@@ -78,8 +78,33 @@ pub fn random32() -> [u8; 32] {
     out
 }
 
+static LOG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Where the crate's own account of what it did goes (a seed mirror that failed, a grow refused): the embedding's log (Photon's log file, a ferros process's console). Nothing is said until one is registered; the crate never fails for want of one.
+pub fn set_log(sink: fn(&str)) {
+    LOG.store(sink as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// One line to the registered log sink, if any.
+pub(crate) fn log(line: &str) {
+    let p = LOG.load(core::sync::atomic::Ordering::Acquire);
+    if p != 0 {
+        // SAFETY: LOG is only ever stored from a `fn(&str)` in set_log, and is nonzero here, so the usize is that function pointer.
+        let sink: fn(&str) = unsafe { core::mem::transmute::<usize, fn(&str)>(p) };
+        sink(line);
+    }
+}
+
 /// Device identity keypair — the deterministic Ed25519 signing key (`Keypair`) fleet ops and attestations are signed with.
 pub mod keys;
+
+/// The chains and fan-outs a device HOLDS (peers first, the seed last: photon docs/peers-are-fgtw.md), and the seed calls that consult and update them: a held copy answers when the seed does not, and a copy a peer hands over is adopted by the same rule a seed copy is. Storage of the held set is the embedding's ([`held::ChainHold`], [`held::FanoutHold`]).
+#[cfg(feature = "protocol")]
+pub mod held;
+
+/// The sponsor's half of the device-ADD ceremony (photon docs/pairing-v2.md) and the approver's half of a departure: the candidate set from the registry and the LAN, the live word matcher, the tap and the beacon matches, the Add, the fan-out grow, the approval of a sibling's departure. Transport (UDP, HTTP, BLE, NFC) stays the caller's.
+#[cfg(feature = "protocol")]
+pub mod sponsor;
 
 /// Fleet membership chain — `FleetOp` / `MembershipBlob` / `fold` / `extends` / `is_member`, plus the VSF op codec and the device-signed builders.
 /// The authority: valid signature + hash-chain link + signer-was-a-prior-member.
