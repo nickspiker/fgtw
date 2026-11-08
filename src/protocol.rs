@@ -317,10 +317,53 @@ pub fn parse_fstate_push(bytes: &[u8]) -> Result<([u8; 32], Vec<u8>, [u8; 32]), 
     Ok((field_handle_proof(&section, "hp").ok_or("fstate_push missing hp")?, field_ge(&section, "bl").ok_or("fstate_push missing bl")?, sender))
 }
 
+// ── The person's identity space over the mesh (crate::space) ──
+
+/// The `space_push` frame: the person's identity space, sealed under the fleet key, handed among one fleet's own devices: a change goes to each sibling, and a `space_want` is answered with one. The receiver checks the sender is a member, opens it, and merges; the merge is a total order, so the order pushes arrive in does not matter.
+pub fn space_push(handle_proof: &[u8; 32], sealed: &crate::space::Sealed, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("space_push");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    crate::space::sealed_fields(&mut section, sealed);
+    signed_frame(section, signer, time)
+}
+
+/// Read a `space_push`: (handle proof, the sealed space, the sending device).
+pub fn parse_space_push(bytes: &[u8]) -> Result<([u8; 32], crate::space::Sealed, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "space_push")?;
+    let sealed = crate::space::sealed_from(&section).ok_or("space_push missing kf or ct")?;
+    Ok((field_handle_proof(&section, "hp").ok_or("space_push missing hp")?, sealed, sender))
+}
+
+/// The `space_want` frame: "send me your copy of the space", with the digest of the asker's own (`Space::digest`), so a sibling holding the same copy need not answer.
+pub fn space_want(handle_proof: &[u8; 32], digest: &[u8; 32], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("space_want");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("dg", VsfType::hb(digest.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `space_want`: (handle proof, the asker's digest, the asking device).
+pub fn parse_space_want(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "space_want")?;
+    Ok((field_handle_proof(&section, "hp").ok_or("space_want missing hp")?, section.bytes32("dg").ok_or("space_want missing dg")?, sender))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fleet::Egg;
+
+    /// A space_push and a space_want round-trip.
+    #[test]
+    fn space_frames_round_trip() {
+        let kp = Keypair::from_seed(&[0x3Du8; 32]);
+        let sealed = crate::space::Sealed { kfp: [4u8; 32], wrap: vec![9u8; 64] };
+        let frame = space_push(&[9u8; 32], &sealed, &kp, 77).unwrap();
+        assert_eq!(parse_space_push(&frame).unwrap(), ([9u8; 32], sealed, kp.public.to_bytes()));
+        let want = space_want(&[9u8; 32], &[5u8; 32], &kp, 78).unwrap();
+        assert_eq!(parse_space_want(&want).unwrap(), ([9u8; 32], [5u8; 32], kp.public.to_bytes()));
+        assert!(parse_space_want(&frame).is_err());
+    }
 
     /// An fstate_push round-trips its handle proof, its sealed bytes and its signer.
     #[test]

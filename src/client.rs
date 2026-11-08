@@ -980,6 +980,42 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     }
 }
 
+// ── The person's identity space at the seed (crate::space) ──
+
+/// Keep the sealed identity space at fgtw.org (`space_put`): the copy a total loss recovers from; day to day the space lives on the fleet (`protocol::space_push`). Member-gated as `fstate_put` is: the envelope is device-signed and the worker takes it only from a current member of the fleet `handle_proof`; the stamp must be newer than the stored one. A worker that has no space slot yet answers `unknown_op`, returned as an error the caller can name.
+pub fn push_space<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32], device_key: &impl crate::pq::FleetSigner, sealed: &crate::space::Sealed) -> Result<(), String> {
+    let mut section = vsf::VsfSection::new("space_put");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    crate::space::sealed_fields(&mut section, sealed);
+    section.add_field("t", VsfType::e(vsf::types::EtType::e6(crate::now_oscillations())));
+    let resp = signed_req(t, device_key, section, "space_put")?;
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw space_put {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
+}
+
+/// The sealed identity space fgtw.org keeps for `handle_proof` (`space_get`), or None when it keeps none. Public, as `fstate_get` is: only the fleet's devices can open it. The stored document is the `space_put` the worker verified; its seal is read back from it.
+pub fn pull_space<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<crate::space::Sealed>, String> {
+    let mut section = vsf::VsfSection::new("space_get");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    let resp = t.post(unsigned_req(section)?)?;
+    if is_error(&resp.body, "not_found") {
+        return Ok(None);
+    }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw space_get {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    let (_, stored) = parse_section(&resp.body)?;
+    Ok(crate::space::sealed_from(&stored))
+}
+
 // ── Fleet state transport ──
 
 /// Publish the fleet-shared state (roster + settings layers): seal it under the fleet key and PUT it to the membership-gated slot. The envelope is device-signed (ke/gm header, every scheme the writer holds at the envelope tier) so FGTW checks the writer against the folded fleet chain — any fleet device may write.
