@@ -285,13 +285,13 @@ pub fn reconcile(space: &mut Space, base: &mut Baseline, local: &[Fact], managed
         keys.push((f.kind, f.id.clone()));
     }
     for e in space.entries() {
-        if managed(e.kind, &e.id) && !local.iter().any(|f| f.kind == e.kind && f.id == e.id) {
+        if managed(e.kind, &e.id) && !local.iter().any(|f| key_of(f.kind, &f.id) == e.key()) {
             keys.push((e.kind, e.id.clone()));
         }
     }
     for (kind, id) in keys {
         let k = hash(&key_of(kind, &id));
-        let fact = local.iter().find(|f| f.kind == kind && f.id == id);
+        let fact = local.iter().find(|f| key_of(f.kind, &f.id) == key_of(kind, &id));
         let l = fact.map(|f| hash(&bytes_of(&f.value)));
         let b = base.get(&k);
         let s = space.get(kind, &id).cloned();
@@ -304,9 +304,11 @@ pub fn reconcile(space: &mut Space, base: &mut Baseline, local: &[Fact], managed
             (None, Some(e)) => l.is_some() && l != s_value && fact.and_then(|f| f.stamp).is_some_and(|t| t > e.updated),
         };
         if moved && l != s_value {
-            // Stamped past everything this device has seen, so the person's latest change here wins: their own stamp when the fact keeps one, else now.
-            let floor = space.newest() + 1;
-            let stamp = fact.and_then(|f| f.stamp).unwrap_or(now).max(floor);
+            // Stamped past the entry this change replaces, so the person's latest change here wins even over a sibling whose clock runs ahead (a Lamport step, not a clamp: without it an older stamp would lose the merge and the change would be undone on the next pass); otherwise their own stamp when the fact keeps one (a kist answer's when), else now.
+            let mut stamp = fact.and_then(|f| f.stamp).unwrap_or(now);
+            if let Some(e) = &s {
+                stamp = stamp.max(e.updated + 1);
+            }
             let (value, gone) = match fact {
                 Some(f) => (f.value.clone(), false),
                 None => (Vec::new(), true),
@@ -557,6 +559,19 @@ mod tests {
         let w = reconcile(&mut s, &mut Baseline::default(), &[], |k, _| k == 1, B, 60);
         assert_eq!(w, vec![Write::Set { kind: 1, id: vec![VsfType::u(0, false)], value: vec![VsfType::i(100)], updated: 50 }]);
         assert!(!s.get(9, &[VsfType::u(0, false)]).unwrap().gone);
+    }
+
+    /// A space read back from its document holds its numbers at their narrow widths (`u3`), the device's copy at the auto width (`u`): the same fact all the same, matched by its bytes (2026-11-08: matched by type, one answer read as two facts and the second removed it).
+    #[test]
+    fn a_fact_is_its_bytes_not_its_width() {
+        let all = |_: u8, _: &[VsfType]| true;
+        let (mut s, mut b) = (Space::new(), Baseline::default());
+        let local = vec![fact(1, 7, 0)];
+        reconcile(&mut s, &mut b, &local, all, A, 10);
+        let mut back = Space::from_doc(&s.to_doc(11).unwrap()).unwrap();
+        assert_ne!(back.entries()[0].id, local[0].id, "the widths differ");
+        assert!(reconcile(&mut back, &mut b, &local, all, A, 12).is_empty());
+        assert!(back.entries().iter().all(|e| !e.gone));
     }
 
     /// A fact the fleet removed, still held by a device that never reconciled it (a restore over an old copy): it goes, and stays gone.
