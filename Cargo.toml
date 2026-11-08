@@ -64,3 +64,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.fn-dsa-comm]
 opt-level = 3
+
+# Dev builds keep line tables only: backtraces still name the file and line, and the full debug info that filled Harbor (2026-11-08) is gone.
+[profile.dev]
+debug = "line-tables-only"
