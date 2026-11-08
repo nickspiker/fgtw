@@ -302,10 +302,34 @@ pub fn parse_fanout_resp(bytes: &[u8]) -> Result<([u8; 32], Vec<u8>, [u8; 32]), 
     Ok((field_handle_proof(&section, "hp").ok_or("fanout_resp missing hp")?, field_ge(&section, "bl").ok_or("fanout_resp missing bl")?, sender))
 }
 
+/// Build an `fstate_push` — a fleet's shared state (roster and settings), sealed under the fleet key, handed device to device among one fleet's own devices: a change goes straight to each sibling, and two siblings that see each other come online swap theirs.
+/// The fgtw.org slot keeps a copy only as the backup a total loss recovers from (Nick 2026-11-07: day-to-day the state lives on the fleet).
+pub fn fstate_push(handle_proof: &[u8; 32], sealed: &[u8], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("fstate_push");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("bl", VsfType::ge(sealed.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read an `fstate_push`: (handle proof, the sealed state, the sending device).
+pub fn parse_fstate_push(bytes: &[u8]) -> Result<([u8; 32], Vec<u8>, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "fstate_push")?;
+    Ok((field_handle_proof(&section, "hp").ok_or("fstate_push missing hp")?, field_ge(&section, "bl").ok_or("fstate_push missing bl")?, sender))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fleet::Egg;
+
+    /// An fstate_push round-trips its handle proof, its sealed bytes and its signer.
+    #[test]
+    fn fstate_push_round_trips() {
+        let kp = Keypair::from_seed(&[0x3Cu8; 32]);
+        let frame = fstate_push(&[9u8; 32], &[1, 2, 3, 4], &kp, 77).unwrap();
+        assert_eq!(parse_fstate_push(&frame).unwrap(), ([9u8; 32], vec![1, 2, 3, 4], kp.public.to_bytes()));
+        assert!(parse_fanout_resp(&frame).is_err(), "a push is not a fan-out answer");
+    }
     use crate::keys::Keypair;
 
     /// The departure request's section is byte-identical to photon's hand codec (photon protocol.rs `depart_req_derive_is_byte_identical_and_round_trips`), and the signed frame round-trips with intent and commitment, and a pre-intent request reads desk-less (0, None).
