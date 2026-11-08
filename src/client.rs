@@ -958,14 +958,15 @@ pub fn recover_fleet_key<T: FgtwTransport>(
 /// Recover the current fleet key, or ESTABLISH revision 1 if NO fan-out exists yet (the genesis founder). Handles the establish race: if another device published first, recover theirs instead.
 /// STATE-CARRYING APPS: an establish over an UNREADABLE (pre-v2) blob mints a key that opens none of the fleet's existing sealed state — if your app keeps state in the fstate slot, wrap this with the carry discipline (preserve under a cached key → mint → re-seal, and refuse the mint entirely when sealed state exists that nothing you hold can preserve). Photon's `recover_or_establish_carrying` is the reference.
 /// A fan-out that EXISTS but holds no wrap for us is NOT an establish case — that's a freshly-bound device whose wrap arrives with the sponsor's green-confirm GROW, and self-publishing in here would hand it the key before the human confirmed (voiding the two-phase gate: any member may publish, so the gate is only real if the joiner never publishes itself in). Wait: return None and let the next sync recover the grown fan-out.
+/// `device_key` is the full signer: opening a wrap needs only its Ed25519 half, but an establish PUBLISHES a fan-out, and that envelope is held to the fleet's floor like any other (it signed with a bare key until 2026-11-08).
 pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
     t: &T,
     handle_proof: &[u8; 32],
-    device_key: &Keypair,
+    device_key: &impl crate::pq::FleetSigner,
     identity_seed: &[u8; 32],
 ) -> Result<Option<[u8; 32]>, String> {
     match fetch_fanout_full(t, handle_proof) {
-        Ok(Some(f)) => open_checked(&f, handle_proof, device_key, identity_seed),
+        Ok(Some(f)) => open_checked(&f, handle_proof, device_key.keypair(), identity_seed),
         // Err = a pre-v3 blob (hard flag-day) — fall through to establish over it, same as absent.
         Ok(None) | Err(_) => {
             let members = current_members(t, handle_proof)?;
@@ -974,7 +975,7 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
             }
             match mint_fleet_key(t, handle_proof, device_key, &members, identity_seed) {
                 Ok((_, k)) => Ok(Some(k)),
-                Err(_) => recover_fleet_key(t, handle_proof, device_key, identity_seed),
+                Err(_) => recover_fleet_key(t, handle_proof, device_key.keypair(), identity_seed),
             }
         }
     }
