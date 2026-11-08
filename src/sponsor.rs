@@ -37,6 +37,21 @@ impl Candidate {
     pub fn nearby(&self) -> bool {
         self.heard_ble || self.heard_lan
     }
+
+    /// Offered as a pick on the sponsor's screen: nearby by either radio, or, while the add is contended ([`contended`]), heard over Bluetooth only, the radio that puts the device beside this one; the LAN reaches anyone on the network.
+    pub fn pickable(&self, contended: bool) -> bool {
+        if contended {
+            self.heard_ble
+        } else {
+            self.nearby()
+        }
+    }
+}
+
+/// More than one device asks to join this identity at once (photon docs/lifecycle.md P3): the network path shuts for the add, words and LAN picks alike, and only Bluetooth or NFC presence can add.
+/// One of them is someone else holding the handle, or the owner adding two at once, who loses nothing by bringing each one close.
+pub fn contended(cands: &[Candidate]) -> bool {
+    cands.len() > 1
 }
 
 /// The requests from both sources merged by device key, the newest stamp winning. Each was verified where it came in.
@@ -277,6 +292,25 @@ mod tests {
         crate::protocol::bind_request(dev, seed, hp, t, nfc)
     }
 
+
+    /// Contention (photon docs/lifecycle.md P3): a second request shuts the network path, and a device heard only over the LAN stops being a pick until Bluetooth hears it.
+    #[test]
+    fn contention_leaves_only_bluetooth_picks() {
+        let (seed, hp) = ([7u8; 32], [9u8; 32]);
+        let a = Keypair::from_seed(&[1u8; 32]);
+        let b = Keypair::from_seed(&[2u8; 32]);
+        let now = crate::now_oscillations();
+        let lan = [a.public.to_bytes()];
+        let one = candidates(vec![req(&a, &seed, &hp, now, &[0; 32])], &seed, &hp, &[], &lan);
+        assert!(!contended(&one));
+        assert!(one[0].pickable(false));
+        let mut two = candidates(vec![req(&a, &seed, &hp, now, &[0; 32]), req(&b, &seed, &hp, now, &[0; 32])], &seed, &hp, &[], &lan);
+        assert!(contended(&two));
+        assert!(two[0].nearby() && !two[0].pickable(true));
+        two[0].heard_ble = true;
+        assert!(two[0].pickable(true));
+        assert!(!two[1].pickable(true));
+    }
     #[test]
     fn words_select_exactly_one_device() {
         let (seed, hp) = ([7u8; 32], [9u8; 32]);
