@@ -12,6 +12,7 @@ use core::net::{IpAddr, SocketAddr};
 /// Trusted sources (a contact's pong, or the bootstrap seed) bypass this.
 const QUORUM: usize = 2;
 /// Pending addresses kept at once; a real device sees one or two candidates, never more.
+/// The least recently voted gives way when a new one arrives (security audit NET-07, FGTW-06), so the list is bounded and a stale claim cannot outlive fresh ones.
 const MAX_PENDING: usize = 1 << 3;
 
 /// This node's own reflexive address, per family, with a quorum buffer for untrusted claims.
@@ -22,8 +23,9 @@ const MAX_PENDING: usize = 1 << 3;
 pub struct ReflexiveState {
     v4: Option<SocketAddr>,
     v6: Option<SocketAddr>,
-    /// Untrusted observations awaiting corroboration: address → distinct source device pubkeys.
+    /// Untrusted observations awaiting corroboration: address → distinct source device pubkeys, least recently voted first.
     /// A handful of racing addresses, each short of a quorum of two, so a plain list searched linearly.
+    /// Each voter list holds at most [`QUORUM`] sources (security audit FGTW-06): past that a vote changes nothing, and an address whose adoption is refused (a LAN view under a held public one) used to keep a slot per source forever.
     votes: Vec<(SocketAddr, Vec<[u8; 32]>)>,
 }
 
@@ -36,6 +38,7 @@ impl ReflexiveState {
     ///
     /// `trusted` = the observation came from a contact's pong or the bootstrap seed → adopt immediately.
     /// Otherwise the address must be seen from [`QUORUM`] distinct sources before adoption (anti-poison).
+    /// `from` must be a source the CALLER authenticated (a verified signature, a known device): this state counts distinct keys and cannot tell a real device from a minted one, so quorum is only as strong as the caller's keying (security audit FGTW-06; photon keys votes by the signed source).
     ///
     /// Returns `Some(addr)` when this observation *changed* the adopted address for its family (the caller should then update `PhotonApp.our_reflexive` and re-announce), else `None`.
     /// Is this address one only a LAN can see? A same-LAN observer reports it; the internet never does.
@@ -62,7 +65,12 @@ impl ReflexiveState {
             true
         } else {
             let at = match self.votes.iter().position(|(a, _)| *a == observed) {
-                Some(at) => at,
+                // A fresh vote moves the address to the back, so the eviction below drops the least recently voted rather than the first ever seen (security audit FGTW-06).
+                Some(at) => {
+                    let entry = self.votes.remove(at);
+                    self.votes.push(entry);
+                    self.votes.len() - 1
+                }
                 None => {
                     // Bounded (security audit NET-07): every unsolicited claim used to open a new slot and stay, so the list and the scan over it grew without end. The oldest pending address gives way.
                     if self.votes.len() >= MAX_PENDING {
@@ -73,7 +81,8 @@ impl ReflexiveState {
                 }
             };
             let voters = &mut self.votes[at].1;
-            if !voters.contains(&from) {
+            // WHY/PROOF: `from` is any untrusted claimant, and a voter list at quorum already adopts; one more key adds nothing but memory (security audit FGTW-06).
+            if voters.len() < QUORUM && !voters.contains(&from) {
                 voters.push(from);
             }
             voters.len() >= QUORUM
@@ -181,6 +190,27 @@ mod tests {
             Some(v4("1.2.3.4:4383"))
         );
         assert_eq!(r.v4(), Some(v4("1.2.3.4:4383")));
+    }
+
+    /// A LAN address refused under a held public one keeps at most QUORUM voters however many sources claim it, and a pending address that keeps being voted outlives MAX_PENDING newer one-off claims (security audit FGTW-06).
+    #[test]
+    fn votes_are_bounded_and_the_recently_voted_survive() {
+        let mut r = ReflexiveState::new();
+        r.record(v4("203.0.113.9:4383"), [0u8; 32], true);
+        for s in 1..=200u8 {
+            assert_eq!(r.record(v4("192.168.1.5:4383"), [s; 32], false), None);
+        }
+        assert_eq!(r.votes.len(), 1);
+        assert_eq!(r.votes[0].1.len(), QUORUM);
+        let mut r = ReflexiveState::new();
+        r.record(v4("1.2.3.4:4383"), [1u8; 32], false);
+        for s in 0..(MAX_PENDING as u8 * 2) {
+            r.record(SocketAddr::new(v4("9.9.9.9:1").ip(), 1000 + s as u16), [2u8; 32], false);
+            r.record(v4("1.2.3.4:4383"), [1u8; 32], false);
+        }
+        assert!(r.votes.len() <= MAX_PENDING);
+        assert!(r.votes.iter().any(|(a, _)| *a == v4("1.2.3.4:4383")), "the address still being voted for is kept");
+        assert_eq!(r.record(v4("1.2.3.4:4383"), [3u8; 32], false), Some(v4("1.2.3.4:4383")), "and its first vote still counts toward quorum");
     }
 
     #[test]
