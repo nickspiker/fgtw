@@ -138,8 +138,9 @@ pub fn gather_peer_candidates(
             }
         }
         if let Some(lan_addr) = ep.lan {
+            // The LAN column passes the same gate as the public one (security audit FGTW-07): `admits` refuses loopback, link-local and unspecified, but a broadcast or multicast address, or port zero, got thru.
             if let IpAddr::V4(v4) = lan_addr.ip() {
-                if policy.admits(v4) {
+                if !is_bogus_addr(&lan_addr) && policy.admits(v4) {
                     set.add(Candidate::new(lan_addr, CandidateKind::HostV4Lan));
                 }
             }
@@ -193,6 +194,18 @@ mod tests {
     }
     fn v4(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    /// The LAN column passes the bogus gate too, and the LAN itself (private, any port) still gets in (security audit FGTW-07).
+    #[test]
+    fn a_bogus_lan_address_never_becomes_a_candidate() {
+        for bad in ["255.255.255.255:4383", "224.0.0.1:4383", "192.168.1.5:0"] {
+            let set = gather_peer_candidates(&[PeerEndpoint { public: None, lan: Some(a(bad)) }], None, LanPolicy::AnyUsable);
+            assert!(set.is_empty(), "{bad} must not enter the candidate set");
+        }
+        let set = gather_peer_candidates(&[PeerEndpoint { public: None, lan: Some(a("192.168.1.5:4383")) }], None, LanPolicy::AnyUsable);
+        assert_eq!(set.sorted().len(), 1);
+        assert!(!is_bogus_addr(&a("[fe80::1]:4383")), "link-local is the LAN");
     }
 
     #[test]

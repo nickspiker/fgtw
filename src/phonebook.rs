@@ -662,6 +662,10 @@ pub fn address_set_entries(blob: &[u8]) -> Option<Vec<SetAddr>> {
     }
     let (header, end) = vsf::verification::read_verified(blob, None).ok()?;
     let sections = header.sections(blob, end).ok()?;
+    // WHY/PROOF: peer-written — a set past the cap is not a device's addresses, and every reader would spend a candidate per entry; counted before any entry is read, bogus ones included.
+    if sections.iter().filter(|s| s.name == ADDR_SECTION).count() > ADDRESS_SET_MAX {
+        return None;
+    }
     let mut out = Vec::new();
     for s in sections.iter().filter(|s| s.name == ADDR_SECTION) {
         let ip = match s.get_field("ip").and_then(|f| f.values.first())? {
@@ -673,15 +677,16 @@ pub fn address_set_entries(blob: &[u8]) -> Option<Vec<SetAddr>> {
             VsfType::np(p) => *p,
             _ => return None,
         };
+        let addr = core::net::SocketAddr::new(ip, port);
+        // An address no peer can be reached at (unspecified, multicast, v4 broadcast, port zero) is dropped, never merged: the set is peer-written, and the gate is the one every candidate passes (security audit FGTW-07). Private and link-local stay; they are the LAN.
+        if crate::traverse::gather::is_bogus_addr(&addr) {
+            continue;
+        }
         out.push(SetAddr {
-            addr: core::net::SocketAddr::new(ip, port),
+            addr,
             kind: s.uint("kind").map(AddrKind::from_u64).unwrap_or(AddrKind::Unknown),
             seen: s.eagle("seen").unwrap_or(0),
         });
-    }
-    // WHY/PROOF: peer-written — a set past the cap is not a device's addresses, and every reader would spend a candidate per entry.
-    if out.len() > ADDRESS_SET_MAX {
-        return None;
     }
     out.sort_by(|a, b| b.seen.cmp(&a.seen));
     Some(out)
@@ -1537,6 +1542,18 @@ mod tests {
             SetAddr { addr: SocketAddr::new(v6(4), 4383), kind: AddrKind::Interface, seen: 5 },
             SetAddr { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 51234), kind: AddrKind::Reflexive, seen: 50 },
         ]
+    }
+
+    /// An address no peer can be reached at is dropped from a set on read, and the rest of the set still reads (security audit FGTW-07).
+    #[test]
+    fn a_bogus_set_address_is_dropped_not_merged() {
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let mut entries = sample_set();
+        entries.push(SetAddr { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 4383), kind: AddrKind::Interface, seen: 60 });
+        entries.push(SetAddr { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 0), kind: AddrKind::Reflexive, seen: 70 });
+        let back = address_set_entries(&address_set_blob(&entries, 77)).expect("the set still reads");
+        assert_eq!(back.len(), sample_set().len());
+        assert!(back.iter().all(|e| !crate::traverse::gather::is_bogus_addr(&e.addr)));
     }
 
     /// FOUR v6 ADDRESSES (Nick 2026-11-01: "I could have two ipv6 addy's per device, or four"): a set carries every one, signs, verifies, and reads back freshest first, under its own key.

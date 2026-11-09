@@ -53,6 +53,10 @@ pub fn priority(kind: CandidateKind, addr: &SocketAddr) -> u32 {
     }
 }
 
+/// The most candidates one set holds, so the most one peer can have us probe (security audit FGTW-07).
+/// `1 << 6` = 64: a device publishes at most `phonebook::ADDRESS_SET_MAX` = 32 addresses, and a contact gathered across its devices rarely reaches ten.
+pub const MAX_CANDIDATES: usize = 1 << 6;
+
 /// A peer's gathered candidate addresses, deduplicated and priority-sorted.
 #[derive(Debug, Clone, Default)]
 pub struct CandidateSet {
@@ -65,10 +69,20 @@ impl CandidateSet {
     }
 
     /// Add a candidate, ignoring exact-address duplicates (keeping the higher-priority kind on collision).
+    /// A full set takes a new candidate only in place of a strictly lower-priority one, the latest-added of the lowest kind, so the best addresses stay and the earliest (freshest, as callers add them) of a kind are kept.
     pub fn add(&mut self, c: Candidate) {
         if let Some(existing) = self.candidates.iter_mut().find(|e| e.addr == c.addr) {
             if c.priority > existing.priority {
                 *existing = c;
+            }
+            return;
+        }
+        // WHY/PROOF: candidates are peer-published addresses (phonebook sets, gossip, punch offers) and every one is probed, so without a bound one peer could aim our probes at as many hosts as it cared to list (security audit FGTW-07).
+        if self.candidates.len() == MAX_CANDIDATES {
+            let (at, worst) = self.candidates.iter().enumerate().rev().min_by_key(|(_, e)| e.priority).map(|(at, e)| (at, e.priority)).unwrap();
+            if c.priority > worst {
+                self.candidates.remove(at);
+                self.candidates.push(c);
             }
             return;
         }
@@ -179,6 +193,20 @@ mod tests {
         let p2p = priority(CandidateKind::HostV4P2p, &a("192.168.49.5:4383"));
         assert!(priority(CandidateKind::HostV4Lan, &a("192.168.1.2:4383")) > p2p);
         assert!(p2p > priority(CandidateKind::Reflexive, &a("203.0.113.7:4383")));
+    }
+
+    /// A set holds MAX_CANDIDATES; past that a new candidate displaces only a strictly lower-priority one, so the best stay (security audit FGTW-07).
+    #[test]
+    fn a_full_set_keeps_the_best() {
+        let mut set = CandidateSet::new();
+        for p in 0..(MAX_CANDIDATES as u16 * 2) {
+            set.add(Candidate::new(SocketAddr::new(a("203.0.113.7:1").ip(), 1000 + p), CandidateKind::Reflexive));
+        }
+        assert_eq!(set.sorted().len(), MAX_CANDIDATES, "a flood of one kind stops at the cap");
+        assert_eq!(set.sorted().last().unwrap().addr.port(), 1000 + MAX_CANDIDATES as u16 - 1, "the first added are the ones kept");
+        set.add(Candidate::new(a("[2001:db8::1]:4383"), CandidateKind::HostV6));
+        assert_eq!(set.sorted().len(), MAX_CANDIDATES);
+        assert_eq!(set.best_pair().unwrap().0, a("[2001:db8::1]:4383"), "a better candidate still gets in");
     }
 
     #[test]

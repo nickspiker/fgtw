@@ -256,6 +256,7 @@ impl CandidateOffer {
     }
 
     /// Decode an offer. `None` on any malformed input — a peer that cannot be parsed simply gets no direct path, never a fault.
+    /// An address no peer can be reached at is dropped, and at most [`phonebook::ADDRESS_SET_MAX`](crate::phonebook::ADDRESS_SET_MAX) are kept, the first listed (security audit FGTW-07): both ends probe every address the other offered.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&count, mut rest) = bytes.split_first()?;
         let mut addrs = Vec::with_capacity(count as usize);
@@ -267,7 +268,11 @@ impl CandidateOffer {
                 return None;
             }
             let (body, tail) = tail.split_at(len);
-            addrs.push(crate::traverse::wire::bytes_to_socketaddr(body)?);
+            let addr = crate::traverse::wire::bytes_to_socketaddr(body)?;
+            // WHY/PROOF: the offer is peer-supplied and every address in it is probed; the count byte allows 255 and the address may be one no host answers at (security audit FGTW-07).
+            if !crate::traverse::gather::is_bogus_addr(&addr) && addrs.len() < crate::phonebook::ADDRESS_SET_MAX {
+                addrs.push(addr);
+            }
             rest = tail;
         }
         Some(Self { addrs })
@@ -292,6 +297,18 @@ mod candidate_offer_tests {
             ],
         };
         assert_eq!(CandidateOffer::decode(&offer.encode()), Some(offer));
+    }
+
+    /// A peer's offer is held to the bogus gate and to ADDRESS_SET_MAX addresses, the first listed (security audit FGTW-07).
+    #[test]
+    fn an_offer_drops_bogus_addresses_and_stops_at_the_cap() {
+        let mut addrs = vec![sa("0.0.0.0:0"), sa("224.0.0.1:4383"), sa("10.0.0.2:0")];
+        for p in 0..200u16 {
+            addrs.push(SocketAddr::new(sa("203.0.113.7:1").ip(), 1000 + p));
+        }
+        let back = CandidateOffer::decode(&CandidateOffer { addrs }.encode()).expect("decodes");
+        assert_eq!(back.addrs.len(), crate::phonebook::ADDRESS_SET_MAX);
+        assert_eq!(back.addrs[0], sa("203.0.113.7:1000"));
     }
 
     #[test]
