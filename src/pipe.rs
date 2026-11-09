@@ -68,6 +68,40 @@ pub fn peel_relay_envelope(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
 
 /// `peel_relay_envelope`, also handing back the header's egg list and the file hash they sign, so a receiver that knows the sender's declared bundle can hold the frame to its fleet's floor with `pq::verify_eggs` — vsf checks only the Ed25519 anchor. The sender is not known until the anchor has been checked, which is why the tier check cannot live here.
 pub fn peel_relay_envelope_eggs(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>, Vec<Egg>, [u8; 32])> {
+    peel_relay_section(bytes).map(|(k, p, e, h, _)| (k, p, e, h))
+}
+
+/// [`peel_relay_envelope`], also holding the envelope to its signed address (security audit FGTW-05): `None` unless the signed `recipient` is `our_device_pubkey` and the signed `svc` is exactly `svc` (`None` = an envelope that carries no `svc`, the photon shape).
+/// The plain peel checks who SENT a frame but not whom it was FOR, so a relay or any peer holding a frame signed to one device could hand it to another, or move a rustdesk frame onto a photon pipe; the signature covers the whole file, so checking the two fields closes that.
+/// Replay of a frame to the device it was addressed to is still the caller's to refuse: the header's creation time is signed and readable, but what window a payload tolerates is the payload's business.
+pub fn peel_relay_envelope_for(bytes: &[u8], our_device_pubkey: &[u8; 32], svc: Option<&str>) -> Option<([u8; 32], Vec<u8>)> {
+    peel_relay_envelope_eggs_for(bytes, our_device_pubkey, svc).map(|(k, p, _, _)| (k, p))
+}
+
+/// [`peel_relay_envelope_eggs`] with [`peel_relay_envelope_for`]'s recipient and service check, for a receiver that also holds the frame to its fleet's floor.
+pub fn peel_relay_envelope_eggs_for(bytes: &[u8], our_device_pubkey: &[u8; 32], svc: Option<&str>) -> Option<([u8; 32], Vec<u8>, Vec<Egg>, [u8; 32])> {
+    let (sender_key, payload, eggs, file_hash, section) = peel_relay_section(bytes)?;
+    let recipient = section.get_field("recipient").and_then(|f| f.values.first()).and_then(|v| match v {
+        VsfType::kx(k) => Some(k.as_slice()),
+        _ => None,
+    })?;
+    if recipient != our_device_pubkey.as_slice() {
+        return None;
+    }
+    // A `svc` of any other type is not a service name, and matches no expected one.
+    let signed_svc = match section.get_field("svc").and_then(|f| f.values.first()) {
+        None => None,
+        Some(VsfType::d(s)) => Some(s.as_str()),
+        Some(_) => return None,
+    };
+    if signed_svc != svc {
+        return None;
+    }
+    Some((sender_key, payload, eggs, file_hash))
+}
+
+/// The one peel: the Ed25519 anchor over the whole file, then the `relay` section and its non-empty payload.
+fn peel_relay_section(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>, Vec<Egg>, [u8; 32], vsf::VsfSection)> {
     use vsf::file_format::VsfHeader;
 
     let (sender_key, eggs, file_hash) = vsf::verification::header_eggs(bytes).ok()?;
@@ -83,7 +117,7 @@ pub fn peel_relay_envelope_eggs(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>, Vec<
     if payload.is_empty() {
         return None;
     }
-    Some((sender_key, payload, eggs, file_hash))
+    Some((sender_key, payload, eggs, file_hash, section))
 }
 
 // ── the rustdesk stream frame ──
@@ -172,6 +206,26 @@ mod tests {
         let (from, payload) = peel_relay_envelope(&env).expect("must peel");
         assert_eq!(from, sender.public.to_bytes());
         assert_eq!(payload, b"hello stream");
+    }
+
+    /// The checked peel takes an envelope only at the device and service it was signed to (security audit FGTW-05).
+    #[test]
+    fn the_checked_peel_holds_the_envelope_to_its_signed_address() {
+        let sender = kp(6);
+        let me = kp(7).public.to_bytes();
+        let other = kp(8).public.to_bytes();
+        let rd = build_relay_envelope(&sender, &me, Some(SVC_RUSTDESK), b"for my rustdesk").unwrap();
+        assert_eq!(peel_relay_envelope_for(&rd, &me, Some(SVC_RUSTDESK)), Some((sender.public.to_bytes(), b"for my rustdesk".to_vec())));
+        assert!(peel_relay_envelope_for(&rd, &other, Some(SVC_RUSTDESK)).is_none(), "another device's frame");
+        assert!(peel_relay_envelope_for(&rd, &me, None).is_none(), "a rustdesk frame on the photon pipe");
+        let photon = build_relay_envelope(&sender, &me, None, b"for my photon").unwrap();
+        assert!(peel_relay_envelope_for(&photon, &me, None).is_some());
+        assert!(peel_relay_envelope_for(&photon, &me, Some(SVC_RUSTDESK)).is_none(), "a photon frame on the rustdesk pipe");
+        let (from, payload, eggs, _) = peel_relay_envelope_eggs_for(&photon, &me, None).unwrap();
+        assert_eq!((from, payload.as_slice()), (sender.public.to_bytes(), b"for my photon".as_slice()));
+        assert!(!eggs.is_empty());
+        // The plain peel is unchanged: it still names the sender of any well-signed envelope.
+        assert!(peel_relay_envelope(&rd).is_some());
     }
 
     #[test]
