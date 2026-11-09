@@ -35,6 +35,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use vsf::VsfType;
 use alloc::string::{String, ToString};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// Signature-scheme tag (the egg label). Wire-stable: append, never renumber.
@@ -300,6 +301,11 @@ pub const CONSENT_WINDOW_OSC: i64 = 3600 * vsf::OSCILLATIONS_PER_SECOND as i64;
 /// A sanity bound judged against nothing but the number itself, never a clock, so every device folds a chain to the same verdict; it is not a freshness rule, and adoption is gated by chain extension instead ([`Adoption`]).
 pub const OP_TIME_MAX_OSC: i64 = 1 << 62;
 
+/// The largest chain document a parser reads, in bytes (security audit FGTW-04): `1 << 24` = 16 MiB, past a hundred times the ~140 KB of a real chain, and about 1800 ops even when every op carries all three eggs.
+pub const CHAIN_BYTES_MAX: usize = 1 << 24;
+/// The most ops a parser reads from one chain (security audit FGTW-04): `1 << 12` = 4096, where a real chain holds tens.
+pub const CHAIN_OPS_MAX: usize = 1 << 12;
+
 /// Binding requests older than this are lapsed (worker refuses at put, skips at list; clients skip too). The author refreshes at ~3.5 min while its ceremony screen is up; an abandoned ceremony self-cleans by expiry — the worker NEVER consumes a request (no third-party deletion, per the sovereign-records rule).
 pub const BINDREQ_FRESH_OSC: i64 = 300 * vsf::OSCILLATIONS_PER_SECOND as i64;
 
@@ -462,6 +468,32 @@ fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
     vk.verify_strict(msg, &Signature::from_bytes(&sig_arr)).is_ok()
 }
 
+/// A device's current signing mask in the fold: its first bundle entry's, or Ed25519 alone.
+fn mask_of(bundles: &[([u8; 32], crate::pq::KeyBundle)], bundle_at: &BTreeMap<[u8; 32], usize>, device: &[u8; 32]) -> scheme::Mask {
+    bundle_at.get(device).map(|&at| bundles[at].1.mask()).unwrap_or(scheme::MASK_BASE)
+}
+
+/// Count a live member's missing scheme bits into (`enter`) or out of the fold's `lacking` tally.
+/// Only bits of `MASK_ALL` are counted, the only bits the floor's AND can hold.
+fn tally(lacking: &mut [usize; 16], mask: scheme::Mask, enter: bool) {
+    for (b, n) in lacking.iter_mut().enumerate() {
+        if scheme::MASK_ALL >> b & 1 == 1 && mask >> b & 1 == 0 {
+            if enter {
+                *n += 1;
+            } else {
+                *n -= 1;
+            }
+        }
+    }
+}
+
+/// The devices of a fold index, in the step order they entered it.
+fn in_step_order(index: BTreeMap<[u8; 32], usize>) -> Vec<[u8; 32]> {
+    let mut v: Vec<([u8; 32], usize)> = index.into_iter().collect();
+    v.sort_unstable_by_key(|&(_, at)| at);
+    v.into_iter().map(|(d, _)| d).collect()
+}
+
 /// Everything one chain walk yields — one traversal, every answer, so no two accessors can disagree about the same chain.
 struct FoldState {
     members: Vec<[u8; 32]>,
@@ -583,14 +615,22 @@ impl MembershipBlob {
         if self.ops.is_empty() {
             return Err(FoldError::Empty);
         }
-        let mut members: Vec<[u8; 32]> = Vec::new();
-        // Members the fleet has locked out. Still members — still hosts — but they carry no authority and the floor stops waiting on them.
-        let mut locked: Vec<[u8; 32]> = Vec::new();
+        // Every lookup below is an ordered index, not a scan (security audit FGTW-04): a hostile chain of M members over L ops cost O(L x M x B) when each op scanned the member, locked and bundle lists, and now costs O(L log M).
+        // Current members, each with the step it joined at; the answer lists them in that order, the order a Vec push-and-retain kept.
+        let mut members: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        // Members the fleet has locked out, each with the step it was locked at. Still members — still hosts — but they carry no authority and the floor stops waiting on them.
+        let mut locked: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         // What each member has declared it can sign with — the full public bundle, so later ops by that device can be verified against it. Absent = Ed25519 alone: no special "undeclared" state, because every device genuinely holds an Ed25519 key.
+        // A device's bundle is its FIRST entry here (an Add pushes even for a device that was a member before, and the lookup always found the first); `bundle_at` names that entry.
         let mut bundles: Vec<([u8; 32], crate::pq::KeyBundle)> = Vec::new();
+        let mut bundle_at: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         // Each device's plate as it last declared it (see FleetOp::plate), never dropped: a locked or departed device's plate is exactly the one worth remembering.
         let mut plates: Vec<([u8; 32], [u8; 32])> = Vec::new();
+        let mut plate_at: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         let mut kinds: Vec<([u8; 32], u8)> = Vec::new();
+        let mut kind_at: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        // For each scheme bit, how many live members (members not locked) lack it: the AND of the live members' masks is the bits no one lacks, kept current op by op instead of recomputed over every member.
+        let mut lacking = [0usize; 16];
         // The fleet's capability floor, RATCHETED. It only ever rises, so a device joining with less cannot drag the fleet back to single-egg — that op simply does not fold.
         let mut floor: scheme::Mask = scheme::MASK_BASE;
         let mut expected_prev = [0u8; 32];
@@ -635,15 +675,21 @@ impl MembershipBlob {
                 return Err(FoldError::StrayPlateKind { index: i });
             }
             if let Some(p) = op.plate {
-                match plates.iter_mut().find(|(d, _)| *d == op.device_pubkey) {
-                    Some(slot) => slot.1 = p,
-                    None => plates.push((op.device_pubkey, p)),
+                match plate_at.get(&op.device_pubkey) {
+                    Some(&at) => plates[at].1 = p,
+                    None => {
+                        plate_at.insert(op.device_pubkey, plates.len());
+                        plates.push((op.device_pubkey, p));
+                    }
                 }
             }
             if op.plate_kind != plate::UNSTATED {
-                match kinds.iter_mut().find(|(d, _)| *d == op.device_pubkey) {
-                    Some(slot) => slot.1 = op.plate_kind,
-                    None => kinds.push((op.device_pubkey, op.plate_kind)),
+                match kind_at.get(&op.device_pubkey) {
+                    Some(&at) => kinds[at].1 = op.plate_kind,
+                    None => {
+                        kind_at.insert(op.device_pubkey, kinds.len());
+                        kinds.push((op.device_pubkey, op.plate_kind));
+                    }
                 }
             }
             // A carried bundle must belong to the op's subject: its Ed25519 entry IS the device key the chain names. (Well-formedness — known schemes, right lengths, Ed25519 present — was enforced at parse by `KeyBundle::from_bytes`.)
@@ -653,7 +699,7 @@ impl MembershipBlob {
                 }
             }
             // A locked device signs nothing that folds — not a Declare, not an Add, not its own Unlock. Only the healthy fleet holds the chain. Checked before the floor so the refusal names the real reason: a locked device is usually below the floor too, and "not enough eggs" would hide the lock.
-            if locked.contains(&op.signer_pubkey) {
+            if locked.contains_key(&op.signer_pubkey) {
                 return Err(FoldError::SignerLocked { index: i });
             }
             // THE FLOOR AS THE REQUIRED SET. Before checking any signature, the op must CARRY every scheme the fleet had reached by the previous op. Read off the chain the verifier is already folding, so unlike a version pin in the payload it cannot be stripped — dropping the Falcon egg from a post-promotion op leaves it short, and it does not fold.
@@ -663,10 +709,9 @@ impl MembershipBlob {
             // Which public keys verify this op's eggs: a Declare is verified against the bundle it carries (self-certifying, anchored by the Ed25519 egg under the device key the chain already knows); every other op against what its signer last declared, or Ed25519 alone if nothing.
             let verify_with: crate::pq::KeyBundle = match (op.kind, &op.bundle) {
                 (OpKind::Declare, Some(b)) => b.clone(),
-                _ => bundles
-                    .iter()
-                    .find(|(d, _)| *d == op.signer_pubkey)
-                    .map(|(_, b)| b.clone())
+                _ => bundle_at
+                    .get(&op.signer_pubkey)
+                    .map(|&at| bundles[at].1.clone())
                     .unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&op.signer_pubkey)),
             };
             if !op.verify_sigs(&verify_with) {
@@ -688,14 +733,15 @@ impl MembershipBlob {
                     if !op.identity_sig.is_empty() && !op.verify_identity_binding() {
                         return Err(FoldError::BadIdentityBinding);
                     }
-                    members.push(op.device_pubkey);
+                    members.insert(op.device_pubkey, i);
+                    tally(&mut lacking, mask_of(&bundles, &bundle_at, &op.device_pubkey), true);
                 }
                 OpKind::Declare => {
                     // Self-declaration only: a device may raise what IT can sign with, never what another device claims.
                     if op.signer_pubkey != op.device_pubkey {
                         return Err(FoldError::DeclareNotSelfSigned { index: i });
                     }
-                    if !members.contains(&op.device_pubkey) {
+                    if !members.contains_key(&op.device_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
                     let Some(bundle) = &op.bundle else {
@@ -706,20 +752,25 @@ impl MembershipBlob {
                         return Err(FoldError::DeclareUnproven { index: i });
                     }
                     // Capability is monotonic per device too — a device cannot quietly renounce a scheme it already proved, which would otherwise be the way to drag the floor down without adding anybody.
-                    if let Some(slot) = bundles.iter_mut().find(|(d, _)| *d == op.device_pubkey) {
-                        if !scheme::covers(bundle.mask(), slot.1.mask()) {
+                    // The declarer is live (a member, and the SignerLocked gate above refused it if locked), so its old mask leaves the tally and its new one enters.
+                    let before = mask_of(&bundles, &bundle_at, &op.device_pubkey);
+                    if let Some(&at) = bundle_at.get(&op.device_pubkey) {
+                        if !scheme::covers(bundle.mask(), bundles[at].1.mask()) {
                             return Err(FoldError::CapabilityRegression { index: i });
                         }
-                        slot.1 = bundle.clone();
+                        bundles[at].1 = bundle.clone();
                     } else {
+                        bundle_at.insert(op.device_pubkey, bundles.len());
                         bundles.push((op.device_pubkey, bundle.clone()));
                     }
+                    tally(&mut lacking, before, false);
+                    tally(&mut lacking, bundle.mask(), true);
                 }
                 OpKind::Add => {
-                    if !members.contains(&op.signer_pubkey) {
+                    if !members.contains_key(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
-                    if members.contains(&op.device_pubkey) {
+                    if members.contains_key(&op.device_pubkey) {
                         return Err(FoldError::AddExistingMember { index: i });
                     }
                     // THE RATCHET. A device joining below the fleet's established floor would lower it, so it is refused outright rather than admitted and tolerated. This is what stops a single-egg device silently undoing a completed upgrade.
@@ -736,11 +787,14 @@ impl MembershipBlob {
                     if op.eagle_time.abs_diff(op.consent_t) > CONSENT_WINDOW_OSC as u64 {
                         return Err(FoldError::ConsentStale { index: i });
                     }
-                    members.push(op.device_pubkey);
+                    members.insert(op.device_pubkey, i);
+                    bundle_at.entry(op.device_pubkey).or_insert(bundles.len());
                     bundles.push((op.device_pubkey, joined));
+                    // A device that was not a member is not locked (a lock needs a member, and a departure clears it), so it joins live.
+                    tally(&mut lacking, mask_of(&bundles, &bundle_at, &op.device_pubkey), true);
                 }
                 OpKind::Remove => {
-                    if !members.contains(&op.signer_pubkey) {
+                    if !members.contains_key(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
                     if op.consent.is_empty() {
@@ -753,10 +807,9 @@ impl MembershipBlob {
                         if op.signer_pubkey == op.device_pubkey {
                             return Err(FoldError::RemoveApproverIsLeaver { index: i });
                         }
-                        let leaver = bundles
-                            .iter()
-                            .find(|(d, _)| *d == op.device_pubkey)
-                            .map(|(_, b)| b.clone())
+                        let leaver = bundle_at
+                            .get(&op.device_pubkey)
+                            .map(|&at| bundles[at].1.clone())
                             .unwrap_or_else(|| crate::pq::KeyBundle::ed25519_only(&op.device_pubkey));
                         if !op.verify_depart_consent(&leaver, floor) {
                             return Err(FoldError::BadConsent { index: i });
@@ -765,36 +818,38 @@ impl MembershipBlob {
                             return Err(FoldError::ConsentStale { index: i });
                         }
                     }
-                    let before = members.len();
-                    members.retain(|m| m != &op.device_pubkey);
-                    if members.len() == before {
+                    if members.remove(&op.device_pubkey).is_none() {
                         return Err(FoldError::RemoveNonMember { index: i });
                     }
-                    locked.retain(|m| m != &op.device_pubkey);
+                    // A locked leaver was already out of the tally; a live one leaves it now.
+                    if locked.remove(&op.device_pubkey).is_none() {
+                        tally(&mut lacking, mask_of(&bundles, &bundle_at, &op.device_pubkey), false);
+                    }
                 }
                 OpKind::Lock => {
-                    if !members.contains(&op.signer_pubkey) {
+                    if !members.contains_key(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
                     // The subject is a member, not the signer, not already locked.
-                    if !members.contains(&op.device_pubkey) || op.device_pubkey == op.signer_pubkey || locked.contains(&op.device_pubkey) {
+                    if !members.contains_key(&op.device_pubkey) || op.device_pubkey == op.signer_pubkey || locked.contains_key(&op.device_pubkey) {
                         return Err(FoldError::LockMalformed { index: i });
                     }
-                    locked.push(op.device_pubkey);
+                    locked.insert(op.device_pubkey, i);
+                    tally(&mut lacking, mask_of(&bundles, &bundle_at, &op.device_pubkey), false);
                 }
                 OpKind::Unlock => {
-                    if !members.contains(&op.signer_pubkey) {
+                    if !members.contains_key(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
-                    let before = locked.len();
-                    locked.retain(|m| m != &op.device_pubkey);
-                    if locked.len() == before {
+                    if locked.remove(&op.device_pubkey).is_none() {
                         return Err(FoldError::LockMalformed { index: i });
                     }
+                    // Only a member can be locked and a departure clears the lock, so the unlocked device is a member and comes back into the tally.
+                    tally(&mut lacking, mask_of(&bundles, &bundle_at, &op.device_pubkey), true);
                 }
                 OpKind::Checkpoint => {
                     // Membership is untouched; the op only pins the epoch spine, so the gates are: a current member signed it, the fields are non-void, and k advances by exactly one.
-                    if !members.contains(&op.signer_pubkey) {
+                    if !members.contains_key(&op.signer_pubkey) {
                         return Err(FoldError::SignerNotMember { index: i });
                     }
                     if op.ckpt_k == 0 || op.ckpt_commit == [0u8; 32] || op.device_pubkey != op.signer_pubkey {
@@ -808,15 +863,12 @@ impl MembershipBlob {
             }
             // Recompute the floor from the CURRENT membership after every op, then ratchet: the AND across members is what the whole fleet can do, and `max` with the running value is what stops a departure or a fresh fold from lowering it.
             // Locked-out members are left out of the AND: a device the fleet has written off must not be the one thing holding everyone else at Ed25519. It is not a downgrade route — an unlock puts the device back in the AND, but the ratchet keeps the floor where it was, and the device then has to declare up to it before its next op folds.
-            let live = members
-                .iter()
-                .filter(|m| !locked.contains(m))
-                .map(|m| bundles.iter().find(|(d, _)| d == m).map(|(_, b)| b.mask()).unwrap_or(scheme::MASK_BASE))
-                .fold(scheme::MASK_ALL, |a, b| a & b);
+            // The AND starts from MASK_ALL, so a scheme bit is in it exactly when no live member lacks it; with no live member it is MASK_ALL, as the fold over an empty list was.
+            let live = (0..16).filter(|&b| scheme::MASK_ALL >> b & 1 == 1 && lacking[b] == 0).fold(0, |m, b| m | (1 << b));
             floor |= live;
             expected_prev = op.chain_hash();
         }
-        Ok(FoldState { members, floor, bundles, locked, plates, kinds })
+        Ok(FoldState { members: in_step_order(members), floor, bundles, locked: in_step_order(locked), plates, kinds })
     }
 
     /// The devices the chain has LOCKED OUT: still members, but excluded from the floor and from signing. What a host checks beside the epoch proof, and what a fleet UI shows as "locked".
@@ -1215,6 +1267,10 @@ impl MembershipBlob {
     /// The document must verify (hp + hb | signature) before any op is read; op-level signatures are then validated by [`fold`].
     /// A malformed op aborts the whole parse (the chain is only meaningful intact); returns the blob for [`fold`] to then validate cryptographically.
     pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Self, String> {
+        // WHY/PROOF: a chain arrives from the wire (a peer, the seed, a sponsor), and its hash and op parse ran over whatever length it claimed (security audit FGTW-04).
+        if bytes.len() > CHAIN_BYTES_MAX {
+            return Err(format!("fleet chain: {} bytes is past the {CHAIN_BYTES_MAX} a chain may be", bytes.len()));
+        }
         let (header, header_end) = vsf::verification::read_verified(bytes, None)
             .map_err(|e| format!("fleet chain verification: {e}"))?;
         // primary_section: name resolution + header-only tolerance live in the vsf crate (an empty chain would encode header-only; fold still rejects it as Empty).
@@ -1224,6 +1280,10 @@ impl MembershipBlob {
 
         let mut ops = Vec::new();
         for field in section.get_fields("op") {
+            // WHY/PROOF: wire input; the op count bounds the fold's work, so it is refused before a single op past the cap is parsed (security audit FGTW-04).
+            if ops.len() == CHAIN_OPS_MAX {
+                return Err(format!("fleet chain: more than {CHAIN_OPS_MAX} ops"));
+            }
             ops.push(parse_op(&field.values)?);
         }
         Ok(MembershipBlob { ops })
@@ -1374,6 +1434,10 @@ impl SuccessorRecord {
 
     /// Parse from a complete VSF file. Structural only — [`verify_for_pin`] does the cryptographic checks.
     pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Self, String> {
+        // WHY/PROOF: a successor record is peer-supplied and carries a whole predecessor chain, so it is held to the chain's caps (security audit FGTW-04).
+        if bytes.len() > CHAIN_BYTES_MAX {
+            return Err(format!("succession: {} bytes is past the {CHAIN_BYTES_MAX} a chain may be", bytes.len()));
+        }
         let (header, header_end) = vsf::verification::read_verified(bytes, None)
             .map_err(|e| format!("succession verification: {e}"))?;
         let section = header
@@ -1389,6 +1453,10 @@ impl SuccessorRecord {
         )?;
         let mut predecessor = MembershipBlob::default();
         for field in section.get_fields("op") {
+            // WHY/PROOF: wire input, the same op cap as a chain (security audit FGTW-04).
+            if predecessor.ops.len() == CHAIN_OPS_MAX {
+                return Err(format!("succession: more than {CHAIN_OPS_MAX} predecessor ops"));
+            }
             predecessor.ops.push(parse_op(&field.values)?);
         }
         let mut continuity_eggs = Vec::new();
@@ -2095,6 +2163,93 @@ mod tests {
     }
 
     /// The floor IS the required set: once promoted, an op carrying fewer schemes does not fold, whoever signed it.
+    /// The fold as it was before its lookups were indexed (security audit FGTW-04): Vec scans, and the floor's AND recomputed over every member after every op.
+    /// Kept only here, as the reference the indexed fold must match on every prefix of a chain.
+    fn reference_fold(ops: &[FleetOp]) -> (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<([u8; 32], KeyBundle)>, scheme::Mask) {
+        let mut members: Vec<[u8; 32]> = Vec::new();
+        let mut locked: Vec<[u8; 32]> = Vec::new();
+        let mut bundles: Vec<([u8; 32], KeyBundle)> = Vec::new();
+        let mut floor = scheme::MASK_BASE;
+        for op in ops {
+            let d = op.device_pubkey;
+            match op.kind {
+                OpKind::Genesis => members.push(d),
+                OpKind::Declare => {
+                    let b = op.bundle.clone().unwrap();
+                    match bundles.iter_mut().find(|(x, _)| *x == d) {
+                        Some(slot) => slot.1 = b,
+                        None => bundles.push((d, b)),
+                    }
+                }
+                OpKind::Add => {
+                    members.push(d);
+                    bundles.push((d, op.bundle.clone().unwrap_or_else(|| KeyBundle::ed25519_only(&d))));
+                }
+                OpKind::Remove => {
+                    members.retain(|m| *m != d);
+                    locked.retain(|m| *m != d);
+                }
+                OpKind::Lock => locked.push(d),
+                OpKind::Unlock => locked.retain(|m| *m != d),
+                OpKind::Checkpoint => {}
+            }
+            let live = members
+                .iter()
+                .filter(|m| !locked.contains(m))
+                .map(|m| bundles.iter().find(|(x, _)| x == m).map(|(_, b)| b.mask()).unwrap_or(scheme::MASK_BASE))
+                .fold(scheme::MASK_ALL, |a, b| a & b);
+            floor |= live;
+        }
+        (members, locked, bundles, floor)
+    }
+
+    /// The indexed fold reaches the reference fold's members, lock list, bundles and floor on every prefix of a chain that joins, departs, rejoins, checkpoints, declares, locks, unlocks and locks again (security audit FGTW-04).
+    /// The rejoin of `e` pins the first-bundle-entry rule: its Add pushes a second bundle entry, the fold reads the first, and the Declare after it raises that first one.
+    #[cfg(feature = "client")]
+    #[test]
+    fn indexed_fold_matches_the_reference_on_every_prefix() {
+        use crate::pq::SigningBundle;
+        let a = SigningBundle::derive(b"index-a");
+        let e = SigningBundle::derive(b"index-e");
+        let d = Keypair::from_seed(&[0x44; 32]);
+        let (pa, pe, pd) = (a.keypair().public.to_bytes(), e.keypair().public.to_bytes(), pk(&d));
+        let mut blob = MembershipBlob::genesis_v2(&a, HP, &SEED, 1);
+        blob.add(&a, pd, 2, 2, d.eggs(&bindreq_signing_bytes(&HP, &pd, 2), scheme::MASK_BASE));
+        blob.add(&a, pe, 3, 3, e.keypair().eggs(&bindreq_signing_bytes(&HP, &pe, 3), scheme::MASK_BASE));
+        blob.depart(&e, 4);
+        blob.add_declared(&a, pe, 5, 5, e.eggs(&bindreq_signing_bytes(&HP, &pe, 5), e.public().mask()), e.public());
+        blob.checkpoint(&a, 6, 1, [0x11; 32], 1);
+        blob.declare(&a, 7);
+        blob.declare(&e, 8);
+        blob.lock(&a, pd, 9);
+        blob.unlock(&e, pd, 10);
+        blob.lock(&a, pd, 11);
+        assert_eq!(blob.scheme_floor().unwrap(), scheme::MASK_ALL, "the chain promotes once d is locked");
+        for n in 1..=blob.ops.len() {
+            let prefix = MembershipBlob { ops: blob.ops[..n].to_vec() };
+            let got = prefix.fold_inner().unwrap_or_else(|e| panic!("prefix {n} folds: {e:?}"));
+            let (members, locked, bundles, floor) = reference_fold(&prefix.ops);
+            assert_eq!(got.members, members, "members after {n} ops");
+            assert_eq!(got.locked, locked, "locked after {n} ops");
+            assert_eq!(got.bundles, bundles, "bundles after {n} ops");
+            assert_eq!(got.floor, floor, "floor after {n} ops");
+        }
+        assert_eq!(blob.fold().unwrap(), vec![pa, pd, pe]);
+        assert_eq!(blob.locked_out().unwrap(), vec![pd]);
+    }
+
+    /// A chain past the byte cap is refused before it is hashed, and one op past the op cap before that op is parsed; a chain at the op cap still parses (security audit FGTW-04).
+    #[test]
+    fn chain_parse_is_capped() {
+        assert!(MembershipBlob::from_vsf_bytes(&vec![0u8; CHAIN_BYTES_MAX + 1]).unwrap_err().contains("past the"));
+        let a = key(1);
+        let one = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let at_cap = MembershipBlob { ops: vec![one.ops[0].clone(); CHAIN_OPS_MAX] };
+        assert_eq!(MembershipBlob::from_vsf_bytes(&at_cap.to_vsf_bytes().unwrap()).unwrap().ops.len(), CHAIN_OPS_MAX);
+        let past = MembershipBlob { ops: vec![one.ops[0].clone(); CHAIN_OPS_MAX + 1] };
+        assert!(MembershipBlob::from_vsf_bytes(&past.to_vsf_bytes().unwrap()).unwrap_err().contains("ops"));
+    }
+
     /// A locked-out member is still a member but no longer holds the floor down: with the last undeclared device locked, the fleet promotes; an unlock puts it back in the AND without lowering the ratchet; and a locked device signs nothing that folds — including its own unlock.
     #[cfg(feature = "client")]
     #[test]
