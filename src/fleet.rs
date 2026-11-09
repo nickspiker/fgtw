@@ -32,7 +32,7 @@
 //! - Consent freshness: `|eagle_time − consent_t| ≤` [`CONSENT_WINDOW_OSC`], so a departed device's ancient consent can't be replayed to re-add it.
 //! - Stamp sanity: every op's `eagle_time` is non-negative and below [`OP_TIME_MAX_OSC`], judged against the number alone and never a clock; a consumer adopts a fetched chain by EXTENSION ([`Adoption`]), never by tip time, so no member can throw the tip into the future and have every later honest op read as stale.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use vsf::VsfType;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -451,6 +451,7 @@ impl FleetOp {
 }
 
 /// Pure Ed25519 verify.
+/// `verify_strict` (security audit VSF-14): a small-order key or a non-canonical R is refused, the malleable forms plain `verify` admits; an honest key and signature always pass.
 fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
     let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
         return false;
@@ -458,7 +459,7 @@ fn verify_ed25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
     let Ok(sig_arr): Result<[u8; 64], _> = sig.try_into() else {
         return false;
     };
-    vk.verify(msg, &Signature::from_bytes(&sig_arr)).is_ok()
+    vk.verify_strict(msg, &Signature::from_bytes(&sig_arr)).is_ok()
 }
 
 /// Everything one chain walk yields — one traversal, every answer, so no two accessors can disagree about the same chain.
@@ -1789,6 +1790,18 @@ mod tests {
     /// A leaver's consent over its departure request, Ed25519 alone (the departure tests use bare keypairs).
     fn depart_consent(device: &Keypair, t: i64) -> Vec<Egg> {
         device.eggs(&departreq_signing_bytes(&HP, &device.public.to_bytes(), t), scheme::MASK_BASE)
+    }
+
+    /// The identity point with R = identity, S = 0 satisfies the plain Ed25519 equation for any message; the chain's verifier refuses it (security audit VSF-14), and an honest signature still passes.
+    #[test]
+    fn a_small_order_key_never_verifies() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        assert!(!verify_ed25519(&identity, b"a fleet op", &sig));
+        let a = key(1);
+        assert!(verify_ed25519(&pk(&a), b"a fleet op", &a.sign(b"a fleet op").to_bytes()));
     }
 
     #[test]

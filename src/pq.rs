@@ -138,11 +138,12 @@ impl KeyBundle {
 pub fn verify_egg(scheme_tag: u8, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     match scheme_tag {
         scheme::ED25519 => {
-            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            use ed25519_dalek::{Signature, VerifyingKey};
             let Ok(pk): Result<[u8; 32], _> = pubkey.try_into() else { return false };
             let Ok(vk) = VerifyingKey::from_bytes(&pk) else { return false };
             let Ok(sig_arr): Result<[u8; 64], _> = sig.try_into() else { return false };
-            vk.verify(msg, &Signature::from_bytes(&sig_arr)).is_ok()
+            // verify_strict (security audit VSF-14): it refuses a small-order key and a non-canonical R, the malleable forms plain verify lets thru; an honest key and signature always pass both.
+            vk.verify_strict(msg, &Signature::from_bytes(&sig_arr)).is_ok()
         }
         scheme::FALCON512 => {
             use fn_dsa_vrfy::{VerifyingKey, VerifyingKey512, DOMAIN_NONE, HASH_ID_RAW};
@@ -416,6 +417,23 @@ mod tests {
         let mut bytes = KeyBundle::ed25519_only(&[2u8; 32]).to_bytes();
         bytes.push(0);
         assert!(KeyBundle::from_bytes(&bytes).is_err(), "trailing bytes");
+    }
+
+    /// The identity point as a public key, and R = identity with S = 0, satisfy the plain Ed25519 equation for EVERY message; verify_strict refuses the small-order key (security audit VSF-14).
+    #[test]
+    fn a_small_order_key_signs_nothing() {
+        use ed25519_dalek::Verifier;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(vk.verify(b"any message at all", &ed25519_dalek::Signature::from_bytes(&sig)).is_ok(), "plain verify accepts the forgery, which is the point");
+        assert!(!verify_egg(scheme::ED25519, &identity, b"any message at all", &sig), "the egg verifier refuses it");
+        // An honest signature still passes the strict check.
+        let kp = crate::keys::derive_device_keypair(&[3u8; 16]);
+        let honest = kp.sign(b"m");
+        assert!(verify_egg(scheme::ED25519, &kp.public.to_bytes(), b"m", &honest.to_bytes()));
     }
 
     #[test]
