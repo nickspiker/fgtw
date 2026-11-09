@@ -1398,7 +1398,8 @@ impl SuccessorRecord {
             let device_pubkey = take_ke32(v.first().ok_or("cegg: missing device")?, "cegg device")?;
             // Same fallback as the egg-tail scheme decode: the codec may round-trip a small `u` as a narrower type, so accept `u(_, false)` OR anything `u8::from_vsf_type` can read.
             let scheme = match v.get(1) {
-                Some(VsfType::u(s, false)) => *s as u8,
+                // WHY/PROOF: the scheme comes off the wire as a usize, and `as u8` read 256 as Ed25519 (security audit FGTW-08); out of range is a malformed record.
+                Some(VsfType::u(s, false)) => u8::try_from(*s).map_err(|_| "cegg: bad scheme".to_string())?,
                 Some(other) => {
                     use vsf::schema::FromVsfType;
                     u8::from_vsf_type(other).map_err(|_| "cegg: bad scheme".to_string())?
@@ -1586,7 +1587,8 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     let handle_proof = take_hp32(&values[0], "hp")?;
     let prev_hash = take_hb32(&values[1], "prev")?;
     let kind = match &values[2] {
-        VsfType::u(v, false) => OpKind::from_u8(*v as u8).ok_or_else(|| format!("bad kind {v}"))?,
+        // WHY/PROOF: the kind comes off the wire as a usize, and `as u8` read 259 as Checkpoint (security audit FGTW-08); out of range is no kind at all.
+        VsfType::u(v, false) => u8::try_from(*v).ok().and_then(OpKind::from_u8).ok_or_else(|| format!("bad kind {v}"))?,
         other => {
             use vsf::schema::FromVsfType;
             let v = u8::from_vsf_type(other).map_err(|_| "fleet op: bad kind type".to_string())?;
@@ -1595,7 +1597,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     };
     let device_pubkey = take_ke32(&values[3], "device")?;
     let eagle_time = match &values[4] {
-        VsfType::e(et) => et_to_osc(et),
+        VsfType::e(et) => try_et_to_osc(et).ok_or("fleet op: time out of range")?,
         _ => return Err("fleet op: bad time".into()),
     };
     let signer_pubkey = take_ke32(&values[5], "signer")?;
@@ -1624,7 +1626,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     }
     if kind == OpKind::Add {
         consent_t = match values.get(6) {
-            Some(VsfType::e(et)) => et_to_osc(et),
+            Some(VsfType::e(et)) => try_et_to_osc(et).ok_or("fleet op: consent time out of range")?,
             _ => return Err("fleet op: add missing consent time".into()),
         };
         consent = match values.get(7) {
@@ -1636,7 +1638,7 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     if kind == OpKind::Remove {
         // Consented form carries (e6 consent_t, ge consent_sig) before the egg tail; legacy self-departure goes straight to eggs. Type-discriminated: an `e` at 6 is the consent stamp, a `u` is the first egg's scheme.
         if let Some(VsfType::e(et)) = values.get(6) {
-            consent_t = et_to_osc(et);
+            consent_t = try_et_to_osc(et).ok_or("fleet op: consent time out of range")?;
             consent = match values.get(7) {
                 Some(VsfType::ge(s)) => consent_from_wire(version, s)?,
                 _ => return Err("fleet op: consented remove missing consent sig".into()),
@@ -1663,7 +1665,8 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     let mut plate_kind = plate::UNSTATED;
     if version == OpVersion::V4 && plate_kind_op(kind) {
         plate_kind = match values.get(i) {
-            Some(VsfType::u(k, false)) => *k as u8,
+            // WHY/PROOF: wire usize; `as u8` truncated it (security audit FGTW-08).
+            Some(VsfType::u(k, false)) => u8::try_from(*k).map_err(|_| "fleet op: bad plate kind".to_string())?,
             Some(other) => {
                 use vsf::schema::FromVsfType;
                 u8::from_vsf_type(other).map_err(|_| "fleet op: bad plate kind".to_string())?
@@ -1689,7 +1692,8 @@ fn parse_op(all: &[VsfType]) -> Result<FleetOp, String> {
     // WHY/PROOF: an op from the wire may end on an odd value — the pair read below indexes i + 1.
     while i + 1 < values.len() {
         let scheme = match &values[i] {
-            VsfType::u(v, false) => *v as u8,
+            // WHY/PROOF: wire usize; `as u8` read scheme 256 as Ed25519 (security audit FGTW-08).
+            VsfType::u(v, false) => u8::try_from(*v).map_err(|_| "fleet egg: bad scheme".to_string())?,
             other => {
                 use vsf::schema::FromVsfType;
                 u8::from_vsf_type(other).map_err(|_| "fleet egg: bad scheme".to_string())?
@@ -1754,13 +1758,20 @@ fn take_ke32(v: &VsfType, what: &str) -> Result<[u8; 32], String> {
 }
 
 /// Decode a VSF eagle-time value to oscillations. Public so the FGTW client (pairing/fan-out parse) can reuse the exact same conversion.
+/// An `e7` beyond the i64 range reads as `i64::MIN`, a stamp no clock produced, which the fold's time gate and every freshness window refuse (security audit FGTW-08); a parser that can say "malformed" uses [`try_et_to_osc`] instead.
 pub fn et_to_osc(et: &vsf::types::EtType) -> i64 {
+    try_et_to_osc(et).unwrap_or(i64::MIN)
+}
+
+/// [`et_to_osc`], refusing an `e7` beyond the i64 range rather than truncating it (security audit FGTW-08): `as i64` kept the low 64 bits, so one signed stamp rode the wire in many encodings and a crafted one landed wherever its low half said.
+pub fn try_et_to_osc(et: &vsf::types::EtType) -> Option<i64> {
     use vsf::types::EtType;
     match et {
-        EtType::e5(o) => *o as i64,
-        EtType::e6(o) => *o,
-        EtType::e7(o) => *o as i64,
-        _ => 0, // deprecated float forms; we only ever emit e6
+        EtType::e5(o) => Some(*o as i64),
+        EtType::e6(o) => Some(*o),
+        // WHY/PROOF: an e7 comes off the wire and may hold any i128; only the i64 range is a time any writer of ours stamps.
+        EtType::e7(o) => i64::try_from(*o).ok(),
+        _ => Some(0), // deprecated float forms; we only ever emit e6
     }
 }
 
@@ -1802,6 +1813,31 @@ mod tests {
         assert!(!verify_ed25519(&identity, b"a fleet op", &sig));
         let a = key(1);
         assert!(verify_ed25519(&pk(&a), b"a fleet op", &a.sign(b"a fleet op").to_bytes()));
+    }
+
+    /// A wire value past its type's range is refused at parse, never truncated into a valid one (security audit FGTW-08): kind 256 + Genesis, scheme 256 + Ed25519, and an e7 stamp whose low 64 bits are the honest time.
+    #[test]
+    fn out_of_range_wire_values_do_not_parse() {
+        let a = key(1);
+        let blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let honest = op_field_values(&blob.ops[0]);
+        assert!(parse_op(&honest).is_ok(), "the honest op parses");
+        let base = if matches!(honest[0], VsfType::hP(_)) { 0 } else { 1 };
+        let mut kind = honest.clone();
+        kind[base + 2] = VsfType::u(256 + OpKind::Genesis as usize, false);
+        assert!(parse_op(&kind).is_err(), "kind 256 is not Genesis");
+        let mut egg = honest.clone();
+        let scheme_at = egg.len() - 2;
+        assert_eq!(egg[scheme_at], VsfType::u(scheme::ED25519 as usize, false));
+        egg[scheme_at] = VsfType::u(256 + scheme::ED25519 as usize, false);
+        assert!(parse_op(&egg).is_err(), "scheme 256 is not Ed25519");
+        let mut time = honest.clone();
+        time[base + 4] = VsfType::e(vsf::types::EtType::e7((1i128 << 64) + 100));
+        assert!(parse_op(&time).is_err(), "an e7 past i64 is not its low half");
+        let mut wide = honest.clone();
+        wide[base + 4] = VsfType::e(vsf::types::EtType::e7(100));
+        assert_eq!(parse_op(&wide).unwrap().eagle_time, 100, "an in-range e7 still reads");
+        assert_eq!(et_to_osc(&vsf::types::EtType::e7(1i128 << 64)), i64::MIN);
     }
 
     #[test]

@@ -205,7 +205,9 @@ pub fn fanout_from_bytes(bytes: &[u8]) -> Result<(u64, [u8; 32], [u8; 32], Vec<F
 pub fn fanout_from_bytes_full(bytes: &[u8]) -> Result<Fanout, String> {
     let mut p = 0usize;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
-        if *p + n > bytes.len() {
+        // WHY/PROOF: `n` is a u32 length off the wire, and on the wasm32 worker `*p + n` overflowed usize, which panicked in debug and in release wrapped past the check into a slice panic (security audit FGTW-08).
+        // `*p <= bytes.len()` always holds (it only advances past a check that passed), so the subtraction cannot underflow.
+        if n > bytes.len() - *p {
             return Err("fanout: truncated".into());
         }
         let s = &bytes[*p..*p + n];
@@ -258,6 +260,24 @@ mod tests {
     }
     fn pk(k: &Keypair) -> [u8; 32] {
         k.public.to_bytes()
+    }
+
+    /// A wrap whose ciphertext length is u32::MAX reads as truncated, never as an overflow (security audit FGTW-08).
+    #[test]
+    fn a_huge_wire_length_is_truncation_not_overflow() {
+        let ep = crate::pq::KeyBundle::ed25519_only(&pk(&key(1))).to_bytes();
+        let mut b = Vec::new();
+        b.extend_from_slice(FANOUT_MAGIC);
+        b.push(FANOUT_VERSION);
+        b.extend_from_slice(&7u64.to_be_bytes());
+        b.extend_from_slice(&[0x11; 32]);
+        b.extend_from_slice(&[0x22; 32]);
+        b.extend_from_slice(&(ep.len() as u16).to_be_bytes());
+        b.extend_from_slice(&ep);
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&[0x33; 64]);
+        b.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(fanout_from_bytes_full(&b).err().as_deref(), Some("fanout: truncated"));
     }
 
     #[test]

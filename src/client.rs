@@ -6,7 +6,7 @@
 
 use crate::fanout::{fanout_open, fanout_seal, fanout_to_bytes, new_fleet_key, FanoutWrap};
 use crate::fleet::{
-    et_to_osc, Adoption, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
+    try_et_to_osc, Adoption, BindRequest, MembershipBlob, SuccessorRecord, BINDREQ_FRESH_OSC,
 };
 #[cfg(feature = "std")]
 use crate::fstate::{fstate_from_bytes, fstate_to_bytes, FleetState};
@@ -734,14 +734,20 @@ pub fn bindreq_list<T: FgtwTransport>(
                     Err(_) => malformed = true,
                 },
                 VsfType::hb(p) if p.len() == 32 => plate = Some(p.as_slice().try_into().unwrap()),
-                VsfType::u(k, false) => plate_kind = *k as u8,
+                // WHY/PROOF: a wire usize; `as u8` truncated it (security audit FGTW-08), so out of range is a malformed request.
+                VsfType::u(k, false) => match u8::try_from(*k) {
+                    Ok(k) => plate_kind = k,
+                    Err(_) => malformed = true,
+                },
                 _ => {}
             }
         }
         if malformed {
             continue;
         }
-        let req = BindRequest { device_pubkey, t: et_to_osc(et), device_sig, identity_sig: is.clone(), nfc_hash, bundle, plate, plate_kind };
+        // An e7 stamp beyond the i64 range is malformed, never truncated into a time (security audit FGTW-08).
+        let Some(t) = try_et_to_osc(et) else { continue };
+        let req = BindRequest { device_pubkey, t, device_sig, identity_sig: is.clone(), nfc_hash, bundle, plate, plate_kind };
         if now.abs_diff(req.t) > BINDREQ_FRESH_OSC as u64 {
             continue; // lapsed — expiry is the only deletion pending records get
         }
