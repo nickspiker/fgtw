@@ -274,7 +274,10 @@ mod signing {
     use super::{scheme, Egg, FleetSigner, KeyBundle};
     use crate::keys::Keypair;
     use alloc::vec::Vec;
-    use rand::{rngs::StdRng, SeedableRng};
+    // ChaCha12Rng by name, never `rand::StdRng` (security audit FGTW-09): StdRng is free to change algorithm between rand versions, and every device key and re-signed egg below is a function of this stream.
+    // rand 0.8's StdRng IS this generator, so the switch re-derived nothing; `keygen_kat` holds the answers.
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha12Rng;
 
     /// One device's secret keys across every scheme it can sign with.
     ///
@@ -291,7 +294,7 @@ mod signing {
     impl SigningBundle {
         /// Derive every scheme's keypair from the machine fingerprint, deterministically.
         ///
-        /// The Ed25519 key comes from [`derive_device_keypair`](crate::keys::derive_device_keypair) exactly as today. Each PQ keygen is fed a `StdRng` seeded from `BLAKE3(fingerprint)` under a per-scheme domain, so the same hardware yields the same keys on every run and after a wipe — the property that makes a host stateless for every scheme rather than only the first.
+        /// The Ed25519 key comes from [`derive_device_keypair`](crate::keys::derive_device_keypair) exactly as today. Each PQ keygen is fed a `ChaCha12Rng` seeded from `BLAKE3(fingerprint)` under a per-scheme domain, so the same hardware yields the same keys on every run and after a wipe — the property that makes a host stateless for every scheme rather than only the first.
         pub fn derive(fingerprint: &[u8]) -> Self {
             let ed = crate::keys::derive_device_keypair(fingerprint);
 
@@ -299,7 +302,7 @@ mod signing {
 
             let (falcon_sk, falcon_vk) = {
                 use fn_dsa::{sign_key_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard, FN_DSA_LOGN_512};
-                let mut rng = StdRng::from_seed(seed_for("PHOTON_DEVICE_FALCON512_v1"));
+                let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_FALCON512_v1"));
                 let mut sk = vec![0u8; sign_key_size(FN_DSA_LOGN_512)];
                 let mut vk = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
                 KeyPairGeneratorStandard::default().keygen(FN_DSA_LOGN_512, &mut rng, &mut sk, &mut vk);
@@ -309,7 +312,7 @@ mod signing {
             let (sphincs_pk, sphincs_sk) = {
                 use fips205::slh_dsa_sha2_128s;
                 use fips205::traits::SerDes;
-                let mut rng = StdRng::from_seed(seed_for("PHOTON_DEVICE_SPHINCS_PLUS_v1"));
+                let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_SPHINCS_PLUS_v1"));
                 // Keygen from a caller-seeded CSPRNG is deterministic by construction; the only failure mode is an internal invariant, which is a bug rather than a runtime condition.
                 let (pk, sk) = slh_dsa_sha2_128s::try_keygen_with_rng(&mut rng).expect("slh-dsa keygen from a seeded rng");
                 (pk.into_bytes(), sk.into_bytes())
@@ -353,7 +356,7 @@ mod signing {
                 let mut h = blake3::Hasher::new_derive_key("PHOTON_FALCON512_SIGN_NONCE_v1");
                 h.update(&self.falcon_sk);
                 h.update(msg);
-                let mut rng = StdRng::from_seed(*h.finalize().as_bytes());
+                let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
                 let mut sk = SigningKeyStandard::decode(&self.falcon_sk).expect("stored falcon key decodes");
                 let mut sig = vec![0u8; signature_size(sk.get_logn())];
                 sk.sign(&mut rng, &DOMAIN_NONE, &HASH_ID_RAW, msg, &mut sig);
@@ -369,7 +372,7 @@ mod signing {
                 let mut h = blake3::Hasher::new_derive_key("PHOTON_SPHINCS_PLUS_SIGN_NONCE_v1");
                 h.update(&self.sphincs_sk);
                 h.update(msg);
-                let mut rng = StdRng::from_seed(*h.finalize().as_bytes());
+                let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
                 let sk = PrivateKey::try_from_bytes(&self.sphincs_sk).expect("stored slh-dsa key decodes");
                 let sig = sk.try_sign_with_rng(&mut rng, msg, &[], true).expect("slh-dsa sign");
                 out.push(Egg { scheme: scheme::SPHINCS_PLUS, sig: sig.to_vec() });
@@ -473,6 +476,29 @@ mod tests {
         }
         // Deterministic: re-signing the same message yields byte-identical eggs.
         assert_eq!(a.eggs(msg, scheme::MASK_ALL), eggs);
+    }
+}
+
+/// Known-answer test for the deterministic PQ keygen and signing (security audit FGTW-09).
+/// Every device's Falcon and SLH-DSA keys, and every re-signed egg, are a function of the RNG fed to keygen and sign.
+/// The hashes below were recorded from the `rand::StdRng` build before the switch to `rand_chacha::ChaCha12Rng`; any RNG change that alters them would re-key every device in the field.
+#[cfg(all(test, feature = "sign"))]
+mod keygen_kat {
+    use super::*;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| alloc::format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn derived_keys_and_eggs_match_the_recorded_answers() {
+        let dev = SigningBundle::derive(&[0x5a; 32]);
+        let public = hex(blake3::hash(&dev.public().to_bytes()).as_bytes());
+        let eggs = hex(blake3::hash(&eggs_to_bytes(&dev.eggs(b"FGTW-09 known answer", scheme::MASK_ALL))).as_bytes());
+        let epoch = hex(blake3::hash(&epoch_bundle(&[0xa5; 32]).public().to_bytes()).as_bytes());
+        assert_eq!(public, "aac436f660830fad323dce0c4c1d91c14ecd34ca8ff7209f640b8e5508503b9f");
+        assert_eq!(eggs, "ce0f4d84604358c3da0172351b44c50ae1a1ea770c9e0eff39a258912c678247");
+        assert_eq!(epoch, "c37ad6f7d3860a4afa334fd8f163f0e8751e16171636f2fdf6b24cf37d04e130");
     }
 }
 

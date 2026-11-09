@@ -29,8 +29,8 @@ std = ["vsf/std", "vsf/crypto", "vsf/inspect", "dep:rand", "rand/std", "rand/std
 fanout = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:voca", "dep:num-bigint"]
 # `protocol` is the transport-generic FGTW protocol (fetch, publish, ensure_member, the bind request, the fan-out fetch + verify, fleet-key mint/recover, error frames) WITHOUT std — alloc only, the clock from `set_clock` and the entropy from `set_entropy` — for a bare-metal client that brings its own FgtwTransport and FleetSigner (ferros's Photon, 2026-10-28). The fleet-state codec stays std (`client`).
 protocol = ["fanout", "sign"]
-# `sign` is the deterministic PQ signer (SigningBundle: Falcon-512 + SLH-DSA keys derived from a seed thru a seeded StdRng, no OS RNG) and the fleet epoch bundle — alloc only, so a bare-metal client signs with the same code the host apps do.
-sign = ["dep:fn-dsa", "dep:rand", "rand/std_rng"]
+# `sign` is the deterministic PQ signer (SigningBundle: Falcon-512 + SLH-DSA keys derived from a seed thru a seeded ChaCha12Rng, no OS RNG) and the fleet epoch bundle — alloc only, so a bare-metal client signs with the same code the host apps do.
+sign = ["dep:fn-dsa", "dep:rand", "rand/std_rng", "dep:rand_chacha"]
 # `client` also pulls the PQ SIGNING halves (`fn-dsa` keygen+sign, fips205's RNG). Base carries only the verify-only crates, so the worker can check a three-egg chain without ever holding a signing key or an RNG.
 client = ["std", "protocol", "fips205/default-rng", "vsf/text-encode"]
 
@@ -47,10 +47,13 @@ fips205 = { version = "0.4", default-features = false, features = ["slh_dsa_sha2
 x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
 chacha20poly1305 = { version = "0.11.0-rc.2", default-features = false, features = ["alloc"], optional = true }
 rand = { version = "0.8", default-features = false, optional = true }
+# The deterministic PQ keygen and signing RNG, named by algorithm (security audit FGTW-09): `rand::StdRng` is documented as not reproducible across rand versions, and in rand 0.8 it is exactly this ChaCha12Rng, so naming it pins every derived key without changing one.
+# 0.3 is the line rand 0.8 itself builds StdRng from (one crate copy, one rand_core).
+rand_chacha = { version = "0.3", default-features = false, optional = true }
 # A path dep like vsf: the registry's 0.0.0 is std-only; the sibling checkout is `no_std` + `alloc` (2026-10-26).
 voca = { version = "0.0.1", path = "../voca", default-features = false, optional = true }
 num-bigint = { version = "0.4", default-features = false, optional = true }
-# client-only: the PQ signing halves. Deterministic keygen seeds a `rand::StdRng` from the machine fingerprint, exactly as the Ed25519 device key derives — so PQ keys re-derive on the same hardware too, and the stateless-host story holds for every scheme, not just one.
+# client-only: the PQ signing halves. Deterministic keygen seeds a `rand_chacha::ChaCha12Rng` from the machine fingerprint, exactly as the Ed25519 device key derives — so PQ keys re-derive on the same hardware too, and the stateless-host story holds for every scheme, not just one.
 fn-dsa = { version = "0.4", default-features = false, optional = true }
 
 # The PQ crates are slow unoptimised — SLH-DSA-128s signing takes tens of seconds in a debug build and under a second in release — so tests and dev builds optimise just these. Per-package, so the rest of the tree stays debuggable. Applies only when this crate is the build root; photon and rustdesk carry the same override for their own builds.

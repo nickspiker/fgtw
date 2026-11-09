@@ -400,6 +400,7 @@ dependencies = [
  "fn-dsa-vrfy",
  "num-bigint",
  "rand",
+ "rand_chacha",
  "voca",
  "vsf",
  "x25519-dalek",
