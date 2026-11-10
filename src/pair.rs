@@ -160,7 +160,8 @@ pub fn parse_pair_event(bytes: &[u8]) -> Option<(String, [u8; 32])> {
     }
     let kind = match section.get_field("k").and_then(|f| f.values.first()) {
         // `a` is what the worker sends (its vsf build has no `text` feature, so `x` would panic there); accept `x` too for forward-compat.
-        Some(VsfType::a(s)) | Some(VsfType::x(s)) => s.clone(),
+        Some(VsfType::a(s)) => s.clone().into_string(),
+        Some(VsfType::x(s)) => s.clone(),
         _ => return None,
     };
     let hp = match section.get_field("hp").and_then(|f| f.values.first()) {

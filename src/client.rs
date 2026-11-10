@@ -70,7 +70,8 @@ pub fn error_frame(body: &[u8]) -> Option<(String, String)> {
             .get_field(n)
             .and_then(|f| f.values.first())
             .and_then(|v| match v {
-                VsfType::a(s) | VsfType::x(s) => Some(s.clone()),
+                VsfType::a(s) => Some(s.to_string()),
+                VsfType::x(s) => Some(s.clone()),
                 _ => None,
             })
     };
@@ -1227,8 +1228,8 @@ mod tests {
             .add_section(
                 "error",
                 vec![
-                    ("reason".to_string(), VsfType::a("not_found".to_string())),
-                    ("detail".to_string(), VsfType::a("no fleet".to_string())),
+                    ("reason".to_string(), VsfType::a(vsf::Ascii::lit("not_found"))),
+                    ("detail".to_string(), VsfType::a(vsf::Ascii::lit("no fleet"))),
                 ],
             )
             .build()

@@ -46,7 +46,7 @@ pub fn build_relay_envelope(
         ("payload".to_string(), VsfType::v(b'r', payload.to_vec())),
     ];
     if let Some(svc) = svc {
-        fields.push(("svc".to_string(), VsfType::d(svc.to_string())));
+        fields.push(("svc".to_string(), VsfType::d(vsf::Ascii::new(svc).map_err(|e| format!("relay envelope svc: {e}"))?)));
     }
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(crate::now_oscillations())

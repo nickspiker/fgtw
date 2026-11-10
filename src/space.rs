@@ -466,7 +466,7 @@ mod tests {
     fn document_round_trips() {
         let mut s = Space::new();
         s.put(e(1, 0, -5, 10, A));
-        s.put(Entry { kind: 3, id: vec![VsfType::ke(B.to_vec()), VsfType::u(6, false)], value: vec![VsfType::u(1, false), VsfType::a("a reason".to_string())], updated: 1 << 40, by: B, gone: false });
+        s.put(Entry { kind: 3, id: vec![VsfType::ke(B.to_vec()), VsfType::u(6, false)], value: vec![VsfType::u(1, false), VsfType::a(vsf::Ascii::lit("a reason"))], updated: 1 << 40, by: B, gone: false });
         s.put(Entry { gone: true, value: vec![], ..e(2, 7, 0, 11, B) });
         let doc = s.to_doc(99).unwrap();
         let back = Space::from_doc(&doc).unwrap();

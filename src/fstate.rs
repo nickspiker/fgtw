@@ -111,7 +111,7 @@ fn parse_section(schema: SectionSchema, doc: &[u8]) -> Result<Option<SectionBuil
 
 /// A row datum's label — the TIFF-tag model: every value is preceded by its `d` name, so decode is a label lookup, never a position or an arrival-order count.
 fn label(name: &str) -> VsfType {
-    VsfType::d(name.to_string())
+    VsfType::d(vsf::Ascii::name(name))
 }
 
 /// Walk a row's values as (label, datum) pairs. A trailing label with no datum is dropped; unlabeled values are ignored (forward compatibility: a future writer can add labeled data an old reader skips by name).
@@ -169,7 +169,7 @@ fn get_text(m: &[(&str, &VsfType)], name: &str) -> Option<String> {
 
 fn get_key(m: &[(&str, &VsfType)], name: &str) -> Option<String> {
     match lookup(m, name)? {
-        VsfType::d(s) => Some(s.clone()),
+        VsfType::d(s) => Some(s.to_string()),
         _ => None,
     }
 }
@@ -337,7 +337,7 @@ fn globals_section_bytes(global: &[SettingEntry]) -> Vec<u8> {
                 vec![
                     // The setting key is itself an internal label, so its VALUE is `d` too — labeled like everything else, so decode never leans on adjacency beyond one label-datum pair.
                     label("key"),
-                    VsfType::d(e.key.clone()),
+                    VsfType::d(vsf::Ascii::checked("setting key", e.key.clone())),
                     label("value"),
                     e.value.clone(),
                     label("updated"),
@@ -396,7 +396,7 @@ fn devices_section_bytes(devices: &[DeviceSettings]) -> Vec<u8> {
                         label("map_updated"),
                         VsfType::e(EtType::e6(d.updated)),
                         label("key"),
-                        VsfType::d(e.key.clone()),
+                        VsfType::d(vsf::Ascii::checked("setting key", e.key.clone())),
                         label("value"),
                         e.value.clone(),
                         label("entry_updated"),
@@ -653,7 +653,7 @@ mod tests {
                 "setting",
                 vec![
                     label("key"),
-                    VsfType::d("display.zoom".into()),
+                    VsfType::d(vsf::Ascii::lit("display.zoom")),
                     label("value"),
                     VsfType::v(b'r', 0.75f32.to_le_bytes().to_vec()),
                     label("updated"),
