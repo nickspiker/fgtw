@@ -222,7 +222,7 @@ pub fn plate_locked(h: &impl ChainHold, handle_proof: &[u8; 32], req: &BindReque
     h.held(handle_proof).and_then(|c| c.locked_plates().ok()).unwrap_or_default().contains(&plate)
 }
 
-/// The Add, SEED-OPTIONAL: append the consent-carrying Add for a verified request to the chain held (refreshed from the seed when it answers), hold the result, and publish it to the seed as a mirror. A seed that cannot be reached does not fail the add: the chain reaches the fleet and the newcomer over the peer frames (`fleet_resp`). Returns the extended chain for the caller to hand out. A seed `stale` answer (a sibling extended first) re-fetches and re-applies.
+/// The Add, SEED-OPTIONAL: append the consent-carrying Add for a verified request to the chain held (refreshed from the seed when it answers), publish it to the seed, and hold it. The seed's `device_owned` or `plate_owned` (the device is in another identity's fleet) fails the add and nothing is held; a seed that cannot be reached does not fail the add: the chain reaches the fleet and the newcomer over the peer frames (`fleet_resp`). Returns the extended chain for the caller to hand out. A seed `stale` answer (a sibling extended first) re-fetches and re-applies.
 pub fn bind_device_held<T: FgtwTransport>(t: &T, h: &impl ChainHold, signer: &impl FleetSigner, handle_proof: &[u8; 32], req: &BindRequest) -> Result<MembershipBlob, String> {
     let me = signer.keypair().public.to_bytes();
     for _attempt in 0..4 {
@@ -237,10 +237,19 @@ pub fn bind_device_held<T: FgtwTransport>(t: &T, h: &impl ChainHold, signer: &im
         // The joiner's bundle and plate ride its own signed request onto the Add; the stamp never precedes the tip (security audit FGTW-03).
         let at = client::stamp_after(&blob);
         blob.add_with(signer, req.device_pubkey, at, req.t, req.device_sig.clone(), req.bundle.clone(), req.plate, req.plate_kind);
-        match crate::held::publish(t, h, &blob) {
-            Ok(()) => return Ok(blob),
+        // Posted before it is held: a seed that says the device or its plate belongs to another identity's fleet refuses the add outright, and a held chain cannot be taken back (`prefer` keeps the longer), so nothing is held then. Only a seed that cannot be reached leaves the add to the peer frames.
+        match client::publish(t, &blob) {
+            Ok(()) => {
+                h.hold(&blob);
+                return Ok(blob);
+            }
             Err(e) if e.contains("stale") => continue,
+            Err(e) if e.contains("device_owned") || e.contains("plate_owned") => {
+                crate::log(&format!("FLEET: add refused, the device belongs to another identity's fleet ({})", e));
+                return Err("this device belongs to another identity's fleet".into());
+            }
             Err(e) => {
+                h.hold(&blob);
                 crate::log(&format!("FLEET: add bound and held; the seed mirror failed ({}) — the chain reaches the fleet over the peer frames", e));
                 return Ok(blob);
             }

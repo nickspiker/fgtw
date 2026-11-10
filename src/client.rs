@@ -101,6 +101,28 @@ pub fn fetch<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<
     Ok(Some(MembershipBlob::from_vsf_bytes(&resp.body)?))
 }
 
+/// Whether the seed's registry holds `device_key` for an identity other than `handle_proof` (`device_owner_get`): asked before a device offers to mint or join, so a device another fleet still claims says so at once instead of failing at the genesis (2026-11-09). The answer never says whose.
+pub fn device_owned_elsewhere<T: FgtwTransport>(t: &T, device_key: &[u8; 32], handle_proof: &[u8; 32]) -> Result<bool, String> {
+    let mut section = vsf::VsfSection::new("device_owner_get");
+    section.add_field("dk", VsfType::ke(device_key.to_vec()));
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    let resp = t.post(unsigned_req(section)?)?;
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw device_owner_get {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    let (name, section) = parse_section(&resp.body)?;
+    if name != "device_owner" {
+        return Err(format!("fgtw device_owner_get: answered {name}"));
+    }
+    match section.get_field("owned").and_then(|f| f.values.first()) {
+        Some(VsfType::u(v, false)) => Ok(*v != 0),
+        _ => Err("fgtw device_owner_get: no owned field".into()),
+    }
+}
+
 /// Publish a new (or extended) chain. The worker accepts it only as a forward extension of what it holds; a stale post gets the `stale` reason frame, surfaced as `"fleet: stale"` so the retry loop can match on it.
 pub fn publish<T: FgtwTransport>(t: &T, blob: &MembershipBlob) -> Result<(), String> {
     let resp = t.post(blob.to_vsf_bytes()?)?;
