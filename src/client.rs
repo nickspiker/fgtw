@@ -1068,11 +1068,29 @@ pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     fleet_key: &[u8; 32],
     state: &FleetState,
 ) -> Result<(), String> {
+    push_fstate_cas(t, s, handle_proof, device_key, fleet_key, state, None).map(|_| ())
+}
+
+/// [`push_fstate`] as a compare-and-set (2026-11-10, fgtw.org read only when needed): with `prev` (the BLAKE3 of the slot body this device last saw, from its own write or a [`pull_fstate_seen`]) the slot is replaced only if it still holds that body, else the worker answers `stale` and the caller reads, merges and writes again.
+/// Returns the BLAKE3 of the body now stored: the next write's `prev`.
+#[cfg(feature = "std")]
+pub fn push_fstate_cas<T: FgtwTransport, S: FleetSealer>(
+    t: &T,
+    s: &S,
+    handle_proof: &[u8; 32],
+    device_key: &impl crate::pq::FleetSigner,
+    fleet_key: &[u8; 32],
+    state: &FleetState,
+    prev: Option<[u8; 32]>,
+) -> Result<[u8; 32], String> {
     let sealed = s.seal(&fstate_to_bytes(state), fleet_key)?;
     let mut section = vsf::VsfSection::new("fstate_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     section.add_field("bl", VsfType::ge(sealed));
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(crate::now_oscillations())));
+    if let Some(p) = prev {
+        section.add_field("prev", VsfType::hb(p.to_vec()));
+    }
     let unsigned = vsf::VsfBuilder::new()
         .creation_time_oscillations(crate::now_oscillations())
         .signed_only_eggs(VsfType::ke(device_key.keypair().public.to_bytes().to_vec()), &crate::pq::reserve_eggs(crate::pq::envelope_mask(device_key)))
@@ -1080,6 +1098,7 @@ pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
         .build()
         .map_err(|e| format!("fstate_put build: {e}"))?;
     let signed = crate::pq::sign_envelope(unsigned, device_key).map_err(|e| format!("fstate_put sign: {e}"))?;
+    let stored = *blake3::hash(&signed).as_bytes();
     let resp = t.post(signed)?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
         return Err(format!("fgtw fstate_put {reason}: {detail}"));
@@ -1087,7 +1106,7 @@ pub fn push_fstate<T: FgtwTransport, S: FleetSealer>(
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    Ok(())
+    Ok(stored)
 }
 
 /// Fetch + open the fleet-shared state (None if none published yet; an old roster-only blob reads as settings-empty). The GET is unauthenticated — the payload is ciphertext only fleet members can open — so the pull just needs the fleet key.
@@ -1098,6 +1117,17 @@ pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
     handle_proof: &[u8; 32],
     fleet_key: &[u8; 32],
 ) -> Result<Option<FleetState>, String> {
+    pull_fstate_seen(t, s, handle_proof, fleet_key).map(|o| o.map(|(state, _)| state))
+}
+
+/// [`pull_fstate`] with the BLAKE3 of the slot body it read: the `prev` for a [`push_fstate_cas`] that may replace exactly what was read.
+#[cfg(feature = "std")]
+pub fn pull_fstate_seen<T: FgtwTransport, S: FleetSealer>(
+    t: &T,
+    s: &S,
+    handle_proof: &[u8; 32],
+    fleet_key: &[u8; 32],
+) -> Result<Option<(FleetState, [u8; 32])>, String> {
     let mut section = vsf::VsfSection::new("fstate_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -1116,7 +1146,7 @@ pub fn pull_fstate<T: FgtwTransport, S: FleetSealer>(
         _ => return Ok(None),
     };
     let plaintext = s.open(&sealed, fleet_key)?;
-    Ok(Some(fstate_from_bytes(&plaintext)?))
+    Ok(Some((fstate_from_bytes(&plaintext)?, *blake3::hash(&resp.body).as_bytes())))
 }
 
 #[cfg(test)]
