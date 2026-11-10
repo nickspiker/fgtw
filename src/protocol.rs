@@ -198,16 +198,11 @@ pub struct DepartReq {
     pub consent_sig: Vec<u8>,
     /// `DEPART_NEW_OWNER`, `DEPART_DESK`, or 0 for a pre-intent build (none on the wire).
     pub intent: u8,
-    /// The approval words' commitment (`depart_words_commit`): the leaver's screen shows the words, the approver types them — proof of live contact with the departing device's screen. The words never ride the wire.
-    pub words_commit: Option<[u8; 32]>,
+    /// This request's salt: 32 fresh random bytes the leaving device chooses for each request, inside the envelope its key signs, so the request is named by it (owner, 2026-11-10: "upon deny another request will have to use a new salt"). A denied salt is refused for good; asking again is a new request with a new salt.
+    pub salt: [u8; 32],
 }
 
-/// The approval words' commitment: BLAKE3 of the words, lowercased.
-pub fn depart_words_commit(words: &str) -> [u8; 32] {
-    *blake3::hash(words.to_lowercase().as_bytes()).as_bytes()
-}
-
-/// The `depart_req` frame — the LEAVING device's request to a sibling (bilateral removal, the mirror of the add ceremony): fields t, cs, it, wc, signed by the leaving device. A surviving member's user approves by typing the words, and that device countersigns and publishes the consented Remove.
+/// The `depart_req` frame: the LEAVING device's request to its fleet's devices (bilateral removal, the mirror of the add ceremony): fields t, cs, it, sl, signed by the leaving device. Each fleet device that receives it asks the person, Approve or Deny (no words since 2026-11-10: the request is a member's signature, checked against the chain). Approve countersigns and publishes the consented Remove; Deny sends a `depart_deny`.
 pub fn depart_req(req: &DepartReq, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
     let mut section = VsfSection::new("depart_req");
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(req.t)));
@@ -215,23 +210,47 @@ pub fn depart_req(req: &DepartReq, signer: &(impl FleetSigner + ?Sized), time: i
     if req.intent != 0 {
         section.add_field("it", VsfType::u(req.intent as usize, false));
     }
-    if let Some(wc) = &req.words_commit {
-        section.add_field("wc", VsfType::hp(wc.to_vec()));
-    }
+    section.add_field("sl", VsfType::hb(req.salt.to_vec()));
     signed_frame(section, signer, time)
 }
 
-/// Read a `depart_req`: (the request, the leaving device = the envelope's signer). A missing intent reads 0, a missing commitment None.
+/// Read a `depart_req`: (the request, the leaving device = the envelope's signer). A missing intent reads 0. A request without a salt (a build from before 2026-11-10, which carried approval words) is refused: there is no reader for that form.
 pub fn parse_depart_req(bytes: &[u8]) -> Result<(DepartReq, [u8; 32]), String> {
     let (section, sender) = open_named(bytes, "depart_req")?;
     let t = section.eagle("t").ok_or("depart_req missing t")?;
     let consent_sig = field_ge(&section, "cs").ok_or("depart_req missing cs")?;
     let intent = section.get_field("it").and_then(|f| f.values.first()).and_then(|v| v.as_u64()).and_then(|n| u8::try_from(n).ok()).unwrap_or(0);
-    let words_commit = section.get_field("wc").and_then(|f| f.values.first()).and_then(|v| match v {
-        VsfType::hp(b) if b.len() == 32 => b.as_slice().try_into().ok(),
+    let salt = section.get_field("sl").and_then(|f| f.values.first()).and_then(|v| match v {
+        VsfType::hb(b) if b.len() == 32 => b.as_slice().try_into().ok(),
         _ => None,
-    });
-    Ok((DepartReq { t, consent_sig, intent, words_commit }, sender))
+    }).ok_or("depart_req missing its salt (a build from before 2026-11-10)")?;
+    Ok((DepartReq { t, consent_sig, intent, salt }, sender))
+}
+
+/// The `depart_deny` frame: a fleet device's person said Deny to a departure request (owner, 2026-11-10). Fields hp (the fleet), lv (the leaving device), sl (the request's salt), t (its consent stamp), signed by the device that denied. Every fleet device that hears it clears that request and refuses its salt and its consent stamp from then on; the leaving device hears it, says so, and a new request takes a new salt.
+pub fn depart_deny(handle_proof: &[u8; 32], leaver: &[u8; 32], salt: &[u8; 32], consent_t: i64, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("depart_deny");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("lv", VsfType::ke(leaver.to_vec()));
+    section.add_field("sl", VsfType::hb(salt.to_vec()));
+    section.add_field("t", VsfType::e(vsf::types::EtType::e6(consent_t)));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `depart_deny`: (the fleet, the leaving device, the request's salt, its consent stamp, the device that denied). The caller checks the denier is a current member of that fleet.
+pub fn parse_depart_deny(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32], i64, [u8; 32]), String> {
+    let (section, denier) = open_named(bytes, "depart_deny")?;
+    let hp = field_handle_proof(&section, "hp").ok_or("depart_deny missing hp")?;
+    let b32 = |name: &str| -> Option<[u8; 32]> {
+        section.get_field(name).and_then(|f| f.values.first()).and_then(|v| match v {
+            VsfType::ke(b) | VsfType::hb(b) if b.len() == 32 => b.as_slice().try_into().ok(),
+            _ => None,
+        })
+    };
+    let leaver = b32("lv").ok_or("depart_deny missing lv")?;
+    let salt = b32("sl").ok_or("depart_deny missing sl")?;
+    let t = section.eagle("t").ok_or("depart_deny missing t")?;
+    Ok((hp, leaver, salt, t, denier))
 }
 
 /// The leaver's consent for a departure from fleet `handle_proof` stamped `t`: its eggs over `fleet::departreq_signing_bytes`, one per scheme it holds, as an egg-list blob — the Remove op's `consent_sig`. The fold verifies them against the bundle the chain holds for this device and demands the floor, so a consent is never weaker than the device's declared set.
@@ -240,23 +259,6 @@ pub fn depart_consent(signer: &(impl FleetSigner + ?Sized), handle_proof: &[u8; 
     let msg = crate::fleet::departreq_signing_bytes(handle_proof, &me, t);
     let mask = signer.bundle().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE);
     eggs_to_bytes(&signer.eggs(&msg, mask))
-}
-
-/// The three approval words the leaving device shows, from `nonce` (the caller's randomness: this crate has no RNG on bare metal): the nonce reduced to three voca words' worth, encoded, and left-padded with the capitalised zero word to exactly three.
-pub fn depart_words(nonce: u64) -> String {
-    let base = voca::FULL.alphabet().len() as u64;
-    let mut words = voca::encode(num_bigint::BigUint::from(nonce % base.pow(3)));
-    while crate::pair::pair_word_tokens(&words) < 3 {
-        let w0 = core::str::from_utf8(voca::FULL.alphabet()[0]).expect("voca words are ASCII");
-        let mut z = String::new();
-        let mut cs = w0.chars();
-        if let Some(c) = cs.next() {
-            z.push(c.to_ascii_uppercase());
-            z.extend(cs);
-        }
-        words = alloc::format!("{z}{words}");
-    }
-    words
 }
 
 // ── The membership chain and the fan-out over the mesh ──
@@ -382,17 +384,26 @@ mod tests {
         hand.add_field("t", VsfType::e(vsf::types::EtType::e6(9_999)));
         hand.add_field("cs", VsfType::ge(vec![7u8; 64]));
         hand.add_field("it", VsfType::u(1, false));
-        hand.add_field("wc", VsfType::hp(vec![3u8; 32]));
-        let req = DepartReq { t: 9_999, consent_sig: vec![7u8; 64], intent: 1, words_commit: Some([3u8; 32]) };
+        hand.add_field("sl", VsfType::hb(vec![3u8; 32]));
+        let req = DepartReq { t: 9_999, consent_sig: vec![7u8; 64], intent: 1, salt: [3u8; 32] };
         let kp = Keypair::from_seed(&[0x5Au8; 32]);
         let frame = depart_req(&req, &kp, 42).unwrap();
         let (section, signer) = open_frame(&frame).unwrap();
         assert_eq!(section.encode(), hand.encode(), "the section must be the hand codec's bytes");
         assert_eq!(parse_depart_req(&frame).unwrap(), (req, kp.public.to_bytes()));
-        let legacy = depart_req(&DepartReq { t: 5, consent_sig: vec![1u8; 64], intent: 0, words_commit: None }, &kp, 42).unwrap();
-        let (back, _) = parse_depart_req(&legacy).unwrap();
-        assert_eq!((back.intent, back.words_commit), (0, None));
+        let no_intent = depart_req(&DepartReq { t: 5, consent_sig: vec![1u8; 64], intent: 0, salt: [9u8; 32] }, &kp, 42).unwrap();
+        let (back, _) = parse_depart_req(&no_intent).unwrap();
+        assert_eq!((back.intent, back.salt), (0, [9u8; 32]));
         assert_eq!(signer, kp.public.to_bytes());
+        // A request from before 2026-11-10 (words, no salt) is refused.
+        let mut old = VsfSection::new("depart_req");
+        old.add_field("t", VsfType::e(vsf::types::EtType::e6(5)));
+        old.add_field("cs", VsfType::ge(vec![1u8; 64]));
+        old.add_field("wc", VsfType::hp(vec![3u8; 32]));
+        assert!(parse_depart_req(&signed_frame(old, &kp, 42).unwrap()).is_err());
+        // A deny round-trips, naming the request by its salt and stamp.
+        let deny = depart_deny(&[1u8; 32], &[2u8; 32], &[3u8; 32], 9_999, &kp, 43).unwrap();
+        assert_eq!(parse_depart_deny(&deny).unwrap(), ([1u8; 32], [2u8; 32], [3u8; 32], 9_999, kp.public.to_bytes()));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! 3. **The key** ([`crate::held::fanout_grow_held`]): the fan-out grown to the member set including the newcomer, under the SAME key. A words match grows at once; a nearby pick waits behind the person's confirm that the newcomer left its words screen (two-phase: a wrong pick stays a keyless ledger entry).
 //! 4. **The hand-over** is the caller's: the extended chain (`fleet_resp`) and the grown fan-out (`fanout_resp`) to the siblings and to the newcomer at the address its LAN request came from; the newcomer also finds both on the seed.
 //!
-//! Departure, approver side: a sibling's `depart_req` is checked on receipt ([`depart_receipt_valid`]); the person types the three words the leaver shows ([`depart_words_match`] against the request's commitment), and [`approve_departure`] countersigns and publishes the consented Remove, releasing the device's brand when the leaver asked for a new owner.
+//! Departure, approver side: a sibling's `depart_req` is checked on receipt ([`depart_receipt_valid`]); every fleet device that has it asks the person, Approve or Deny (no words since 2026-11-10), and Approve is [`approve_departure`], which countersigns and publishes the consented Remove, releasing the device's brand when the leaver asked for a new owner.
 //!
 //! Moved from photon src/ui/photon_app/devices.rs and src/network/fgtw/fleet.rs (2026-11-08), behaviour unchanged.
 
@@ -268,10 +268,6 @@ pub fn depart_receipt_valid(handle_proof: &[u8; 32], leaver: &[u8; 32], consent_
         .unwrap_or(false)
 }
 
-/// The approval words typed against the request's commitment: blake3 over the typed words, trimmed and lower-cased (the leaver commits to its words lower-cased, [`crate::protocol::depart_words_commit`]).
-pub fn depart_words_match(typed: &str, commit: &[u8; 32]) -> bool {
-    crate::protocol::depart_words_commit(typed.trim()) == *commit
-}
 
 /// What an approved departure did beyond the Remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,13 +363,10 @@ mod tests {
     }
 
     #[test]
-    fn departure_words_and_receipt() {
+    fn departure_receipt() {
         let hp = [9u8; 32];
         let leaver = Keypair::from_seed(&[3u8; 32]);
-        let words = crate::protocol::depart_words(12345);
-        let commit = crate::protocol::depart_words_commit(&words);
-        assert!(depart_words_match(&format!("  {} ", words.to_lowercase()), &commit));
-        assert!(!depart_words_match("wrong words here", &commit));
+
         let t = 42;
         let consent = crate::protocol::depart_consent(&leaver, &hp, t);
         assert!(depart_receipt_valid(&hp, &leaver.public.to_bytes(), t, &consent));
