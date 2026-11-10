@@ -276,6 +276,26 @@ pub fn parse_fleet_req(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
     Ok((field_handle_proof(&section, "hp").ok_or("fleet_req missing hp")?, sender))
 }
 
+/// The `bind_select` frame (2026-11-10, owner: "if you tap, it shouldn't become part of the fleet, it should just get notified it was selected"): a sponsor tells the joining device `joiner` that the person picked it for fleet `hp`, by the candidate button or an NFC tap.
+/// Nothing is bound by it: the joiner checks the sender folds as a current member of that fleet's chain, lights green ("Selected"), and waits for the new keys, which come only when the person presses Add on the sponsor.
+pub fn bind_select(handle_proof: &[u8; 32], joiner: &[u8; 32], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("bind_select");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("dev", VsfType::ke(joiner.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `bind_select`: (the fleet's handle proof, the selected joiner's device key, the selecting sponsor's device key).
+pub fn parse_bind_select(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "bind_select")?;
+    let hp = field_handle_proof(&section, "hp").ok_or("bind_select missing hp")?;
+    let joiner: [u8; 32] = match section.get_field("dev").and_then(|f| f.values.first()) {
+        Some(VsfType::ke(b)) if b.len() == 32 => b.as_slice().try_into().map_err(|_| "bind_select dev")?,
+        _ => return Err("bind_select missing dev".into()),
+    };
+    Ok((hp, joiner, sender))
+}
+
 /// The `fleet_resp` frame: the membership chain of handle `hp` (`MembershipBlob::to_vsf_bytes`, a complete VSF document in the `ch` field) — the answer to a `fleet_req`, or a sponsor's push after extending the chain. The chain verifies itself; the carrier earns no trust.
 pub fn fleet_resp(handle_proof: &[u8; 32], chain: &[u8], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
     let mut section = VsfSection::new("fleet_resp");
@@ -354,6 +374,15 @@ pub fn parse_space_want(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), 
 mod tests {
     use super::*;
     use crate::fleet::Egg;
+
+    /// A bind_select round-trips the fleet, the selected joiner and the selecting sponsor, and is not read as another frame.
+    #[test]
+    fn bind_select_round_trips() {
+        let sponsor = Keypair::from_seed(&[0x3Eu8; 32]);
+        let frame = bind_select(&[9u8; 32], &[7u8; 32], &sponsor, 77).unwrap();
+        assert_eq!(parse_bind_select(&frame).unwrap(), ([9u8; 32], [7u8; 32], sponsor.public.to_bytes()));
+        assert!(parse_fleet_req(&frame).is_err());
+    }
 
     /// A space_push and a space_want round-trip.
     #[test]
