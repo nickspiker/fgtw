@@ -93,17 +93,17 @@ pub fn release_slots() -> Vec<(u8, usize)> {
 
 /// Is `doc` a VSF document signed by the release key, with every egg present and verifying?
 pub fn verify_release(doc: &[u8]) -> Result<(), String> {
-    verify_signed_by(doc, &RELEASE_ED25519, &release_bundle())
+    verify_signed_by(doc, &RELEASE_ED25519, &release_bundle()).map_err(|e| alloc::format!("release key: {e}"))
 }
 
-/// The rule [`verify_release`] applies, for any pinned bundle: the header's key is `ed`, and every scheme's egg verifies against `bundle`.
-fn verify_signed_by(doc: &[u8], ed: &[u8; 32], bundle: &KeyBundle) -> Result<(), String> {
+/// The rule [`verify_release`] applies, for any pinned key: the header's key is `ed`, and an egg for every scheme verifies against `bundle` — public so an installer checks a developer's kist against that developer's pinned bundle the same way (ferros, 2026-11-10).
+pub fn verify_signed_by(doc: &[u8], ed: &[u8; 32], bundle: &KeyBundle) -> Result<(), String> {
     let (signer, eggs, file_hash) = vsf::verification::header_eggs(doc)?;
     if signer != *ed {
-        return Err("release: not signed by the release key".into());
+        return Err("signed: not signed by the expected key".into());
     }
     if !verify_eggs(&eggs, bundle, &file_hash, RELEASE_MASK) {
-        return Err("release: the release key's eggs do not all verify".into());
+        return Err("signed: the key's eggs do not all verify".into());
     }
     Ok(())
 }
@@ -158,5 +158,18 @@ mod tests {
             .unwrap();
         let ed_only = vsf::verification::sign_file_with(ed_only, |h| key.eggs(h, scheme::MASK_BASE)).unwrap();
         assert!(verify_signed_by(&ed_only, &ed, &key.public()).is_err(), "one egg is not enough");
+    }
+
+    /// A developer's bundle signs and verifies like the release key's, and its post-quantum halves belong to its name: the same seed under another name, or as the release key, is another key.
+    #[test]
+    fn developer_bundles_are_their_own_keys() {
+        let seed = [5u8; 32];
+        let dev = SigningBundle::developer(&seed, "TEST_DEVELOPER");
+        let ed = dev.keypair().public.to_bytes();
+        assert!(verify_signed_by(&signed_doc(&dev), &ed, &dev.public()).is_ok());
+        assert_eq!(SigningBundle::developer(&seed, "TEST_DEVELOPER").public(), dev.public(), "stable");
+        assert_ne!(SigningBundle::developer(&seed, "OTHER_DEVELOPER").public(), dev.public());
+        assert_ne!(SigningBundle::release(&seed).public(), dev.public());
+        assert_eq!(SigningBundle::release(&seed).public().ed25519(), dev.public().ed25519(), "the Ed25519 half is the seed either way");
     }
 }

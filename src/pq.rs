@@ -307,6 +307,14 @@ mod signing {
             Self::with_pq(Keypair::from_seed(seed), |domain: &str| -> [u8; 32] { blake3::derive_key(domain, seed) }, "PHOTON_RELEASE_FALCON512_v1", "PHOTON_RELEASE_SPHINCS_PLUS_v1")
         }
 
+        /// A DEVELOPER key's bundle (2026-11-10, ferros kists): the release key's derivation for any developer seed, under the developer's own domains `{name}_FALCON512_v1` and `{name}_SPHINCS_PLUS_v1`.
+        /// The Ed25519 half is the seed itself; `name` keeps one developer's post-quantum keys apart from every other's and from the release key's (e.g. `FERROS_DEVELOPER_NICK` for the owner's own apps). A name, once used, is never changed: it is part of the key.
+        pub fn developer(seed: &[u8; 32], name: &str) -> Self {
+            let falcon = alloc::format!("{name}_FALCON512_v1");
+            let sphincs = alloc::format!("{name}_SPHINCS_PLUS_v1");
+            Self::with_pq(Keypair::from_seed(seed), |domain: &str| -> [u8; 32] { blake3::derive_key(domain, seed) }, &falcon, &sphincs)
+        }
+
         /// The post-quantum halves beside `ed`, each keygen fed a `ChaCha12Rng` seeded from `seed_for` under its own domain.
         fn with_pq(ed: Keypair, seed_for: impl Fn(&str) -> [u8; 32], falcon_domain: &str, sphincs_domain: &str) -> Self {
             let (falcon_sk, falcon_vk) = {
