@@ -298,12 +298,20 @@ mod signing {
         /// The Ed25519 key comes from [`derive_device_keypair`](crate::keys::derive_device_keypair) exactly as today. Each PQ keygen is fed a `ChaCha12Rng` seeded from `BLAKE3(fingerprint)` under a per-scheme domain, so the same hardware yields the same keys on every run and after a wipe — the property that makes a host stateless for every scheme rather than only the first.
         pub fn derive(fingerprint: &[u8]) -> Self {
             let ed = crate::keys::derive_device_keypair(fingerprint);
+            Self::with_pq(ed, |domain: &str| -> [u8; 32] { blake3::derive_key(domain, fingerprint) }, "PHOTON_DEVICE_FALCON512_v1", "PHOTON_DEVICE_SPHINCS_PLUS_v1")
+        }
 
-            let seed_for = |domain: &str| -> [u8; 32] { blake3::derive_key(domain, fingerprint) };
+        /// The RELEASE key's bundle (2026-11-10): the Ed25519 half is the 32-byte release seed itself, so its public key is the one every Photon already pins (`AUTHOR_PUBKEY`, dff3af0c…), and the Falcon-512 and SPHINCS+ halves are derived from the same seed under release domains of their own.
+        /// One secret holds every scheme, by the device bundle's own derivation, so the release key is as stable as a device's (`keygen_kat`).
+        pub fn release(seed: &[u8; 32]) -> Self {
+            Self::with_pq(Keypair::from_seed(seed), |domain: &str| -> [u8; 32] { blake3::derive_key(domain, seed) }, "PHOTON_RELEASE_FALCON512_v1", "PHOTON_RELEASE_SPHINCS_PLUS_v1")
+        }
 
+        /// The post-quantum halves beside `ed`, each keygen fed a `ChaCha12Rng` seeded from `seed_for` under its own domain.
+        fn with_pq(ed: Keypair, seed_for: impl Fn(&str) -> [u8; 32], falcon_domain: &str, sphincs_domain: &str) -> Self {
             let (falcon_sk, falcon_vk) = {
                 use fn_dsa::{sign_key_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard, FN_DSA_LOGN_512};
-                let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_FALCON512_v1"));
+                let mut rng = ChaCha12Rng::from_seed(seed_for(falcon_domain));
                 let mut sk = vec![0u8; sign_key_size(FN_DSA_LOGN_512)];
                 let mut vk = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
                 KeyPairGeneratorStandard::default().keygen(FN_DSA_LOGN_512, &mut rng, &mut sk, &mut vk);
@@ -313,7 +321,7 @@ mod signing {
             let (sphincs_pk, sphincs_sk) = {
                 use fips205::slh_dsa_sha2_128s;
                 use fips205::traits::SerDes;
-                let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_SPHINCS_PLUS_v1"));
+                let mut rng = ChaCha12Rng::from_seed(seed_for(sphincs_domain));
                 // Keygen from a caller-seeded CSPRNG is deterministic by construction; the only failure mode is an internal invariant, which is a bug rather than a runtime condition.
                 let (pk, sk) = slh_dsa_sha2_128s::try_keygen_with_rng(&mut rng).expect("slh-dsa keygen from a seeded rng");
                 (pk.into_bytes(), sk.into_bytes())
