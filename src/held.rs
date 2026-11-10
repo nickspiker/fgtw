@@ -24,7 +24,11 @@ pub fn fp(k: &[u8; 32]) -> String {
 
 /// Should `new` replace `old` as the held copy of one fleet's chain? Both must have folded already.
 /// An extension wins over its prefix; between forks (two members appended at once with no seed to serialise them) the longer valid chain wins, then the newer tip, then the lower head hash: deterministic, so every holder converges on the same head without a server.
+/// A chain with a DIFFERENT genesis is never preferred: it is a different identity claiming the same slot, not a newer copy of this one, so neither a wiped-and-reclaimed seed slot nor a peer's forgery can displace the chain a device already holds (2026-11-10).
 pub fn prefer(new: &MembershipBlob, old: &MembershipBlob) -> bool {
+    if new.genesis_hash() != old.genesis_hash() {
+        return false;
+    }
     if new.extends(old) {
         return new.ops.len() > old.ops.len();
     }
@@ -50,11 +54,12 @@ impl HeldChains {
     }
 
     /// Keep `blob` as the held copy of its fleet's chain if it is preferred over what is held (or nothing is). Returns whether the held copy changed. The caller has folded it.
+    /// The one way past the genesis pin: a held chain that no longer folds under current rules (a dead-format chain from before a flag day) yields to a chain that does.
     pub fn hold(&mut self, blob: &MembershipBlob) -> bool {
         let Some(hp) = blob.genesis_handle_proof() else { return false };
         match self.0.iter_mut().find(|(h, _)| *h == hp) {
             Some((_, old)) => {
-                if prefer(blob, old) {
+                if prefer(blob, old) || (blob.genesis_hash() != old.genesis_hash() && old.fold().is_err()) {
                     *old = blob.clone();
                     true
                 } else {
@@ -136,6 +141,58 @@ pub fn fetch<T: FgtwTransport>(t: &T, h: &impl ChainHold, handle_proof: &[u8; 32
 pub fn publish<T: FgtwTransport>(t: &T, h: &impl ChainHold, blob: &MembershipBlob) -> Result<(), String> {
     h.hold(blob);
     client::publish(t, blob)
+}
+
+/// [`client::ensure_member_plated`] with the chain this device holds consulted first (2026-11-10): while a chain is held for the slot, the seed's answer never makes this a first claim.
+/// Before this, a seed that had lost the record (a wipe, a nuke) answered "no chain", and the next existing device to check in minted a NEW one-device genesis over its own fleet: the identity forked on fgtw.org while every device and contact still pinned the old one.
+/// Listed by the held chain: a member, whatever the seed says; an empty seed slot gets the held chain published back, and a seed holding a different genesis is reported and left alone (the pin refuses it everywhere it is held).
+/// Held but not listed: only a newer copy of the SAME fleet on the seed (a device bound a moment ago) admits it.
+/// Nothing held, or a held chain that no longer folds under current rules: the seed decides, genesis included, exactly as before.
+pub fn ensure_member_held<T: FgtwTransport>(
+    t: &T,
+    h: &impl ChainHold,
+    device_key: &impl crate::pq::FleetSigner,
+    handle_proof: &[u8; 32],
+    identity_seed: &[u8; 32],
+    plate: Option<[u8; 32]>,
+    plate_kind: u8,
+) -> Result<(), String> {
+    let me = device_key.keypair().public.to_bytes();
+    if let Some(held) = h.held(handle_proof).filter(|c| c.genesis_handle_proof() == Some(*handle_proof)) {
+        match held.fold() {
+            Ok(members) if members.contains(&me) => {
+                match client::fetch(t, handle_proof) {
+                    Ok(None) => {
+                        crate::log(&format!("FLEET: the seed holds no chain for {} — publishing this device's held chain back ({} op(s)), never a new genesis", fp(handle_proof), held.ops.len()));
+                        if let Err(e) = client::publish(t, &held) {
+                            crate::log(&format!("FLEET: republishing the held chain for {} failed: {}", fp(handle_proof), e));
+                        }
+                    }
+                    Ok(Some(seed)) if seed.genesis_hash() != held.genesis_hash() => {
+                        crate::log(&format!("FLEET: SECURITY the seed holds a DIFFERENT genesis for {} than the chain this device holds — not adopting it, not minting", fp(handle_proof)));
+                    }
+                    Ok(Some(seed)) => {
+                        if seed.fold().is_ok() {
+                            h.hold(&seed);
+                        }
+                    }
+                    Err(_) => {}
+                }
+                return Ok(());
+            }
+            Ok(_) => {
+                return match client::fetch(t, handle_proof)? {
+                    Some(seed) if seed.genesis_hash() == held.genesis_hash() && seed.fold().is_ok_and(|m| m.contains(&me)) => {
+                        h.hold(&seed);
+                        Ok(())
+                    }
+                    _ => Err("this device is not in the fleet — enroll it from an existing device first".into()),
+                };
+            }
+            Err(_) => {}
+        }
+    }
+    client::ensure_member_plated(t, device_key, handle_proof, identity_seed, plate, plate_kind)
 }
 
 /// Whether `me` folds as a current member of the chain held for `handle_proof`.
@@ -250,4 +307,74 @@ pub fn fanout_open_blob(fh: &impl FanoutHold, handle_proof: &[u8; 32], blob: &[u
     }
     fh.hold_fanout(handle_proof, f.revision, blob);
     Ok(Some((f.revision, k)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HP: [u8; 32] = [0x11; 32];
+    const SEED: [u8; 32] = [0x22; 32];
+
+    /// A second genesis for the same slot, newer and so the old tie-break's winner, never replaces the chain held: the held genesis is the pin.
+    #[test]
+    fn a_different_genesis_never_displaces_the_held_chain() {
+        let ours = MembershipBlob::genesis(&Keypair::from_seed(&[1; 32]), HP, &SEED, 100);
+        let theirs = MembershipBlob::genesis(&Keypair::from_seed(&[2; 32]), HP, &SEED, 200);
+        assert!(ours.fold().is_ok() && theirs.fold().is_ok());
+        let mut held = HeldChains::new();
+        assert!(held.hold(&ours));
+        assert!(!prefer(&theirs, &ours));
+        assert!(!held.hold(&theirs));
+        assert_eq!(held.get(&HP).and_then(|b| b.genesis_hash()), ours.genesis_hash());
+    }
+
+    /// A seed that lost the chain gets the held chain back from a member, never a new one-device genesis (the fork a wiped seed caused, 2026-11-10).
+    #[test]
+    fn an_empty_seed_gets_the_held_chain_back_never_a_new_genesis() {
+        struct LostSeed(core::cell::RefCell<Vec<Vec<u8>>>);
+        impl FgtwTransport for LostSeed {
+            fn post(&self, body: Vec<u8>) -> Result<client::FgtwResponse, String> {
+                if MembershipBlob::from_vsf_bytes(&body).is_ok_and(|b| !b.ops.is_empty()) {
+                    self.0.borrow_mut().push(body);
+                }
+                let not_found = vsf::VsfBuilder::new()
+                    .creation_time_oscillations(1)
+                    .add_section("error", alloc::vec![("reason".into(), vsf::VsfType::a(vsf::types::Ascii::lit("not_found")))])
+                    .build()?;
+                Ok(client::FgtwResponse { status: 200, body: not_found })
+            }
+        }
+        let me = Keypair::from_seed(&[1; 32]);
+        let ours = MembershipBlob::genesis(&me, HP, &SEED, 100);
+        let held = core::cell::RefCell::new(HeldChains::new());
+        assert!(ChainHold::hold(&held, &ours));
+        let seed = LostSeed(core::cell::RefCell::new(Vec::new()));
+        ensure_member_held(&seed, &held, &me, &HP, &SEED, None, 0).unwrap();
+        let posted = seed.0.borrow();
+        assert_eq!(posted.len(), 1, "exactly one publish: the held chain going back");
+        let back = MembershipBlob::from_vsf_bytes(&posted[0]).unwrap();
+        assert_eq!(back.genesis_hash(), ours.genesis_hash(), "the published chain is the held one, not a new genesis");
+    }
+
+    /// A device the held chain does not list is not a member because the seed is empty: no genesis is minted over a held chain.
+    #[test]
+    fn not_listed_by_the_held_chain_and_an_empty_seed_is_refused() {
+        struct EmptySeed;
+        impl FgtwTransport for EmptySeed {
+            fn post(&self, body: Vec<u8>) -> Result<client::FgtwResponse, String> {
+                assert!(!MembershipBlob::from_vsf_bytes(&body).is_ok_and(|b| !b.ops.is_empty()), "nothing may be published");
+                let not_found = vsf::VsfBuilder::new()
+                    .creation_time_oscillations(1)
+                    .add_section("error", alloc::vec![("reason".into(), vsf::VsfType::a(vsf::types::Ascii::lit("not_found")))])
+                    .build()?;
+                Ok(client::FgtwResponse { status: 200, body: not_found })
+            }
+        }
+        let owner = Keypair::from_seed(&[1; 32]);
+        let stranger = Keypair::from_seed(&[3; 32]);
+        let held = core::cell::RefCell::new(HeldChains::new());
+        assert!(ChainHold::hold(&held, &MembershipBlob::genesis(&owner, HP, &SEED, 100)));
+        assert!(ensure_member_held(&EmptySeed, &held, &stranger, &HP, &SEED, None, 0).is_err());
+    }
 }
