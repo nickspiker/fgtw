@@ -118,8 +118,9 @@ pub fn device_owned_elsewhere<T: FgtwTransport>(t: &T, device_key: &[u8; 32], ha
         return Err(format!("fgtw device_owner_get: answered {name}"));
     }
     match section.get_field("owned").and_then(|f| f.values.first()) {
-        Some(VsfType::u(v, false)) => Ok(*v != 0),
-        _ => Err("fgtw device_owner_get: no owned field".into()),
+        // Any unsigned width: vsf writes a `u` in the smallest that holds it (`owned` 0 or 1 arrives as `u3`).
+        Some(v) => v.as_usize().map(|n| n != 0).ok_or_else(|| "fgtw device_owner_get: owned is not unsigned".into()),
+        None => Err("fgtw device_owner_get: no owned field".into()),
     }
 }
 
@@ -135,7 +136,12 @@ pub fn publish<T: FgtwTransport>(t: &T, blob: &MembershipBlob) -> Result<(), Str
     if !(200..300).contains(&resp.status) {
         return Err(format!("FGTW transport {}", resp.status));
     }
-    Ok(())
+    // Taken only on the worker's `fleet_ack`: an answer that is neither an ack nor a readable error is no acceptance (2026-11-09: a device_owned refusal the client could not read passed here as a published genesis).
+    match parse_section(&resp.body) {
+        Ok((name, _)) if name == "fleet_ack" => Ok(()),
+        Ok((name, _)) => Err(format!("fgtw fleet_put: answered {name}, not fleet_ack")),
+        Err(e) => Err(format!("fgtw fleet_put: unreadable answer ({e})")),
+    }
 }
 
 /// Fetch the succession record for a handle (docs/identity-succession.md), or `None` if none is published. Read-only; a contact then runs `SuccessorRecord::verify_for_pin` against its own pin — the worker does NOT verify continuity, only slot storage.
@@ -218,6 +224,10 @@ pub fn ensure_member_plated<T: FgtwTransport>(
         MembershipBlob::genesis_v2_plated(device_key, *handle_proof, identity_seed, crate::now_oscillations(), plate, plate_kind);
     // A rejected publish is NOT fatal by itself (a racing sibling may have won the slot), but it must not vanish either — the refetch below adjudicates, and the publish error rides along if that also comes up empty.
     let publish_err = publish(t, &blob).err();
+    crate::log(&match &publish_err {
+        None => "FLEET: genesis published, the seed took it".to_string(),
+        Some(e) => format!("FLEET: genesis publish answered: {e}"),
+    });
     // Trust the network, not ourselves: re-fetch the canonical chain and accept ONLY if it names this device. The fleet slot has no compare-and-set, so two devices racing a fresh handle's genesis both "publish" but the slot settles on ONE — the loser re-reads here, finds it isn't a member, and fails cleanly instead of announcing as a phantom founder.
     match fetch(t, handle_proof)? {
         Some(b) => {
