@@ -154,6 +154,10 @@ pub mod scoped_blob;
 /// The person's identity space: their facts across their fleet (kists, answers, the home screen's arrangement), merged by a total order, sealed under the fleet key, reconciled with a device's own copy. no_std; the seal behind `fanout`.
 pub mod space;
 
+/// The words every TOKEN app shows for the fleet and the identity, written once in all sixteen languages, and the one language list (`text::Lang`). no_std, no alloc.
+#[cfg(feature = "text")]
+pub mod text;
+
 /// Fleet-shared encrypted state — the codec for the slot each app writes its shared state into (photon: the contact roster; calendar: events).
 /// Data model + serialize + CRDT merge; the seal-and-push transport is the client's.
 #[cfg(all(feature = "fanout", feature = "std"))]
