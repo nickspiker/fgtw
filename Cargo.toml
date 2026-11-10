@@ -33,6 +33,8 @@ protocol = ["fanout", "sign"]
 sign = ["dep:fn-dsa", "dep:rand", "rand/std_rng", "dep:rand_chacha"]
 # `client` also pulls the PQ SIGNING halves (`fn-dsa` keygen+sign, fips205's RNG). Base carries only the verify-only crates, so the worker can check a three-egg chain without ever holding a signing key or an RNG.
 client = ["std", "protocol", "fips205/default-rng", "vsf/text-encode"]
+# `text` is the fleet and identity words in all sixteen languages and the one language list (src/text.rs), shared by Photon and ferros. No deps of its own.
+text = []
 
 [dependencies]
 # vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.
