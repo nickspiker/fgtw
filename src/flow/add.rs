@@ -617,14 +617,14 @@ impl Add {
     }
 
     /// Read a document [`Add::to_vsf`] wrote. Tell the members, then call [`Add::resume`].
-    pub fn from_vsf(bytes: &[u8], hp: Key, seed: [u8; 32], reports_sent: bool) -> Result<Self, String> {
+    pub fn from_vsf(bytes: &[u8], hp: Key, seed: [u8; 32], me: Key, reports_sent: bool) -> Result<Self, String> {
         let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("add state: {e}"))?;
         let sec = header.primary_section(bytes, end).map_err(|e| alloc::format!("add state: {e}"))?;
-        Self::from_section(&sec, hp, seed, reports_sent)
+        Self::from_section(&sec, hp, seed, me, reports_sent)
     }
 
-    /// Read the state back from its section.
-    pub fn from_section(sec: &VsfSection, hp: Key, seed: [u8; 32], reports_sent: bool) -> Result<Self, String> {
+    /// Read the state back from its section. `me` is this device's key as the app holds it now: state saved under another key (a vault carried to a new device key) belongs to that device, and the machine starts fresh.
+    pub fn from_section(sec: &VsfSection, hp: Key, seed: [u8; 32], me: Key, reports_sent: bool) -> Result<Self, String> {
         if sec.name != "add" {
             return Err("not an add section".to_string());
         }
@@ -634,8 +634,11 @@ impl Add {
                 _ => None,
             })
         };
-        let me = key("me").ok_or("add state missing me")?;
+        let saved_me = key("me").ok_or("add state missing me")?;
         let mut m = Add::new(hp, seed, me, reports_sent);
+        if saved_me != me {
+            return Ok(m);
+        }
         if let Some(device) = key("adding") {
             let grown = sec.get_field("adding_step").and_then(|f| f.values.first()).and_then(|v| v.as_u64()) == Some(1);
             m.adding = Some(Adding { device, req: None, step: if grown { Step2::Growing } else { Step2::Binding } });

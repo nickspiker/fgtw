@@ -462,14 +462,15 @@ impl Depart {
     }
 
     /// Read a document [`Depart::to_vsf`] wrote: verified, then the section read back.
-    pub fn from_vsf(bytes: &[u8], hp: Key, reports_sent: bool) -> Result<Self, String> {
+    pub fn from_vsf(bytes: &[u8], hp: Key, me: Key, reports_sent: bool) -> Result<Self, String> {
         let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("depart state: {e}"))?;
         let sec = header.primary_section(bytes, end).map_err(|e| alloc::format!("depart state: {e}"))?;
-        Self::from_section(&sec, hp, reports_sent)
+        Self::from_section(&sec, hp, me, reports_sent)
     }
 
     /// Read the state back. Members are not kept: tell them, then call [`Depart::resume`].
-    pub fn from_section(sec: &VsfSection, hp: Key, reports_sent: bool) -> Result<Self, String> {
+    /// `me` is this device's key as the app holds it now: state saved under another key (a vault carried to a new device key) belongs to that device, and the machine starts fresh.
+    pub fn from_section(sec: &VsfSection, hp: Key, me: Key, reports_sent: bool) -> Result<Self, String> {
         if sec.name != "depart" {
             return Err("not a depart section".to_string());
         }
@@ -481,8 +482,11 @@ impl Depart {
             })
         };
         let small = |name: &str| first(name).and_then(|v| v.as_u64()).and_then(|n| u8::try_from(n).ok());
-        let me = key("me").ok_or("depart state missing me")?;
+        let saved_me = key("me").ok_or("depart state missing me")?;
         let mut m = Depart::new(hp, me, reports_sent);
+        if saved_me != me {
+            return Ok(m);
+        }
         if let (Some(t), Some(salt), Some(intent)) = (sec.eagle("own_t"), key("own_salt"), small("own_intent")) {
             let deliver = first("own_frame").and_then(|v| match v {
                 VsfType::v(b'r', b) => Some(Deliver::new(b.clone(), &[], reports_sent, &mut Vec::new())),

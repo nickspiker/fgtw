@@ -213,7 +213,7 @@ fn a_grow_cut_short_by_a_restart_is_asked_for_again() {
     rig.step(Event::Bound { device: dev, result: Ok(()) });
     let doc = rig.m.to_vsf(NOW).unwrap();
     assert!(!doc.windows(32).any(|w| w == HP || w == SEED), "no root in the saved state");
-    rig.m = Add::from_vsf(&doc, HP, SEED, true).unwrap();
+    rig.m = Add::from_vsf(&doc, HP, SEED, rig.me.public.to_bytes(), true).unwrap();
     rig.members.push(dev);
     rig.tell_members();
     let s = rig.m.resume();
@@ -230,7 +230,7 @@ fn a_bind_cut_short_by_a_restart_is_reported_to_do_again() {
     rig.step(Event::User(UserOp::Touch { device: dev }));
     rig.step(Event::User(UserOp::Yes));
     let doc = rig.m.to_vsf(NOW).unwrap();
-    rig.m = Add::from_vsf(&doc, HP, SEED, true).unwrap();
+    rig.m = Add::from_vsf(&doc, HP, SEED, rig.me.public.to_bytes(), true).unwrap();
     rig.tell_members();
     let s = rig.m.resume();
     assert!(s.actions.iter().any(|x| matches!(x, Action::Note(Note::AddFailed { device, .. }) if *device == dev)));
@@ -276,7 +276,7 @@ fn a_resume_before_the_fold_waits_for_the_members() {
     rig.step(Event::User(UserOp::Yes));
     rig.step(Event::Bound { device: dev, result: Ok(()) });
     let doc = rig.m.to_vsf(NOW).unwrap();
-    rig.m = Add::from_vsf(&doc, HP, SEED, true).unwrap();
+    rig.m = Add::from_vsf(&doc, HP, SEED, rig.me.public.to_bytes(), true).unwrap();
     assert!(rig.m.resume().actions.is_empty(), "no grow to the newcomer alone");
     rig.members.push(dev);
     let (m, l) = (rig.members.clone(), rig.locked.clone());
@@ -355,4 +355,23 @@ fn the_view_names_the_device_being_added() {
     let v = rig.m.view();
     assert_eq!(v.phase, Phase::Binding);
     assert_eq!(v.adding, Some((dev, crate::pair::device_name_default(&dev, &SEED))));
+}
+
+#[test]
+fn state_saved_under_another_device_key_starts_fresh() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let dev = j.public.to_bytes();
+    rig.hear(&j, &request(&j, &[0; 32]));
+    rig.step(Event::User(UserOp::Touch { device: dev }));
+    rig.step(Event::User(UserOp::Yes));
+    let doc = rig.m.to_vsf(NOW).unwrap();
+    // The vault carried to a new device key (Android root conversion): the add under way was the old key's.
+    let new_me = Keypair::from_seed(&[2; 32]).public.to_bytes();
+    let mut back = Add::from_vsf(&doc, HP, SEED, new_me, true).unwrap();
+    let members = [new_me];
+    back.step(Event::Members { members: &members, locked: &[] }, NOW);
+    assert!(back.resume().actions.is_empty());
+    assert_eq!(back.view().adding, None);
 }

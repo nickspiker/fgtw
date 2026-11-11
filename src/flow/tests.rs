@@ -280,7 +280,7 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     net.down.push(far);
     net.user(0, LEAVE);
     let doc = net.devs[0].m.to_vsf(net.now).unwrap();
-    let back = Depart::from_vsf(&doc, HP, true).unwrap();
+    let back = Depart::from_vsf(&doc, HP, net.key(0), true).unwrap();
     net.devs[0].m = back;
     net.down.clear();
     net.queue.push((0, Q::Members));
@@ -291,7 +291,7 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     assert_eq!(net.devs[2].m.asked(), Some((leaver, 1, SALT)), "the restarted leaver hands its saved request to the member that missed it");
     // The approver side survives too.
     let sec = net.devs[2].m.to_section();
-    let mut back = Depart::from_section(&sec, HP, true).unwrap();
+    let mut back = Depart::from_section(&sec, HP, net.key(2), true).unwrap();
     assert_eq!(back.asked(), Some((leaver, 1, SALT)));
     let s = back.resume();
     assert_eq!(s.actions, vec![Action::Note(Note::DepartAsked { leaver })]);
