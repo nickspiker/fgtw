@@ -85,6 +85,8 @@ pub struct Add {
     known: bool,
     key_held: bool,
     locked_plates: Vec<[u8; 32]>,
+    /// The Fleet page is showing (the flow may still be shut by the fleet-key gate).
+    shown: bool,
     open: bool,
     lan: Vec<BindRequest>,
     registry: Vec<BindRequest>,
@@ -118,6 +120,7 @@ impl Add {
             known: false,
             key_held: false,
             locked_plates: Vec::new(),
+            shown: false,
             open: false,
             lan: Vec::new(),
             registry: Vec::new(),
@@ -199,7 +202,13 @@ impl Add {
                 self.known = true;
                 self.rebuild(now);
             }
-            Event::FleetKey { held } => self.key_held = held,
+            Event::FleetKey { held } => {
+                self.key_held = held;
+                // A key that arrives while the page shows (a fan-out after this device's own join) opens the flow at once, no close and reopen.
+                if self.shown && !self.open && self.can_add() {
+                    self.page(true, now, &mut s);
+                }
+            }
             Event::LockedPlates { plates } => self.locked_plates = plates.to_vec(),
             Event::Page { shown } => self.page(shown, now, &mut s),
             Event::Frame { bytes, from } => self.on_frame(bytes, from, now, &mut s),
@@ -275,6 +284,7 @@ impl Add {
     }
 
     fn page(&mut self, shown: bool, now: i64, s: &mut Step) {
+        self.shown = shown;
         if shown {
             if !self.can_add() {
                 // The fleet-key gate (owner rule): the flow does not open and nothing is written.

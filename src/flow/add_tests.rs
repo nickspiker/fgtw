@@ -245,3 +245,22 @@ fn the_screen_asks_to_be_woken_when_a_nearby_device_lapses() {
     let s = rig.m.step(Event::Frame { bytes: &frame, from: None }, NOW);
     assert_eq!(s.wake, Some((NOW + super::add::NEARBY_OSC, Wake::Lapse)));
 }
+
+#[test]
+fn a_key_that_arrives_while_the_page_shows_opens_the_flow() {
+    let mut rig = Rig::new(1);
+    rig.step(Event::FleetKey { held: false });
+    assert!(has_note(&rig.open(), Note::AddNoFleetKey));
+    let a = rig.step(Event::FleetKey { held: true });
+    assert!(a.contains(&Action::Radios { ble_scan: true, nfc_reader: true }));
+    assert_eq!(rig.m.view().phase, Phase::Open);
+}
+
+#[test]
+fn a_closed_page_never_asks_to_be_woken() {
+    let mut rig = Rig::new(1);
+    let j = joiner(0);
+    let frame = crate::protocol::bind_req(&request(&j, &[0; 32]), &HP, &j, NOW).unwrap();
+    let s = rig.m.step(Event::Frame { bytes: &frame, from: None }, NOW);
+    assert_eq!(s.wake, None, "requests held while the page is closed lapse lazily");
+}
