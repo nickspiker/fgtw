@@ -426,6 +426,22 @@ impl Depart {
         sec
     }
 
+    /// The state as a complete VSF document stamped `time`, the form an app keeps in its vault.
+    pub fn to_vsf(&self, time: i64) -> Result<Vec<u8>, String> {
+        vsf::VsfBuilder::new()
+            .creation_time_oscillations(time)
+            .add_section_direct(self.to_section())
+            .build()
+            .map_err(|e| alloc::format!("depart state: {e}"))
+    }
+
+    /// Read a document [`Depart::to_vsf`] wrote: verified, then the section read back.
+    pub fn from_vsf(bytes: &[u8]) -> Result<Self, String> {
+        let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("depart state: {e}"))?;
+        let sec = header.primary_section(bytes, end).map_err(|e| alloc::format!("depart state: {e}"))?;
+        Self::from_section(&sec)
+    }
+
     /// Read the state back. Members are not kept: tell them, then call [`Depart::resume`].
     pub fn from_section(sec: &VsfSection) -> Result<Self, String> {
         if sec.name != "depart" {

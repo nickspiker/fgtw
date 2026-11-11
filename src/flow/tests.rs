@@ -271,8 +271,8 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     let (leaver, far) = (net.key(0), net.key(2));
     net.down.push(far);
     net.user(0, LEAVE);
-    let sec = net.devs[0].m.to_section();
-    let back = Depart::from_section(&sec).unwrap();
+    let doc = net.devs[0].m.to_vsf(net.now).unwrap();
+    let back = Depart::from_vsf(&doc).unwrap();
     net.devs[0].m = back;
     net.down.clear();
     net.queue.push((0, Q::Members));
