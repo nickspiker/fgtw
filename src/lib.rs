@@ -106,6 +106,10 @@ pub mod held;
 #[cfg(feature = "protocol")]
 pub mod sponsor;
 
+/// The fleet flows as machines (FLOWS.md): a device leaving, written once for every TOKEN app; each app carries out the actions with its own radios, vault and screen.
+#[cfg(feature = "flow")]
+pub mod flow;
+
 /// Fleet membership chain — `FleetOp` / `MembershipBlob` / `fold` / `extends` / `is_member`, plus the VSF op codec and the device-signed builders.
 /// The authority: valid signature + hash-chain link + signer-was-a-prior-member.
 /// The one source of truth shared by the worker (verify) and clients (fetch-then-sign).

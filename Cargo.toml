@@ -33,6 +33,8 @@ protocol = ["fanout", "sign"]
 sign = ["dep:fn-dsa", "dep:rand", "rand/std_rng", "dep:rand_chacha"]
 # `client` also pulls the PQ SIGNING halves (`fn-dsa` keygen+sign, fips205's RNG). Base carries only the verify-only crates, so the worker can check a three-egg chain without ever holding a signing key or an RNG.
 client = ["std", "protocol", "fips205/default-rng", "vsf/text-encode"]
+# `flow` is the fleet flows as UI-free machines (FLOWS.md): events in, actions out, no I/O, no clock, no timers; no_std + alloc, on top of `protocol`.
+flow = ["protocol"]
 # `text` is the fleet and identity words in all sixteen languages and the one language list (src/text.rs), shared by Photon and ferros. No deps of its own.
 text = []
 
