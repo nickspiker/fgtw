@@ -146,6 +146,7 @@ impl Net {
                 Action::Wipe => self.wiped.push(me),
                 Action::PushChain { to } => self.pushed_chain.push(to),
                 Action::Persist | Action::RecordReleased { .. } | Action::RefreshChain => {}
+                Action::ChainNews { .. } | Action::Radios { .. } | Action::Job(Job::ListRequests | Job::Bind { .. } | Job::Grow { .. }) => panic!("depart runs none of the add flow's actions"),
             }
         }
     }

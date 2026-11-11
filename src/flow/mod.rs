@@ -8,11 +8,14 @@ use alloc::vec::Vec;
 
 use crate::pq::FleetSigner;
 
+pub mod add;
 pub mod deliver;
 pub mod depart;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod add_tests;
 
 /// A device key (Ed25519 public key).
 pub type Key = [u8; 32];
@@ -32,6 +35,10 @@ pub enum Frame {
     DepartReq { hp: Key, t: i64, intent: u8, salt: [u8; 32] },
     /// This device's person said Deny to `leaver`'s request.
     DepartDeny { hp: Key, leaver: Key, salt: [u8; 32], t: i64 },
+    /// Tell a device picked on the sponsor's screen that it was picked, so it can turn green.
+    BindSelect { hp: Key, joiner: Key },
+    /// The fleet key's fan-out, grown to include a new member.
+    FanoutResp { hp: Key, blob: Vec<u8> },
 }
 
 /// Build and sign `frame`: the one place a [`Frame`] becomes bytes, so every app signs the same thing. `time` is the document's stamp.
@@ -42,14 +49,22 @@ pub fn build(frame: &Frame, signer: &(impl FleetSigner + ?Sized), time: i64) -> 
             crate::protocol::depart_req(&crate::protocol::DepartReq { t: *t, consent_sig, intent: *intent, salt: *salt }, signer, time)
         }
         Frame::DepartDeny { hp, leaver, salt, t } => crate::protocol::depart_deny(hp, leaver, salt, *t, signer, time),
+        Frame::BindSelect { hp, joiner } => crate::protocol::bind_select(hp, joiner, signer, time),
+        Frame::FanoutResp { hp, blob } => crate::protocol::fanout_resp(hp, blob, signer, time),
     }
 }
 
 /// Slow or effectful work the app runs off the machine and answers with an event.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Job {
     /// Countersign `leaver`'s departure and publish the consented Remove; for intent 1 release its hardware too (`sponsor::approve_departure`). Answered by [`Event::Approved`].
     Approve { leaver: Key, t: i64, consent_sig: Vec<u8>, intent: u8 },
+    /// Read fgtw.org's binding requests for our fleet (`client::bindreq_list`), and which of them belong to another fleet. Answered by [`Event::Listed`].
+    ListRequests,
+    /// Add this device to the fleet (`sponsor::bind_device_held`; a plate the fleet locked out is refused there too). Answered by [`Event::Bound`].
+    Bind { req: crate::fleet::BindRequest },
+    /// Grow the fan-out to `members` (the machine leaves locked devices out) with the key held now (`held::fanout_grow_held`). Answered by [`Event::Grown`].
+    Grow { device: Key, members: Vec<Key> },
 }
 
 /// What the person should be told. The app chooses the words (`text::Msg`), the device names and where it shows: a toast, a notification, the Fleet page.
@@ -79,10 +94,30 @@ pub enum Note {
     DepartApproved { leaver: Key, outcome: crate::sponsor::Approved },
     /// The approval did not publish; the request stays for another try.
     DepartApproveFailed { leaver: Key, reason: String },
+    /// This device holds no fleet key, so it cannot add a device (nothing was written).
+    AddNoFleetKey,
+    /// A device on this network is asking to join (LAN only; a request seen only on fgtw.org notifies nowhere).
+    AsksToJoin { device: Key },
+    /// A device was picked: it should turn green on its own screen.
+    Picked { device: Key },
+    /// The picked device could not be reached on this network: add it by its words.
+    PickUnreachable { device: Key },
+    /// Another add is under way.
+    AddBusy,
+    /// This device is one the fleet locked out.
+    AddLockedOut { device: Key },
+    /// This device belongs to another fleet.
+    AddOwnedElsewhere { device: Key },
+    /// The add started: the screen goes back to the Fleet page.
+    Adding { device: Key },
+    /// The device is in and holds the fleet key.
+    Added { device: Key },
+    /// The add stopped.
+    AddFailed { device: Key, reason: String },
 }
 
 /// What a machine asks the app to do.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// Send these bytes; the app reports [`Event::Sent`] when it knows whether they arrived.
     Send { to: To, frame: Vec<u8> },
@@ -102,6 +137,10 @@ pub enum Action {
     RecordReleased { device: Key },
     /// Send our fleet chain as it stands now (`fleet_resp`) to this device.
     PushChain { to: Key },
+    /// Our chain changed by our hand: send it to every device of ours, every contact's devices, and `extra` (a device not in the fold yet, the newcomer).
+    ChainNews { extra: Option<Key> },
+    /// The radios the sponsor's screen needs, as a whole state (idempotent: the app sets both, and sets them again after a driver restart).
+    Radios { ble_scan: bool, nfc_reader: bool },
     /// The fleet chain changed by our hand: fetch or refold it now.
     RefreshChain,
     /// Tell the person.
@@ -110,12 +149,15 @@ pub enum Action {
     Wipe,
 }
 
-/// Why a machine wants to be woken. None of the current machines need a deadline.
+/// Why a machine wants to be woken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Wake {}
+pub enum Wake {
+    /// A request heard on the LAN or a device heard nearby lapses then (the add screen's candidates change by time alone).
+    Lapse,
+}
 
 /// A step's result: the actions in order, and at most one deadline.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Step {
     pub actions: Vec<Action>,
     pub wake: Option<(i64, Wake)>,
@@ -138,10 +180,18 @@ pub enum UserOp {
     Approve,
     /// Deny the request shown.
     Deny,
+    /// Touch a device's row on the add screen: pick it.
+    Touch { device: Key },
+    /// Yes, the picked device is bright green: add it.
+    Yes,
+    /// No: drop the pick.
+    No,
+    /// "Not nearby? Look through fgtw.org", or opening "type its words": read fgtw.org's requests once.
+    LookFarther,
 }
 
 /// What the app tells a machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event<'a> {
     /// The fleet as folded now: every member (this device among them) and the locked ones. Sent at start and on every change.
     Members { members: &'a [Key], locked: &'a [Key] },
@@ -163,6 +213,24 @@ pub enum Event<'a> {
     GaveUp { leaver: Key, t: i64 },
     /// An NFC tap read this secret.
     NfcRead { secret: [u8; 32] },
+    /// The Fleet page is shown (the add flow opens) or gone (it closes).
+    Page { shown: bool },
+    /// Whether this device holds the fleet key now.
+    FleetKey { held: bool },
+    /// The plates this fleet locked out.
+    LockedPlates { plates: &'a [[u8; 32]] },
+    /// A binding request's BLE beacon id heard.
+    BeaconHeard { id: [u8; crate::pair::BEACON_UUID_LEN] },
+    /// An own-handle LAN beacon from this device key heard.
+    LanHeard { device: Key },
+    /// The answer to [`Job::ListRequests`]: the requests read, and the devices among them owned by another fleet.
+    Listed { reqs: &'a [crate::fleet::BindRequest], owned_elsewhere: &'a [Key] },
+    /// The answer to [`Job::Bind`].
+    Bound { device: Key, result: Result<(), &'a str> },
+    /// The answer to [`Job::Grow`]: the grown fan-out blob.
+    Grown { device: Key, result: Result<&'a [u8], &'a str> },
+    /// The words typed so far on the add screen.
+    Words { text: &'a str },
     /// The person chose.
     User(UserOp),
 }
