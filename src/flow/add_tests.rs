@@ -375,3 +375,27 @@ fn state_saved_under_another_device_key_starts_fresh() {
     assert!(back.resume().actions.is_empty());
     assert_eq!(back.view().adding, None);
 }
+
+#[test]
+fn words_typed_before_the_device_answers_still_add_it() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let words = crate::pair::masked_device_words(&j.public.to_bytes(), &SEED);
+    assert!(!binds(&rig.step(Event::Words { text: &words })), "no candidate yet");
+    let r = request(&j, &[0; 32]);
+    assert!(binds(&rig.step(Event::Listed { reqs: core::slice::from_ref(&r), owned_elsewhere: &[] })), "the typed words match the device as soon as it answers");
+}
+
+#[test]
+fn a_list_hint_reads_again_only_after_the_person_looked_farther() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    assert!(!rig.step(Event::ListMayHaveChanged).contains(&Action::Job(Job::ListRequests)), "the person has not asked to look farther");
+    rig.step(Event::User(UserOp::LookFarther));
+    rig.step(Event::Listed { reqs: &[], owned_elsewhere: &[] });
+    assert!(rig.step(Event::ListMayHaveChanged).contains(&Action::Job(Job::ListRequests)));
+    rig.step(Event::Page { shown: false });
+    rig.open();
+    assert!(!rig.step(Event::ListMayHaveChanged).contains(&Action::Job(Job::ListRequests)), "a new page starts without the person's ask");
+}

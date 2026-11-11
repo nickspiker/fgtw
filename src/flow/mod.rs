@@ -235,6 +235,8 @@ pub enum Event<'a> {
     Words { text: &'a str },
     /// A deadline a step asked for ([`Step::wake`]) has come.
     Wake { reason: Wake },
+    /// A hint that fgtw.org's requests for this fleet may have changed (Photon: the hub's "request" event; ferros: a fleet peer's word). Read again only where the person already asked to look farther on this page.
+    ListMayHaveChanged,
     /// [`Job::ListRequests`] failed: the rows read before stay.
     ListFailed { reason: &'a str },
     /// The person chose.

@@ -117,6 +117,10 @@ pub struct Add {
     words: Option<WordState>,
     /// The words stopped matching and fgtw.org was asked once; asked again only after they match something in between.
     nomatch_asked: bool,
+    /// The words typed so far, matched again whenever the candidates change (a device that answers after the last keystroke still lands). Never saved.
+    typed: String,
+    /// The person asked to look farther on this page (the button, or words that matched nothing): a list-may-have-changed hint reads again.
+    looked: bool,
     /// resume() came before the members: it runs when they arrive.
     resume_pending: bool,
     selected: Option<Key>,
@@ -153,6 +157,8 @@ impl Add {
             listing: false,
             words: None,
             nomatch_asked: false,
+            typed: String::new(),
+            looked: false,
             resume_pending: false,
             selected: None,
             select_build: None,
@@ -234,6 +240,7 @@ impl Add {
                 if self.shown && !self.open && self.can_add() {
                     self.page(true, now, &mut s);
                 }
+                self.rematch(false, &mut s);
             }
             Event::FleetKey { held } => {
                 self.key_held = held;
@@ -251,6 +258,7 @@ impl Add {
                     None => self.heard_ble.push((id, now)),
                 }
                 self.rebuild(now);
+                self.rematch(false, &mut s);
             }
             Event::LanHeard { device } => {
                 match self.heard_lan.iter_mut().find(|(k, _)| *k == device) {
@@ -258,8 +266,17 @@ impl Add {
                     None => self.heard_lan.push((device, now)),
                 }
                 self.rebuild(now);
+                self.rematch(false, &mut s);
             }
-            Event::Wake { reason: Wake::Lapse } => self.rebuild(now),
+            Event::Wake { reason: Wake::Lapse } => {
+                self.rebuild(now);
+                self.rematch(false, &mut s);
+            }
+            Event::ListMayHaveChanged => {
+                if self.looked {
+                    self.list(&mut s);
+                }
+            }
             Event::ListFailed { reason } => {
                 self.listing = false;
                 s.push(Action::Note(Note::ListFailed { reason: reason.to_string() }));
@@ -269,8 +286,12 @@ impl Add {
                 self.registry = reqs.to_vec();
                 self.owned_elsewhere = owned_elsewhere.to_vec();
                 self.rebuild(now);
+                self.rematch(false, &mut s);
             }
-            Event::Words { text } => self.on_words(text, &mut s),
+            Event::Words { text } => {
+                self.typed = text.to_string();
+                self.rematch(true, &mut s);
+            }
             Event::NfcRead { secret } => {
                 // Physical proximity is the confirmation: an NFC match adds at once, contended or not.
                 if self.open {
@@ -291,7 +312,10 @@ impl Add {
                     self.selected = None;
                     self.select_build = None;
                 }
-                UserOp::LookFarther => self.list(&mut s),
+                UserOp::LookFarther => {
+                    self.looked = true;
+                    self.list(&mut s);
+                }
                 _ => {}
             },
             Event::Built { id, result } => self.on_built(id, result, &mut s),
@@ -339,6 +363,8 @@ impl Add {
             self.selected = None;
             self.select_build = None;
             self.words = None;
+            self.typed.clear();
+            self.looked = false;
         }
         s.push(self.radios());
     }
@@ -361,6 +387,7 @@ impl Add {
         }
         let offered = sponsor::offer_lan(&mut self.lan, req);
         self.rebuild(now);
+        self.rematch(false, s);
         // Join notices are LAN only (owner): a device on this network asking while the page is closed is announced once.
         if offered == sponsor::Offered::New && !self.open && !self.members.contains(&device) {
             s.push(Action::Note(Note::AsksToJoin { device }));
@@ -374,16 +401,19 @@ impl Add {
         }
     }
 
-    fn on_words(&mut self, text: &str, s: &mut Step) {
-        if !self.open {
+    /// Match the words typed so far against the candidates as they are now. `may_list`: this is the person's keystroke, so words that stop matching may read fgtw.org (a candidate change never does).
+    fn rematch(&mut self, may_list: bool, s: &mut Step) {
+        if !self.open || self.typed.is_empty() || self.adding.is_some() {
             return;
         }
+        let text = self.typed.clone();
         // While contended the network path is shut for words too: only a device heard over Bluetooth can be added by its words.
         let pool: Vec<Candidate> = if self.contended { self.cands.iter().filter(|c| c.heard_ble).cloned().collect() } else { self.cands.clone() };
-        let state = match sponsor::match_words(text, &pool) {
+        let state = match sponsor::match_words(&text, &pool) {
             WordMatch::Full(i) => {
                 let req = pool[i].req.clone();
                 self.words = None;
+                self.typed.clear();
                 self.add(req, s);
                 return;
             }
@@ -396,8 +426,9 @@ impl Add {
         match state {
             // Words that match no device may belong to one only fgtw.org has heard: read its requests once when they stop matching, again only after they matched something in between (the person's edge, not every keystroke).
             WordState::NoMatch(_) | WordState::NoCandidates { .. } => {
-                if !self.nomatch_asked {
+                if may_list && !self.nomatch_asked {
                     self.nomatch_asked = true;
+                    self.looked = true;
                     self.list(s);
                 }
             }
