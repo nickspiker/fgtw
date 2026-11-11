@@ -105,5 +105,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("kapag naaprubahan, buburahin dito ang mga gamit mo\nat magre-restart ito; kinakansela ng balik ang pag-alis"),
         Msg::DepartDeniedOn(name) => write!(o, "tinanggihan ang pag-alis sa {name}"),
         Msg::DepartNotStarted => o.write_str("hindi nagsimula ang pag-alis"),
+        Msg::LastDevice => o.write_str("Ito na ang huling device ng pagkakakilanlan mo.\nHindi ito puwedeng umalis. Magdagdag muna ng ibang device, saka iretiro ito."),
     }
 }

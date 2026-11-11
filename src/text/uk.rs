@@ -115,5 +115,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("після схвалення твої дані зітруться з нього\nі він перезапуститься; «назад» скасовує вихід"),
         Msg::DepartDeniedOn(name) => write!(o, "вихід відхилено на пристрої {name}"),
         Msg::DepartNotStarted => o.write_str("вихід не розпочався"),
+        Msg::LastDevice => o.write_str("Це останній пристрій твоєї ідентичності.\nВін не може піти. Спершу додай інший пристрій, а тоді відправ цей на спочинок."),
     }
 }

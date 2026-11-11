@@ -105,5 +105,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("once approved, your things are wiped from it\nand it restarts; back gives up leaving"),
         Msg::DepartDeniedOn(name) => write!(o, "leaving was denied on {name}"),
         Msg::DepartNotStarted => o.write_str("the departure did not start"),
+        Msg::LastDevice => o.write_str("This is your identity's last device.\nIt can't leave. Add another device first, then retire this one."),
     }
 }

@@ -106,5 +106,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("मंज़ूरी के बाद तुम्हारी चीज़ें इससे मिट जाती हैं\nऔर यह फिर से शुरू होता है; वापस दबाने से जाना रद्द होता है"),
         Msg::DepartDeniedOn(name) => write!(o, "{name} पर जाना मना कर दिया गया"),
         Msg::DepartNotStarted => o.write_str("जाना शुरू नहीं हुआ"),
+        Msg::LastDevice => o.write_str("यह तुम्हारी पहचान का आख़िरी डिवाइस है।\nयह नहीं जा सकता। पहले कोई और डिवाइस जोड़ो, फिर इसे रिटायर करो।"),
     }
 }

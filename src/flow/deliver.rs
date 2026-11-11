@@ -22,12 +22,14 @@ enum Hand {
 pub struct Deliver {
     frame: Vec<u8>,
     targets: Vec<(Key, Hand)>,
+    /// The app reports every send's outcome ([`super::Event::Sent`]): a send with no word back is in flight, not lost. An app that reports none (Photon today) has each reachable edge hand it again.
+    reports_sent: bool,
 }
 
 impl Deliver {
     /// Start delivering `frame` to `targets`: one send each.
-    pub fn new(frame: Vec<u8>, targets: &[Key], out: &mut Vec<Action>) -> Self {
-        let mut d = Deliver { frame, targets: Vec::new() };
+    pub fn new(frame: Vec<u8>, targets: &[Key], reports_sent: bool, out: &mut Vec<Action>) -> Self {
+        let mut d = Deliver { frame, targets: Vec::new(), reports_sent };
         for k in targets {
             d.add(*k, out);
         }
@@ -71,10 +73,11 @@ impl Deliver {
         }
     }
 
-    /// `from` showed it is reachable: hand it the frame unless it has taken it (a send with no word back counts as not taken; the receiver drops a copy it already has).
+    /// `from` showed it is reachable: hand it the frame if its send gave up or it was never handed it; a send still in flight is not sent again (ferros 2026-11-10: a beacon every 3 s would start a duplicate transfer each time). Where the app reports no send outcomes, a send with no word back is handed again.
     pub fn on_reachable(&mut self, from: Key, out: &mut Vec<Action>) {
+        let again_in_flight = !self.reports_sent;
         if let Some((_, h)) = self.targets.iter_mut().find(|(k, _)| *k == from) {
-            if *h != Hand::Took {
+            if *h == Hand::Again || (*h == Hand::Out && again_in_flight) {
                 *h = Hand::Out;
                 out.push(Action::Send { to: To::Device(from), frame: self.frame.clone() });
             }

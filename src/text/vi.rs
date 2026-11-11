@@ -105,5 +105,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("khi được duyệt, mọi thứ của bạn bị xóa khỏi nó\nvà nó khởi động lại; quay lại là thôi không rời đi"),
         Msg::DepartDeniedOn(name) => write!(o, "việc rời đi bị từ chối trên {name}"),
         Msg::DepartNotStarted => o.write_str("việc rời đi chưa bắt đầu"),
+        Msg::LastDevice => o.write_str("Đây là thiết bị cuối cùng của danh tính bạn.\nNó không thể rời đi. Hãy thêm một thiết bị khác trước, rồi mới cho cái này nghỉ."),
     }
 }

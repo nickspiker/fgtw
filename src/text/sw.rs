@@ -106,5 +106,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("kikiidhinishwa, vitu vyako vinafutwa kutoka kwake\nna kinaanza upya; rudi huacha kuondoka"),
         Msg::DepartDeniedOn(name) => write!(o, "kuondoka kumekataliwa kwenye {name}"),
         Msg::DepartNotStarted => o.write_str("kuondoka hakukuanza"),
+        Msg::LastDevice => o.write_str("Hiki ndicho kifaa cha mwisho cha utambulisho wako.\nHakiwezi kuondoka. Ongeza kifaa kingine kwanza, kisha ukistaafishe hiki."),
     }
 }

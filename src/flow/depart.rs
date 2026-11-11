@@ -62,12 +62,14 @@ pub struct Depart {
     denied: Vec<(Key, [u8; 32], i64)>,
     denies: Vec<DenyOut>,
     next_build: u32,
+    /// The app reports every send's outcome (see [`Deliver`]).
+    reports_sent: bool,
 }
 
 impl Depart {
-    /// A fresh machine for device `me` of the fleet `hp`. Tell it the members before anything else.
-    pub fn new(hp: Key, me: Key) -> Self {
-        Depart { hp, me, members: Vec::new(), locked: Vec::new(), known: false, own: None, asked: None, denied: Vec::new(), denies: Vec::new(), next_build: 0 }
+    /// A fresh machine for device `me` of the fleet `hp`. `reports_sent`: the app reports every send's outcome as [`Event::Sent`]. Tell it the members before anything else.
+    pub fn new(hp: Key, me: Key, reports_sent: bool) -> Self {
+        Depart { hp, me, members: Vec::new(), locked: Vec::new(), known: false, own: None, asked: None, denied: Vec::new(), denies: Vec::new(), next_build: 0, reports_sent }
     }
 
     /// Our request is out (or being built).
@@ -78,6 +80,16 @@ impl Depart {
     /// The request this device's person is asked about: (leaver, intent, salt).
     pub fn asked(&self) -> Option<(Key, u8, [u8; 32])> {
         self.asked.as_ref().map(|a| (a.leaver, a.intent, a.salt))
+    }
+
+    /// The consent stamp of the request this device's person is asked about.
+    pub fn asked_t(&self) -> Option<i64> {
+        self.asked.as_ref().map(|a| a.t)
+    }
+
+    /// Our own request as signed and sent, once built.
+    pub fn own_frame(&self) -> Option<&[u8]> {
+        self.own.as_ref().and_then(|o| o.deliver.as_ref()).map(|d| d.frame())
     }
 
     /// The members a frame from this device goes to: live, not locked, not us.
@@ -156,6 +168,14 @@ impl Depart {
                     s.push(Action::Persist);
                 }
             }
+            Event::GaveUp { leaver, t } => {
+                // The leaver withdrew the request (its frame, or the identity space showing the entry gone): nothing to approve.
+                if self.asked.as_ref().is_some_and(|a| a.leaver == leaver && a.t == t) {
+                    self.asked = None;
+                    s.push(Action::Persist);
+                    s.push(Action::Note(Note::DepartWithdrawn { leaver }));
+                }
+            }
             Event::NfcRead { secret } => {
                 // A tap of the leaving device, which serves its salt while its request stands, approves the request it names.
                 if self.asked.as_ref().is_some_and(|a| a.salt == secret) {
@@ -229,7 +249,7 @@ impl Depart {
         if let Some(own) = self.own.as_mut().filter(|o| o.build == id && o.deliver.is_none()) {
             match result {
                 Ok(frame) => {
-                    own.deliver = Some(Deliver::new(frame.to_vec(), &targets, &mut s.actions));
+                    own.deliver = Some(Deliver::new(frame.to_vec(), &targets, self.reports_sent, &mut s.actions));
                     let salt = own.salt;
                     s.push(Action::NfcServe(Some(salt)));
                     s.push(Action::Persist);
@@ -245,7 +265,7 @@ impl Depart {
         }
         if let Some(i) = self.denies.iter().position(|d| d.build == id && d.deliver.is_none()) {
             match result {
-                Ok(frame) => self.denies[i].deliver = Some(Deliver::new(frame.to_vec(), &targets, &mut s.actions)),
+                Ok(frame) => self.denies[i].deliver = Some(Deliver::new(frame.to_vec(), &targets, self.reports_sent, &mut s.actions)),
                 // The deny is already recorded here and in the fleet-shared settings; only its frame failed, so the others learn it from the settings sync.
                 Err(_) => {
                     self.denies.remove(i);
@@ -336,6 +356,8 @@ impl Depart {
                 if *outcome == crate::sponsor::Approved::Released(Ok(())) {
                     s.push(Action::RecordReleased { device: leaver });
                 }
+                // The leaver learns it is out from the chain itself, handed to it now, not from a poll.
+                s.push(Action::PushChain { to: leaver });
                 s.push(Action::RefreshChain);
                 s.push(Action::Persist);
                 s.push(Action::Note(Note::DepartApproved { leaver, outcome: outcome.clone() }));
@@ -395,9 +417,9 @@ impl Depart {
     }
 
     /// The state to keep in the vault: our request (with its signed frame once built), the request asked about, and the denied list.
+    /// The handle proof is not in it: it is a root, and stays off the disk where the identity lives in RAM only (ferros, unlock-at-boot off); the app hands it back to [`Depart::from_section`].
     pub fn to_section(&self) -> VsfSection {
         let mut sec = VsfSection::new("depart");
-        sec.add_field("hp", VsfType::hP(self.hp.to_vec()));
         sec.add_field("me", VsfType::ke(self.me.to_vec()));
         if let Some(o) = self.own.as_ref() {
             sec.add_field("own_t", VsfType::e(EtType::e6(o.t)));
@@ -436,14 +458,14 @@ impl Depart {
     }
 
     /// Read a document [`Depart::to_vsf`] wrote: verified, then the section read back.
-    pub fn from_vsf(bytes: &[u8]) -> Result<Self, String> {
+    pub fn from_vsf(bytes: &[u8], hp: Key, reports_sent: bool) -> Result<Self, String> {
         let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("depart state: {e}"))?;
         let sec = header.primary_section(bytes, end).map_err(|e| alloc::format!("depart state: {e}"))?;
-        Self::from_section(&sec)
+        Self::from_section(&sec, hp, reports_sent)
     }
 
     /// Read the state back. Members are not kept: tell them, then call [`Depart::resume`].
-    pub fn from_section(sec: &VsfSection) -> Result<Self, String> {
+    pub fn from_section(sec: &VsfSection, hp: Key, reports_sent: bool) -> Result<Self, String> {
         if sec.name != "depart" {
             return Err("not a depart section".to_string());
         }
@@ -455,12 +477,11 @@ impl Depart {
             })
         };
         let small = |name: &str| first(name).and_then(|v| v.as_u64()).and_then(|n| u8::try_from(n).ok());
-        let hp = key("hp").ok_or("depart state missing hp")?;
         let me = key("me").ok_or("depart state missing me")?;
-        let mut m = Depart::new(hp, me);
+        let mut m = Depart::new(hp, me, reports_sent);
         if let (Some(t), Some(salt), Some(intent)) = (sec.eagle("own_t"), key("own_salt"), small("own_intent")) {
             let deliver = first("own_frame").and_then(|v| match v {
-                VsfType::v(b'r', b) => Some(Deliver::new(b.clone(), &[], &mut Vec::new())),
+                VsfType::v(b'r', b) => Some(Deliver::new(b.clone(), &[], reports_sent, &mut Vec::new())),
                 _ => None,
             });
             m.own = Some(Own { t, salt, intent, build: 0, deliver });

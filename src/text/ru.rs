@@ -111,5 +111,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("после одобрения твои данные сотрутся с него\nи оно перезапустится; «назад» отменяет уход"),
         Msg::DepartDeniedOn(name) => write!(o, "уход отклонён на устройстве {name}"),
         Msg::DepartNotStarted => o.write_str("уход не начался"),
+        Msg::LastDevice => o.write_str("Это последнее устройство твоей личности.\nЕму нельзя уйти. Сначала добавь другое устройство, а потом отправь это на покой."),
     }
 }

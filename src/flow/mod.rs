@@ -73,6 +73,8 @@ pub enum Note {
     DepartDeniedElsewhere { leaver: Key, by: Key },
     /// `leaver`'s request was settled elsewhere (it is no longer in the fleet).
     DepartSettled { leaver: Key },
+    /// `leaver` withdrew its request.
+    DepartWithdrawn { leaver: Key },
     /// Approved here: the Remove is published; what happened to the hardware.
     DepartApproved { leaver: Key, outcome: crate::sponsor::Approved },
     /// The approval did not publish; the request stays for another try.
@@ -98,6 +100,8 @@ pub enum Action {
     RecordDenied { leaver: Key, salt: [u8; 32], t: i64 },
     /// Remember that this device's hardware was released.
     RecordReleased { device: Key },
+    /// Send our fleet chain as it stands now (`fleet_resp`) to this device.
+    PushChain { to: Key },
     /// The fleet chain changed by our hand: fetch or refold it now.
     RefreshChain,
     /// Tell the person.
@@ -155,6 +159,8 @@ pub enum Event<'a> {
     Approved { leaver: Key, result: Result<&'a crate::sponsor::Approved, &'a str> },
     /// Denied requests the fleet-shared settings hold (every device's list, merged).
     DeniedKnown { denied: &'a [(Key, [u8; 32], i64)] },
+    /// The leaving device withdrew the request stamped `t` (its frame, or the identity space showing the entry gone).
+    GaveUp { leaver: Key, t: i64 },
     /// An NFC tap read this secret.
     NfcRead { secret: [u8; 32] },
     /// The person chose.

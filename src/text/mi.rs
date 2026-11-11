@@ -106,5 +106,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("ina whakaaetia, ka ūkuia ō mea i runga i a ia\nkātahi ka tīmata anō; mā hoki e whakamutu te wehe"),
         Msg::DepartDeniedOn(name) => write!(o, "i whakakāhoretia te wehe i {name}"),
         Msg::DepartNotStarted => o.write_str("kāore te wehenga i tīmata"),
+        Msg::LastDevice => o.write_str("Ko te pūrere whakamutunga tēnei o tō tuakiri.\nKāore e taea te wehe. Tāpirihia he pūrere kē i te tuatahi, kātahi ka whakatā i tēnei."),
     }
 }

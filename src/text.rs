@@ -365,6 +365,8 @@ pub enum Msg<'a> {
     DepartDeniedOn(&'a str),
     /// ferros's. One-line. The request did not go out.
     DepartNotStarted,
+    /// Photon's. Wrapping. The identity's last device cannot ask to leave: add another device first.
+    LastDevice,
 }
 
 /// Message `m` in language `l`, written into `o`.
@@ -497,6 +499,7 @@ mod tests {
         add(Msg::DepartThen, 0, false);
         add(Msg::DepartDeniedOn(H), 1, false);
         add(Msg::DepartNotStarted, 0, true);
+        add(Msg::LastDevice, 0, false);
         v
     }
 

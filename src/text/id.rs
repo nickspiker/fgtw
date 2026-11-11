@@ -106,5 +106,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("setelah disetujui, milikmu dihapus darinya\nlalu ia mulai ulang; kembali membatalkan keluar"),
         Msg::DepartDeniedOn(name) => write!(o, "permintaan keluar ditolak di {name}"),
         Msg::DepartNotStarted => o.write_str("kepergiannya tidak dimulai"),
+        Msg::LastDevice => o.write_str("Ini perangkat terakhir identitasmu.\nIa tidak bisa keluar. Tambahkan perangkat lain dulu, lalu pensiunkan yang ini."),
     }
 }

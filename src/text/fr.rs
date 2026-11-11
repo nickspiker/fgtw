@@ -114,5 +114,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("une fois approuvé, tes données en sont effacées\net il redémarre ; retour annule le départ"),
         Msg::DepartDeniedOn(name) => write!(o, "le départ a été refusé sur {name}"),
         Msg::DepartNotStarted => o.write_str("le départ n’a pas commencé"),
+        Msg::LastDevice => o.write_str("C\u{2019}est le dernier appareil de ton identité.\nIl ne peut pas partir. Ajoute d\u{2019}abord un autre appareil, puis retire celui-ci."),
     }
 }

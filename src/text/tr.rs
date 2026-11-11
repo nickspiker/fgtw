@@ -106,5 +106,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("onaylanınca senin olan her şey ondan silinir\nve yeniden başlar; geri, ayrılmaktan vazgeçer"),
         Msg::DepartDeniedOn(name) => write!(o, "ayrılma şu cihazda reddedildi: {name}"),
         Msg::DepartNotStarted => o.write_str("ayrılış başlamadı"),
+        Msg::LastDevice => o.write_str("Bu, kimliğinin son cihazı.\nAyrılamaz. Önce başka bir cihaz ekle, sonra bunu emekliye ayır."),
     }
 }

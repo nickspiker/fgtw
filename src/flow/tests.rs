@@ -40,6 +40,7 @@ struct Net {
     wiped: Vec<Key>,
     recorded_denied: Vec<Key>,
     serving: Vec<(Key, Option<[u8; 32]>)>,
+    pushed_chain: Vec<Key>,
     /// What the approve job answers.
     approve_fails: bool,
     now: i64,
@@ -47,15 +48,20 @@ struct Net {
 
 impl Net {
     fn new(n: u8) -> Net {
+        Net::with(n, true)
+    }
+
+    /// `reports_sent`: whether the app reports every send's outcome.
+    fn with(n: u8, reports_sent: bool) -> Net {
         let devs: Vec<Dev> = (0..n)
             .map(|i| {
                 let kp = Keypair::from_seed(&[i + 1; 32]);
                 let me = kp.public.to_bytes();
-                Dev { kp, m: Depart::new(HP, me) }
+                Dev { kp, m: Depart::new(HP, me, reports_sent) }
             })
             .collect();
         let members = devs.iter().map(|d| d.kp.public.to_bytes()).collect();
-        let mut net = Net { devs, members, locked: Vec::new(), down: Vec::new(), silent: Vec::new(), queue: Vec::new(), notes: Vec::new(), wiped: Vec::new(), recorded_denied: Vec::new(), serving: Vec::new(), approve_fails: false, now: 1 << 40 };
+        let mut net = Net { devs, members, locked: Vec::new(), down: Vec::new(), silent: Vec::new(), queue: Vec::new(), notes: Vec::new(), wiped: Vec::new(), recorded_denied: Vec::new(), serving: Vec::new(), pushed_chain: Vec::new(), approve_fails: false, now: 1 << 40 };
         for i in 0..net.devs.len() {
             net.queue.push((i, Q::Members));
         }
@@ -138,6 +144,7 @@ impl Net {
                 Action::RecordDenied { .. } => self.recorded_denied.push(me),
                 Action::Note(n) => self.notes.push((me, n)),
                 Action::Wipe => self.wiped.push(me),
+                Action::PushChain { to } => self.pushed_chain.push(to),
                 Action::Persist | Action::RecordReleased { .. } | Action::RefreshChain => {}
             }
         }
@@ -163,7 +170,7 @@ fn the_last_device_cannot_ask_to_leave() {
 #[test]
 fn a_fleet_not_known_yet_is_treated_as_one_device() {
     let kp = Keypair::from_seed(&[9; 32]);
-    let mut m = Depart::new(HP, kp.public.to_bytes());
+    let mut m = Depart::new(HP, kp.public.to_bytes(), true);
     let s = m.step(Event::User(LEAVE), 1);
     assert_eq!(s.actions, vec![Action::Note(Note::LastDevice)]);
 }
@@ -272,7 +279,7 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     net.down.push(far);
     net.user(0, LEAVE);
     let doc = net.devs[0].m.to_vsf(net.now).unwrap();
-    let back = Depart::from_vsf(&doc).unwrap();
+    let back = Depart::from_vsf(&doc, HP, true).unwrap();
     net.devs[0].m = back;
     net.down.clear();
     net.queue.push((0, Q::Members));
@@ -283,7 +290,7 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     assert_eq!(net.devs[2].m.asked(), Some((leaver, 1, SALT)), "the restarted leaver hands its saved request to the member that missed it");
     // The approver side survives too.
     let sec = net.devs[2].m.to_section();
-    let mut back = Depart::from_section(&sec).unwrap();
+    let mut back = Depart::from_section(&sec, HP, true).unwrap();
     assert_eq!(back.asked(), Some((leaver, 1, SALT)));
     let s = back.resume();
     assert_eq!(s.actions, vec![Action::Note(Note::DepartAsked { leaver })]);
@@ -291,7 +298,8 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
 
 #[test]
 fn a_member_never_reached_is_handed_the_request_when_it_shows_up() {
-    let mut net = Net::new(3);
+    // An app that reports no send outcomes (Photon today): a send with no word back is handed again when the device shows up.
+    let mut net = Net::with(3, false);
     let (leaver, far) = (net.key(0), net.key(2));
     net.silent.push(far);
     net.user(0, LEAVE);
@@ -310,4 +318,53 @@ fn a_frame_reports_its_signer_and_address() {
     let addr: core::net::SocketAddr = "192.0.2.7:4383".parse().unwrap();
     let s = net.devs[1].m.step(Event::Frame { bytes: &frame, from: Some(addr) }, net.now);
     assert!(s.actions.contains(&Action::Seen { device: net.key(0), addr }));
+}
+
+#[test]
+fn a_send_in_flight_is_not_sent_again_when_its_device_shows_up() {
+    // An app that reports every outcome (ferros): a beacon every few seconds must not start a duplicate transfer.
+    let mut net = Net::new(3);
+    let far = net.key(2);
+    net.silent.push(far);
+    net.user(0, LEAVE);
+    let s = net.devs[0].m.step(Event::Reachable { from: far }, net.now);
+    assert!(s.actions.iter().all(|a| !matches!(a, Action::Send { .. })), "still in flight, so no second send");
+    // A send that gave up is handed again.
+    let s = net.devs[0].m.step(Event::Sent { to: far, ok: false }, net.now);
+    assert!(s.actions.is_empty());
+    let s = net.devs[0].m.step(Event::Reachable { from: far }, net.now);
+    assert!(s.actions.iter().any(|a| matches!(a, Action::Send { to: To::Device(k), .. } if *k == far)));
+}
+
+#[test]
+fn the_approver_hands_the_leaver_the_new_chain() {
+    let mut net = Net::new(2);
+    let leaver = net.key(0);
+    net.user(0, LEAVE);
+    net.user(1, UserOp::Approve);
+    assert!(net.pushed_chain.contains(&leaver));
+}
+
+#[test]
+fn a_withdrawn_request_leaves_the_approvers() {
+    let mut net = Net::new(2);
+    let leaver = net.key(0);
+    net.user(0, LEAVE);
+    let t = net.devs[1].m.asked_t().unwrap();
+    assert!(net.devs[0].m.own_frame().is_some(), "the leaver keeps its signed request");
+    net.queue.push((1, Q::Members));
+    net.run();
+    let s = net.devs[1].m.step(Event::GaveUp { leaver, t }, net.now);
+    assert!(s.actions.contains(&Action::Note(Note::DepartWithdrawn { leaver })));
+    assert_eq!(net.devs[1].m.asked(), None);
+}
+
+#[test]
+fn the_saved_state_holds_no_handle_proof() {
+    let mut net = Net::new(2);
+    net.user(0, LEAVE);
+    let sec = net.devs[0].m.to_section();
+    assert!(sec.get_field("hp").is_none());
+    let doc = net.devs[0].m.to_vsf(net.now).unwrap();
+    assert!(!doc.windows(32).any(|w| w == HP), "the handle proof never reaches the disk");
 }

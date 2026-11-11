@@ -125,5 +125,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("po zatwierdzeniu twoje dane zostaną z niego wymazane\ni uruchomi się ponownie; wstecz rezygnuje z odejścia"),
         Msg::DepartDeniedOn(name) => write!(o, "odejście odrzucono na urządzeniu {name}"),
         Msg::DepartNotStarted => o.write_str("odejście się nie rozpoczęło"),
+        Msg::LastDevice => o.write_str("To ostatnie urządzenie twojej tożsamości.\nNie może odejść. Najpierw dodaj inne, potem wycofaj to."),
     }
 }

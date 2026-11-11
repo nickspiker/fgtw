@@ -105,5 +105,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("depois de aprovado, as suas coisas são apagadas dele\ne ele reinicia; voltar desiste de sair"),
         Msg::DepartDeniedOn(name) => write!(o, "a saída foi recusada em {name}"),
         Msg::DepartNotStarted => o.write_str("a saída não começou"),
+        Msg::LastDevice => o.write_str("Este é o último dispositivo da sua identidade.\nEle não pode sair. Adicione outro dispositivo primeiro e só então aposente este."),
     }
 }

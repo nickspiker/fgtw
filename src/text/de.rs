@@ -112,5 +112,6 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartThen => o.write_str("nach der Zustimmung werden deine Daten davon gelöscht\nund es startet neu; zurück bricht den Austritt ab"),
         Msg::DepartDeniedOn(name) => write!(o, "der Austritt wurde auf {name} abgelehnt"),
         Msg::DepartNotStarted => o.write_str("der Austritt hat nicht begonnen"),
+        Msg::LastDevice => o.write_str("Das ist das letzte Gerät deiner Identität.\nEs kann nicht gehen. Füge erst ein weiteres Gerät hinzu und leg dieses dann still."),
     }
 }
