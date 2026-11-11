@@ -113,7 +113,7 @@ impl Depart {
         let mut s = Step::default();
         match ev {
             Event::Members { members, locked } => self.on_members(members, locked, &mut s),
-            Event::Frame { bytes } => self.on_frame(bytes, &mut s),
+            Event::Frame { bytes, from } => self.on_frame(bytes, from, &mut s),
             Event::Sent { to, ok } => {
                 if let Some(d) = self.own.as_mut().and_then(|o| o.deliver.as_mut()) {
                     d.on_sent(to, ok);
@@ -123,12 +123,12 @@ impl Depart {
                 }
                 self.denies.retain(|d| !d.deliver.as_ref().is_some_and(|x| x.done()));
             }
-            Event::Pong { from } => {
+            Event::Reachable { from } => {
                 if let Some(d) = self.own.as_mut().and_then(|o| o.deliver.as_mut()) {
-                    d.on_pong(from, &mut s.actions);
+                    d.on_reachable(from, &mut s.actions);
                 }
                 for d in self.denies.iter_mut().filter_map(|d| d.deliver.as_mut()) {
-                    d.on_pong(from, &mut s.actions);
+                    d.on_reachable(from, &mut s.actions);
                 }
             }
             Event::LinkUp => {
@@ -254,12 +254,18 @@ impl Depart {
         }
     }
 
-    fn on_frame(&mut self, bytes: &[u8], s: &mut Step) {
+    fn on_frame(&mut self, bytes: &[u8], from: Option<core::net::SocketAddr>, s: &mut Step) {
         if let Ok((req, leaver)) = crate::protocol::parse_depart_req(bytes) {
+            if let Some(addr) = from.filter(|_| self.live(&leaver)) {
+                s.push(Action::Seen { device: leaver, addr });
+            }
             self.on_depart_req(req, leaver, s);
             return;
         }
         if let Ok((hp, leaver, salt, t, by)) = crate::protocol::parse_depart_deny(bytes) {
+            if let Some(addr) = from.filter(|_| self.live(&by)) {
+                s.push(Action::Seen { device: by, addr });
+            }
             self.on_depart_deny(hp, leaver, salt, t, by, s);
         }
     }

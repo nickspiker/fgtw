@@ -17,7 +17,7 @@ enum Q {
     Built(u32, Result<Vec<u8>, String>),
     Approved(Key, Result<Approved, String>),
     Members,
-    Pong(Key),
+    Reachable(Key),
     User(UserOp),
     Nfc([u8; 32]),
 }
@@ -33,6 +33,8 @@ struct Net {
     locked: Vec<Key>,
     /// Sends to these devices give up.
     down: Vec<Key>,
+    /// Sends to these devices vanish with no word back (a send the app cannot map to a key).
+    silent: Vec<Key>,
     queue: Vec<(usize, Q)>,
     notes: Vec<(Key, Note)>,
     wiped: Vec<Key>,
@@ -53,7 +55,7 @@ impl Net {
             })
             .collect();
         let members = devs.iter().map(|d| d.kp.public.to_bytes()).collect();
-        let mut net = Net { devs, members, locked: Vec::new(), down: Vec::new(), queue: Vec::new(), notes: Vec::new(), wiped: Vec::new(), recorded_denied: Vec::new(), serving: Vec::new(), approve_fails: false, now: 1 << 40 };
+        let mut net = Net { devs, members, locked: Vec::new(), down: Vec::new(), silent: Vec::new(), queue: Vec::new(), notes: Vec::new(), wiped: Vec::new(), recorded_denied: Vec::new(), serving: Vec::new(), approve_fails: false, now: 1 << 40 };
         for i in 0..net.devs.len() {
             net.queue.push((i, Q::Members));
         }
@@ -86,12 +88,12 @@ impl Net {
             let (i, q) = self.queue.remove(0);
             let (members, locked) = (self.members.clone(), self.locked.clone());
             let step = match &q {
-                Q::Frame(b) => self.devs[i].m.step(Event::Frame { bytes: b }, self.now),
+                Q::Frame(b) => self.devs[i].m.step(Event::Frame { bytes: b, from: None }, self.now),
                 Q::Sent(k, ok) => self.devs[i].m.step(Event::Sent { to: *k, ok: *ok }, self.now),
                 Q::Built(id, r) => self.devs[i].m.step(Event::Built { id: *id, result: r.as_deref().map_err(|e| e.as_str()) }, self.now),
                 Q::Approved(l, r) => self.devs[i].m.step(Event::Approved { leaver: *l, result: r.as_ref().map_err(|e| e.as_str()) }, self.now),
                 Q::Members => self.devs[i].m.step(Event::Members { members: &members, locked: &locked }, self.now),
-                Q::Pong(k) => self.devs[i].m.step(Event::Pong { from: *k }, self.now),
+                Q::Reachable(k) => self.devs[i].m.step(Event::Reachable { from: *k }, self.now),
                 Q::User(op) => self.devs[i].m.step(Event::User(*op), self.now),
                 Q::Nfc(s) => self.devs[i].m.step(Event::NfcRead { secret: *s }, self.now),
             };
@@ -104,6 +106,9 @@ impl Net {
         for a in actions {
             match a {
                 Action::Send { to: To::Device(k), frame } => {
+                    if self.silent.contains(&k) {
+                        continue;
+                    }
                     let ok = !self.down.contains(&k);
                     if ok {
                         if let Some(j) = self.index(&k) {
@@ -129,6 +134,7 @@ impl Net {
                     }
                 }
                 Action::NfcServe(s) => self.serving.push((me, s)),
+                Action::Seen { .. } => {}
                 Action::RecordDenied { .. } => self.recorded_denied.push(me),
                 Action::Note(n) => self.notes.push((me, n)),
                 Action::Wipe => self.wiped.push(me),
@@ -208,14 +214,14 @@ fn deny_tells_the_leaver_and_every_device_refuses_that_salt() {
 }
 
 #[test]
-fn a_request_lost_to_a_failed_send_is_handed_again_at_the_next_pong() {
+fn a_request_lost_to_a_failed_send_is_handed_again_when_the_device_is_reachable() {
     let mut net = Net::new(3);
     let (leaver, far) = (net.key(0), net.key(2));
     net.down.push(far);
     net.user(0, LEAVE);
     assert_eq!(net.devs[2].m.asked(), None, "the send gave up");
     net.down.clear();
-    net.queue.push((0, Q::Pong(far)));
+    net.queue.push((0, Q::Reachable(far)));
     net.run();
     assert_eq!(net.devs[2].m.asked(), Some((leaver, 1, SALT)), "handed again when it answered a ping");
 }
@@ -281,4 +287,27 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     assert_eq!(back.asked(), Some((leaver, 1, SALT)));
     let s = back.resume();
     assert_eq!(s.actions, vec![Action::Note(Note::DepartAsked { leaver })]);
+}
+
+#[test]
+fn a_member_never_reached_is_handed_the_request_when_it_shows_up() {
+    let mut net = Net::new(3);
+    let (leaver, far) = (net.key(0), net.key(2));
+    net.silent.push(far);
+    net.user(0, LEAVE);
+    assert_eq!(net.devs[2].m.asked(), None, "the first send vanished and no Sent came back");
+    net.silent.clear();
+    net.queue.push((0, Q::Reachable(far)));
+    net.run();
+    assert_eq!(net.devs[2].m.asked(), Some((leaver, 1, SALT)), "its beacon or Pong hands it the request");
+}
+
+#[test]
+fn a_frame_reports_its_signer_and_address() {
+    let mut net = Net::new(2);
+    net.user(0, LEAVE);
+    let frame = build(&super::Frame::DepartReq { hp: HP, t: net.now + 1, intent: 1, salt: [7; 32] }, &net.devs[0].kp, net.now).unwrap();
+    let addr: core::net::SocketAddr = "192.0.2.7:4383".parse().unwrap();
+    let s = net.devs[1].m.step(Event::Frame { bytes: &frame, from: Some(addr) }, net.now);
+    assert!(s.actions.contains(&Action::Seen { device: net.key(0), addr }));
 }

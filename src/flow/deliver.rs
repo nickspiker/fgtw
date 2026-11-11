@@ -1,5 +1,6 @@
 //! Deliver one frame to every live member until each has it (owner 2026-11-10).
-//! A send the app gave up on is handed again at that device's next Pong, or when a network comes up; nothing is resent on a timer.
+//! A device that has not taken it is handed it again each time it shows it is reachable (a Pong, its beacon, a frame from it) or a network comes up; nothing is resent on a timer.
+//! A member never reached at all (no Sent comes back for it, or none maps to its key) is covered the same way: its first beacon or Pong hands it the frame.
 
 use alloc::vec::Vec;
 
@@ -42,7 +43,7 @@ impl Deliver {
         out.push(Action::Send { to: To::Device(k), frame: self.frame.clone() });
     }
 
-    /// A device that should have it, handed at the next [`Deliver::resume`], Pong or new network (a restart rebuilding the target list).
+    /// A device that should have it, handed at the next [`Deliver::resume`], reachable edge or new network (a restart rebuilding the target list).
     pub fn owe(&mut self, k: Key) {
         if !self.targets.iter().any(|(t, _)| *t == k) {
             self.targets.push((k, Hand::Again));
@@ -70,10 +71,10 @@ impl Deliver {
         }
     }
 
-    /// `from` is reachable again: hand it the frame if its last send gave up.
-    pub fn on_pong(&mut self, from: Key, out: &mut Vec<Action>) {
+    /// `from` showed it is reachable: hand it the frame unless it has taken it (a send with no word back counts as not taken; the receiver drops a copy it already has).
+    pub fn on_reachable(&mut self, from: Key, out: &mut Vec<Action>) {
         if let Some((_, h)) = self.targets.iter_mut().find(|(k, _)| *k == from) {
-            if *h == Hand::Again {
+            if *h != Hand::Took {
                 *h = Hand::Out;
                 out.push(Action::Send { to: To::Device(from), frame: self.frame.clone() });
             }

@@ -84,6 +84,8 @@ pub enum Note {
 pub enum Action {
     /// Send these bytes; the app reports [`Event::Sent`] when it knows whether they arrived.
     Send { to: To, frame: Vec<u8> },
+    /// A frame from `device` came from `addr`: the app may reach it there (it learns addresses from frames as well as beacons).
+    Seen { device: Key, addr: core::net::SocketAddr },
     /// Build and sign this frame ([`build`]) and answer [`Event::Built`] with the same `id`.
     Build { id: u32, frame: Frame },
     /// Run this job and answer with its event.
@@ -139,12 +141,12 @@ pub enum UserOp {
 pub enum Event<'a> {
     /// The fleet as folded now: every member (this device among them) and the locked ones. Sent at start and on every change.
     Members { members: &'a [Key], locked: &'a [Key] },
-    /// A frame arrived (the machine opens it and checks its signer).
-    Frame { bytes: &'a [u8] },
+    /// A frame arrived, from this address when the app knows it (the machine opens it, checks its signer, and reports the pair as [`Action::Seen`]).
+    Frame { bytes: &'a [u8], from: Option<core::net::SocketAddr> },
     /// A send finished: it arrived (`ok`) or the app gave up on it.
     Sent { to: Key, ok: bool },
-    /// A device answered a ping: a good moment to hand it what it missed.
-    Pong { from: Key },
+    /// A device showed it is reachable: it answered a ping, its beacon was heard, or a frame came from it. A good moment to hand it what it has not taken.
+    Reachable { from: Key },
     /// A network came up: hand again whatever did not arrive.
     LinkUp,
     /// The frame asked for with [`Action::Build`].
