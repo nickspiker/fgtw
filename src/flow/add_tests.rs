@@ -264,3 +264,95 @@ fn a_closed_page_never_asks_to_be_woken() {
     let s = rig.m.step(Event::Frame { bytes: &frame, from: None }, NOW);
     assert_eq!(s.wake, None, "requests held while the page is closed lapse lazily");
 }
+
+#[test]
+fn a_resume_before_the_fold_waits_for_the_members() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let dev = j.public.to_bytes();
+    rig.hear(&j, &request(&j, &[0; 32]));
+    rig.step(Event::User(UserOp::Touch { device: dev }));
+    rig.step(Event::User(UserOp::Yes));
+    rig.step(Event::Bound { device: dev, result: Ok(()) });
+    let doc = rig.m.to_vsf(NOW).unwrap();
+    rig.m = Add::from_vsf(&doc, HP, SEED, true).unwrap();
+    assert!(rig.m.resume().actions.is_empty(), "no grow to the newcomer alone");
+    rig.members.push(dev);
+    let (m, l) = (rig.members.clone(), rig.locked.clone());
+    let a = rig.step(Event::Members { members: &m, locked: &l });
+    let grow = a.iter().find_map(|x| match x {
+        Action::Job(Job::Grow { members, .. }) => Some(members.clone()),
+        _ => None,
+    });
+    assert!(grow.is_some_and(|g| g.contains(&rig.members[1]) && g.contains(&dev)), "the grow names the whole fold once it is known");
+}
+
+#[test]
+fn the_members_can_open_a_page_already_showing() {
+    let me = Keypair::from_seed(&[1; 32]);
+    let mut m = Add::new(HP, SEED, me.public.to_bytes(), true);
+    m.step(Event::FleetKey { held: true }, NOW);
+    assert!(m.step(Event::Page { shown: true }, NOW).actions.contains(&Action::Note(Note::AddNoFleetKey)), "the fold is not known yet");
+    let members = [me.public.to_bytes()];
+    let a = m.step(Event::Members { members: &members, locked: &[] }, NOW).actions;
+    assert!(a.contains(&Action::Radios { ble_scan: true, nfc_reader: true }));
+    assert_eq!(m.view().phase, Phase::Open);
+}
+
+#[test]
+fn a_wake_drops_a_device_no_longer_heard() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let r = request(&j, &[0; 32]);
+    rig.step(Event::Listed { reqs: core::slice::from_ref(&r), owned_elsewhere: &[] });
+    rig.step(Event::BeaconHeard { id: crate::pair::beacon_id(&HP, &j.public.to_bytes(), NOW) });
+    assert!(rig.m.view().rows[0].ble);
+    rig.m.step(Event::Wake { reason: Wake::Lapse }, NOW + super::add::NEARBY_OSC + 1);
+    assert!(!rig.m.view().rows[0].ble, "not heard for longer than the nearby window");
+}
+
+#[test]
+fn words_that_stop_matching_read_fgtw_org_once_until_they_match_again() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let r = request(&j, &[0; 32]);
+    rig.step(Event::Listed { reqs: core::slice::from_ref(&r), owned_elsewhere: &[] });
+    let first = crate::pair::pair_word_list(&crate::pair::masked_device_words(&j.public.to_bytes(), &SEED))[0].clone();
+    assert!(rig.step(Event::Words { text: "zzzz " }).contains(&Action::Job(Job::ListRequests)));
+    rig.step(Event::Listed { reqs: core::slice::from_ref(&r), owned_elsewhere: &[] });
+    assert!(!rig.step(Event::Words { text: "zzzz y " }).contains(&Action::Job(Job::ListRequests)), "still not matching: no second read");
+    rig.step(Event::Words { text: &first });
+    assert_eq!(rig.m.view().words, Some(super::add::WordState::One(j.public.to_bytes())));
+    assert!(rig.step(Event::Words { text: "zzzz " }).contains(&Action::Job(Job::ListRequests)), "matched in between: read again");
+}
+
+#[test]
+fn a_failed_read_keeps_the_rows_and_says_so() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let r = request(&j, &[0; 32]);
+    rig.step(Event::Listed { reqs: core::slice::from_ref(&r), owned_elsewhere: &[] });
+    rig.step(Event::User(UserOp::LookFarther));
+    let a = rig.step(Event::ListFailed { reason: "unreachable" });
+    assert!(has_note(&a, Note::ListFailed { reason: "unreachable".into() }));
+    assert_eq!(rig.m.view().rows.len(), 1);
+    assert!(!rig.m.view().listing);
+}
+
+#[test]
+fn the_view_names_the_device_being_added() {
+    let mut rig = Rig::new(1);
+    rig.open();
+    let j = joiner(0);
+    let dev = j.public.to_bytes();
+    rig.hear(&j, &request(&j, &[0; 32]));
+    rig.step(Event::User(UserOp::Touch { device: dev }));
+    rig.step(Event::User(UserOp::Yes));
+    let v = rig.m.view();
+    assert_eq!(v.phase, Phase::Binding);
+    assert_eq!(v.adding, Some((dev, crate::pair::device_name_default(&dev, &SEED))));
+}

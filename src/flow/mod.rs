@@ -114,6 +114,8 @@ pub enum Note {
     Added { device: Key },
     /// The add stopped.
     AddFailed { device: Key, reason: String },
+    /// fgtw.org's requests could not be read; the rows already shown stay.
+    ListFailed { reason: String },
 }
 
 /// What a machine asks the app to do.
@@ -231,6 +233,10 @@ pub enum Event<'a> {
     Grown { device: Key, result: Result<&'a [u8], &'a str> },
     /// The words typed so far on the add screen.
     Words { text: &'a str },
+    /// A deadline a step asked for ([`Step::wake`]) has come.
+    Wake { reason: Wake },
+    /// [`Job::ListRequests`] failed: the rows read before stay.
+    ListFailed { reason: &'a str },
     /// The person chose.
     User(UserOp),
 }

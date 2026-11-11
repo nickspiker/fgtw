@@ -41,6 +41,21 @@ pub struct Row {
     pub owned_elsewhere: bool,
 }
 
+/// Where the words typed so far stand, by device key (the candidate indexes stay inside the machine).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WordState {
+    /// No device to match against yet; the first bad word, if the spell-check found one.
+    NoCandidates { typo: Option<String> },
+    /// Nothing typed; how many devices are asking.
+    Nothing { asking: usize },
+    /// The words left every device at this word.
+    NoMatch(String),
+    /// Still matching exactly this device.
+    One(Key),
+    /// Still matching this many.
+    Many(usize),
+}
+
 /// What the add screen shows: the app turns it into its own page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
@@ -49,7 +64,9 @@ pub struct View {
     /// The picked device: its name and its masked words, to compare with its own screen.
     pub selected: Option<(Key, String, String)>,
     /// Where the words typed so far stand.
-    pub words: Option<WordMatch>,
+    pub words: Option<WordState>,
+    /// The device being added (Binding or Growing): its key and name.
+    pub adding: Option<(Key, String)>,
     pub contended: bool,
     /// fgtw.org's requests are being read.
     pub listing: bool,
@@ -97,7 +114,11 @@ pub struct Add {
     /// More than one device asked at once: only Bluetooth or NFC can add until an add finishes (P3).
     contended: bool,
     listing: bool,
-    words: Option<WordMatch>,
+    words: Option<WordState>,
+    /// The words stopped matching and fgtw.org was asked once; asked again only after they match something in between.
+    nomatch_asked: bool,
+    /// resume() came before the members: it runs when they arrive.
+    resume_pending: bool,
     selected: Option<Key>,
     select_build: Option<u32>,
     adding: Option<Adding>,
@@ -131,6 +152,8 @@ impl Add {
             contended: false,
             listing: false,
             words: None,
+            nomatch_asked: false,
+            resume_pending: false,
             selected: None,
             select_build: None,
             adding: None,
@@ -201,6 +224,16 @@ impl Add {
                 self.locked = locked.to_vec();
                 self.known = true;
                 self.rebuild(now);
+                // A resume that came before the fold runs now: a grow needs the members it names.
+                if self.resume_pending {
+                    self.resume_pending = false;
+                    let r = self.resume();
+                    s.actions.extend(r.actions);
+                }
+                // The fold can be what makes this device able to add: re-check the gate while the page shows.
+                if self.shown && !self.open && self.can_add() {
+                    self.page(true, now, &mut s);
+                }
             }
             Event::FleetKey { held } => {
                 self.key_held = held;
@@ -225,6 +258,11 @@ impl Add {
                     None => self.heard_lan.push((device, now)),
                 }
                 self.rebuild(now);
+            }
+            Event::Wake { reason: Wake::Lapse } => self.rebuild(now),
+            Event::ListFailed { reason } => {
+                self.listing = false;
+                s.push(Action::Note(Note::ListFailed { reason: reason.to_string() }));
             }
             Event::Listed { reqs, owned_elsewhere } => {
                 self.listing = false;
@@ -342,19 +380,31 @@ impl Add {
         }
         // While contended the network path is shut for words too: only a device heard over Bluetooth can be added by its words.
         let pool: Vec<Candidate> = if self.contended { self.cands.iter().filter(|c| c.heard_ble).cloned().collect() } else { self.cands.clone() };
-        let m = sponsor::match_words(text, &pool);
-        match &m {
+        let state = match sponsor::match_words(text, &pool) {
             WordMatch::Full(i) => {
-                let req = pool[*i].req.clone();
+                let req = pool[i].req.clone();
                 self.words = None;
                 self.add(req, s);
                 return;
             }
-            // Words that match no candidate may belong to a device only fgtw.org has heard: read its requests again (the person's edge, not a timer).
-            WordMatch::NoMatch(_) | WordMatch::NoCandidates { .. } => self.list(s),
-            _ => {}
+            WordMatch::NoMatch(w) => WordState::NoMatch(w),
+            WordMatch::NoCandidates { typo } => WordState::NoCandidates { typo },
+            WordMatch::Nothing { asking } => WordState::Nothing { asking },
+            WordMatch::One(i) => WordState::One(pool[i].req.device_pubkey),
+            WordMatch::Many(k) => WordState::Many(k),
+        };
+        match state {
+            // Words that match no device may belong to one only fgtw.org has heard: read its requests once when they stop matching, again only after they matched something in between (the person's edge, not every keystroke).
+            WordState::NoMatch(_) | WordState::NoCandidates { .. } => {
+                if !self.nomatch_asked {
+                    self.nomatch_asked = true;
+                    self.list(s);
+                }
+            }
+            WordState::One(_) | WordState::Many(_) => self.nomatch_asked = false,
+            WordState::Nothing { .. } => {}
         }
-        self.words = Some(m);
+        self.words = Some(state);
     }
 
     fn pick(&mut self, device: Key, s: &mut Step) {
@@ -519,12 +569,17 @@ impl Add {
             })
             .collect();
         let selected = self.selected.and_then(|d| self.cands.iter().find(|c| c.req.device_pubkey == d)).map(|c| (c.req.device_pubkey, c.name.clone(), crate::pair::masked_device_words(&c.req.device_pubkey, &self.seed)));
-        View { phase, rows, selected, words: self.words.clone(), contended: self.contended, listing: self.listing, last: self.last }
+        let adding = self.adding.as_ref().map(|a| (a.device, crate::pair::device_name_default(&a.device, &self.seed)));
+        View { phase, rows, selected, words: self.words.clone(), adding, contended: self.contended, listing: self.listing, last: self.last }
     }
 
     /// After a restart: carry on with an add the saved state holds. A grow is asked for again; a bind cut short goes on to its grow when the fold already lists the newcomer, and is reported to do again when it does not (the request itself is not saved). Tell the members first.
     pub fn resume(&mut self) -> Step {
         let mut s = Step::default();
+        if !self.known {
+            self.resume_pending = true;
+            return s;
+        }
         let Some(a) = self.adding.clone() else { return s };
         match a.step {
             Step2::Binding if a.req.is_none() => {
