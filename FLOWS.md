@@ -94,6 +94,31 @@ The network leftovers in Photon (`network/fgtw/`: held-chain statics, the fstate
 
 Photon's 16 fleet-frame dispatch arms in `network/status.rs` collapse onto one `fgtw::protocol::parse_fleet_frame -> FleetFrame`, and `STRANGER_SECTIONS` comes from fgtw.
 
+### Add (sponsor side): the design, for review before it is built
+
+One machine per device, `flow::add::Add`, built like Depart: events in, actions out, state as VSF without roots (the identity seed and the handle proof come back from the app on load).
+
+**What it holds:** the fold (members, locked), whether this device holds the fleet key, whether the Fleet page is shown, the requests heard on the LAN (`bind_req` frames, kept fresh by `sponsor::retain_fresh`), the requests read from fgtw.org (only after the person asked), the BLE beacon ids and LAN device keys heard, the candidates (`sponsor::candidates`), the contention latch (P3), the device picked, and the add under way: the request, and whether it is binding or growing.
+The add under way is saved, so a bind that landed before a restart still gets its key: on resume a Growing add asks for the grow again.
+
+**Events it takes:**
+- the Fleet page shown or gone: radios on (BLE scan, NFC reader) and the add flow open, or all off and the pick dropped;
+- a `bind_req` frame (checked with `sponsor::check_lan_request`, offered with `sponsor::offer_lan`), a BLE beacon id heard, an own-handle LAN beacon heard;
+- the person: touch a row, Yes, No, words typed (the text so far), "not nearby? look through fgtw.org";
+- an NFC tag secret read;
+- job answers: the registry list, the bind, the grow; the members and the fleet key's presence.
+
+**Rules it carries (owner, 2026-11-10):**
+- adding needs the Fleet page shown and the fleet key held; one add at a time;
+- an NFC match (`sponsor::nfc_match`) or a full typed-word match (`sponsor::match_words`) adds at once;
+- a touch on a pickable row selects: our chain (`PushChain`) and a signed `bind_select` (`Build`) go to that device, nothing is bound; Yes adds, No drops the pick;
+- contention shuts the network path: only BLE- or NFC-heard candidates stay pickable until an add finishes;
+- fgtw.org's registry is read only on the person's edges: "look through fgtw.org", and again when the words typed so far match no candidate (no timer);
+- the add: `Job::Bind` (the app runs `sponsor::bind_device_held`; a locked plate refuses there), then on its answer our chain goes to every member, the newcomer and our contacts (`PushChain`), and `Job::Grow { members }` with the members minus the locked ones (the machine names them, so no app can grow to a locked device), then the grown fan-out is built as a `fanout_resp` and delivered to the newcomer and every live member (`Deliver`);
+- the screen returns to the Fleet page the moment the add starts; "Adding", "Added" or the failure are notes, shown wherever the person is.
+
+**New pieces in `flow`:** `Frame::BindSelect`, `Frame::FanoutResp`; `Job::ListRequests`, `Job::Bind`, `Job::Grow`; `Action::Radios`; events for the page, beacons, the person's add choices and the job answers; notes for picked, adding, added, failed, contended, no fleet key.
+
 ## Stages
 
 Green at every step (MIGRATION.md's rule): Photon, the worker and ferros build, and the wire format does not change.
