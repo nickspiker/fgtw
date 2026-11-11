@@ -192,7 +192,11 @@ impl Depart {
                 }
                 UserOp::Approve => self.approve(&mut s),
                 UserOp::Deny => self.deny(&mut s),
+                // The add screen's choices belong to the Add machine.
+                _ => {}
             },
+            // The add flow's events belong to the Add machine.
+            _ => {}
         }
         s
     }
