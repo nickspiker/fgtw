@@ -175,6 +175,9 @@ pub mod binding;
 #[cfg(feature = "profile")]
 pub mod people;
 
+/// The devices a kist's alias vouches for (ferros docs/PHOTON.md M3): the alias-signed, revisioned device list a contact checks a kist's traffic against, and the cutover mark. no_std; signing behind `sign`.
+pub mod alias_devices;
+
 /// The words every TOKEN app shows for the fleet and the identity, written once in all sixteen languages, and the one language list (`text::Lang`). no_std, no alloc.
 #[cfg(feature = "text")]
 pub mod text;
