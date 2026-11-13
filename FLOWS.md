@@ -94,6 +94,22 @@ The network leftovers in Photon (`network/fgtw/`: held-chain statics, the fstate
 
 Photon's 16 fleet-frame dispatch arms in `network/status.rs` collapse onto one `fgtw::protocol::parse_fleet_frame -> FleetFrame`, and `STRANGER_SECTIONS` comes from fgtw.
 
+### Profile: the design, for review before it is built (owner go 2026-11-13)
+
+Names and avatars disappear today because nothing says which copy is newer: every holder keeps the last copy it heard, a pong answered by another device drops it, and an adopted avatar is re-stamped as new (photon `Claude memories/project_profile_pending.md`).
+
+**The record, `fgtw::profile::ProfileRecord`** (no_std + alloc): the identity (handle proof), the field (name, avatar pin; more later: contact details for the You page), the value, the revision (the Eagle time its owner set it, never re-stamped by anyone who carries it), the device that set it, and that device's eggs over all of it.
+A record verifies when its eggs verify and its device was a member of the identity's fold; the app supplies the fold check.
+Newest revision wins per (identity, field); a tie goes to the larger hash of the value, so every holder picks the same one.
+An empty value is a real value (a removed avatar), never "unknown".
+
+**Who carries it:** the record is self-verifying, so any holder may hand it on: the owner's devices, a friend's devices, a pong answered by any of the person's devices, the fleet roster, a group member record, the contacts backup.
+A device adopts only a newer record and passes a newer one on, once: to the identity's own devices when theirs is older, to anyone showing it as missing.
+A device with none asks the people and devices it knows (BLE, LAN, WAN, fgtw.org last) with a `profile_want`; any holder answers with its records.
+"Pending" then means no copy anywhere it asked.
+
+**Stages:** P1, the record and its merge in fgtw; Photon signs its own name and avatar pin as records, carries them in the pong tail (beside the old bare fields, which older peers still read), adopts only newer ones, keeps them through a pong answered by another device, and merges the roster per field by revision. P2, `profile_want` and the hand-on; friend avatars readable on every one of our devices, not only the one that ran CLUTCH; group member names re-signed on change. P3, the You page's other fields, shared with ferros.
+
 ### Add (sponsor side): the design, for review before it is built
 
 One machine per device, `flow::add::Add`, built like Depart: events in, actions out, state as VSF without roots (the identity seed and the handle proof come back from the app on load).
