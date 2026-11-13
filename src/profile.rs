@@ -16,6 +16,9 @@ use crate::pq::{eggs_from_bytes, eggs_to_bytes, FleetSigner};
 /// A device or identity key.
 pub type Key = [u8; 32];
 
+/// The wrapped-value marker a record rides under when it is one value inside another document (a pong tail, a contact document, a settings value): VSF's application range, `P` for profile.
+pub const WRAP: u8 = b'P';
+
 /// Which profile field a record carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Field {
@@ -164,6 +167,30 @@ impl ProfileRecord {
         };
         Ok(ProfileRecord { subject, field, value, rev, device, sig })
     }
+
+    /// The record as one VSF value, its section's bytes wrapped under [`WRAP`], so it rides a field of another document (a pong tail, a contact document, a settings value) and is read back by its marker, never by position.
+    /// The section is in its self-describing form (name, count and length before the fields), since no header's table of contents names it.
+    pub fn to_value(&self) -> VsfType {
+        VsfType::v(WRAP, self.to_section().encode_far())
+    }
+
+    /// Read a record back from [`ProfileRecord::to_value`]'s form; any other value, or a field this build does not know, is an error the caller skips.
+    pub fn from_value(v: &VsfType) -> Result<Self, String> {
+        match v {
+            VsfType::v(WRAP, bytes) => {
+                let mut ptr = 0;
+                let sec = VsfSection::parse(bytes, &mut ptr)?;
+                Self::from_section(&sec)
+            }
+            _ => Err("not a wrapped profile record".to_string()),
+        }
+    }
+}
+
+/// Verify a record and offer it to a held set, the one step every carrier takes: None when it does not verify (it is never held), else what merging did.
+/// `member` is the app's fold check, as in [`ProfileRecord::verify`].
+pub fn accept(held: &mut Vec<ProfileRecord>, rec: ProfileRecord, member: impl Fn(&Key, &Key, i64) -> bool) -> Option<Merged> {
+    rec.verify(member).then(|| merge(held, rec))
 }
 
 /// Offer a verified record to a held set: adopted when it is the first or newer than what is held for its (identity, field). The caller verifies first.
@@ -246,5 +273,40 @@ mod tests {
             }
             assert_eq!(ProfileRecord::from_section(&sec).unwrap(), rec);
         }
+    }
+
+    #[test]
+    fn a_record_rides_as_one_wrapped_value_and_nothing_else_reads_as_one() {
+        let kp = Keypair::from_seed(&[1; 32]);
+        for rec in [
+            ProfileRecord::sign(&kp, &HP, Field::Name, "Zoë".as_bytes().to_vec(), 5),
+            ProfileRecord::sign(&kp, &HP, Field::AvatarPin, vec![7; 64], 6),
+            ProfileRecord::sign(&kp, &HP, Field::AvatarPin, Vec::new(), 7),
+        ] {
+            let v = rec.to_value();
+            assert!(matches!(&v, VsfType::v(WRAP, b) if !b.is_empty()));
+            let back = ProfileRecord::from_value(&v).unwrap();
+            assert_eq!(back, rec);
+            assert!(back.verify(member_of(kp.public.to_bytes())));
+            let flat = v.flatten();
+            let mut ptr = 0;
+            assert_eq!(ProfileRecord::from_value(&vsf::decoding::parse::parse(&flat, &mut ptr).unwrap()).unwrap(), rec, "the value survives its own wire form");
+        }
+        assert!(ProfileRecord::from_value(&VsfType::v(b'r', vec![1, 2, 3])).is_err());
+        assert!(ProfileRecord::from_value(&VsfType::x("Bloom".to_string())).is_err());
+    }
+
+    #[test]
+    fn accept_holds_only_what_verifies() {
+        let kp = Keypair::from_seed(&[1; 32]);
+        let me = kp.public.to_bytes();
+        let stranger = Keypair::from_seed(&[2; 32]);
+        let mut held = Vec::new();
+        let forged = ProfileRecord::sign(&stranger, &HP, Field::Name, b"Weed".to_vec(), 900);
+        assert_eq!(accept(&mut held, forged, member_of(me)), None);
+        assert!(held.is_empty(), "a record from a device outside the fold is never held");
+        let rec = ProfileRecord::sign(&kp, &HP, Field::Name, b"Bloom".to_vec(), 100);
+        assert_eq!(accept(&mut held, rec.clone(), member_of(me)), Some(Merged::Adopted));
+        assert_eq!(accept(&mut held, rec, member_of(me)), Some(Merged::Kept));
     }
 }
