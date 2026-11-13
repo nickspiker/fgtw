@@ -33,6 +33,8 @@ protocol = ["fanout", "sign"]
 sign = ["dep:fn-dsa", "dep:rand", "rand/std_rng", "dep:rand_chacha"]
 # `client` also pulls the PQ SIGNING halves (`fn-dsa` keygen+sign, fips205's RNG). Base carries only the verify-only crates, so the worker can check a three-egg chain without ever holding a signing key or an RNG.
 client = ["std", "protocol", "fips205/default-rng", "vsf/text-encode"]
+# `profile` is the signed, revisioned profile records (src/profile.rs). A name is VSF text (`x`), so without std it needs a vsf text codec: this turns on the smallest (`x-compact`, the 712 short codes); a build that wants every character also enables `vsf/x-full`, and the widest one enabled is used. With no codec at all a name would flatten to an empty field.
+profile = ["protocol", "vsf/x-compact"]
 # `flow` is the fleet flows as UI-free machines (FLOWS.md): events in, actions out, no I/O, no clock, no timers; no_std + alloc, on top of `protocol`.
 flow = ["protocol"]
 # `text` is the fleet and identity words in all sixteen languages and the one language list (src/text.rs), shared by Photon and ferros. No deps of its own.

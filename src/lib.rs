@@ -106,6 +106,10 @@ pub mod held;
 #[cfg(feature = "protocol")]
 pub mod sponsor;
 
+/// A person's profile fields as records its owner signs, newest revision winning (FLOWS.md, "Profile").
+#[cfg(feature = "profile")]
+pub mod profile;
+
 /// The fleet flows as machines (FLOWS.md): a device leaving, written once for every TOKEN app; each app carries out the actions with its own radios, vault and screen.
 #[cfg(feature = "flow")]
 pub mod flow;
