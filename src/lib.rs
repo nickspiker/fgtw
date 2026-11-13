@@ -162,6 +162,12 @@ pub mod scoped_blob;
 /// The person's identity space: their facts across their fleet (kists, answers, the home screen's arrangement), merged by a total order, sealed under the fleet key, reconciled with a device's own copy. no_std; the seal behind `fanout`.
 pub mod space;
 
+/// A kist's alias (ferros docs/FACETS.md): the one derivation of a kist's per-person seed from the person key and the kist's identity, and the keys a kist makes from it. no_std, BLAKE3 only; the bundle behind `sign`.
+pub mod alias;
+
+/// The person key (ferros docs/FACETS.md D0): minted from several eggs, kept as a fact of the person's space sealed under the fleet key, re-sealed and never rotated at a shrink. no_std; the seal behind `fanout`.
+pub mod person;
+
 /// The words every TOKEN app shows for the fleet and the identity, written once in all sixteen languages, and the one language list (`text::Lang`). no_std, no alloc.
 #[cfg(feature = "text")]
 pub mod text;
