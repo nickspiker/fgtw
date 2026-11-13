@@ -154,14 +154,19 @@ pub fn possession_bytes(alias: &KeyBundle) -> Vec<u8> {
     m
 }
 
-/// The alias's eggs over [`possession_bytes`], with every scheme its bundle has (the kist signs these with its alias's `SigningBundle`).
-pub fn possession(signer: &(impl FleetSigner + ?Sized), alias: &KeyBundle) -> Vec<u8> {
-    eggs_to_bytes(&signer.eggs(&possession_bytes(alias), alias.mask()))
+/// The schemes a possession proof carries: the envelope tier (Ed25519 and Falcon-512), so the bundle and its eggs fit one ferros call (4096 bytes; SPHINCS+ alone is 7856). The binding itself is signed by the fleet member with every egg; this only shows the asker holds the alias it names, whose Ed25519 key the kernel also stamps on ferros.
+pub fn possession_mask(alias: &KeyBundle) -> scheme::Mask {
+    alias.mask() & crate::pq::ENVELOPE_TIER
 }
 
-/// Whether `eggs` (an egg list) show the holder of `alias` signed for it, with every scheme the bundle has.
+/// The alias's eggs over [`possession_bytes`], at [`possession_mask`] (the kist signs these with its alias's `SigningBundle`).
+pub fn possession(signer: &(impl FleetSigner + ?Sized), alias: &KeyBundle) -> Vec<u8> {
+    eggs_to_bytes(&signer.eggs(&possession_bytes(alias), possession_mask(alias)))
+}
+
+/// Whether `eggs` (an egg list) show the holder of `alias` signed for it, at [`possession_mask`].
 pub fn holds(alias: &KeyBundle, eggs: &[u8]) -> bool {
-    eggs_from_bytes(eggs).is_ok_and(|e| verify_eggs(&e, alias, &possession_bytes(alias), alias.mask()))
+    eggs_from_bytes(eggs).is_ok_and(|e| verify_eggs(&e, alias, &possession_bytes(alias), possession_mask(alias)))
 }
 
 #[cfg(all(test, feature = "sign"))]
@@ -275,6 +280,8 @@ mod tests {
         let (s, alias) = alias();
         let eggs = possession(&s, &alias);
         assert!(holds(&alias, &eggs));
+        // The request a kist sends on ferros (op 0: a byte, the bundle's length, the bundle, the eggs) fits one call of 4096 bytes.
+        assert!(3 + alias.to_bytes().len() + eggs.len() <= 4096, "{} bytes", 3 + alias.to_bytes().len() + eggs.len());
         assert!(!holds(&alias_other(), &eggs), "eggs for one alias do not hold another");
         let other = crate::alias::bundle(&crate::alias::seed(&[8; 32], &DEV, &OPT));
         assert!(!holds(&alias, &possession(&other, &alias)), "a key that is not the alias cannot sign for it");
