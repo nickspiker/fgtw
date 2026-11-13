@@ -168,6 +168,13 @@ pub mod alias;
 /// The person key (ferros docs/FACETS.md D0): minted from several eggs, kept as a fact of the person's space sealed under the fleet key, re-sealed and never rotated at a shrink. no_std; the seal behind `fanout`.
 pub mod person;
 
+/// Be you (ferros docs/FACETS.md "Be you"): the binding, "this alias speaks for this handle proof in this kist", signed by a member of the person's fleet with every egg, and its check against a folded chain. no_std.
+pub mod binding;
+
+/// The person's people (ferros docs/FACETS.md "People"): a person as the identity space keeps them (the pin-set and the name given them), and the document a kist granted `people` is handed. A name is VSF text (`x`), so behind `profile`, which brings a text codec without std.
+#[cfg(feature = "profile")]
+pub mod people;
+
 /// The words every TOKEN app shows for the fleet and the identity, written once in all sixteen languages, and the one language list (`text::Lang`). no_std, no alloc.
 #[cfg(feature = "text")]
 pub mod text;
