@@ -122,6 +122,63 @@ impl DeviceList {
     }
 }
 
+/// The wrap a list rides under inside another document (the slot document, a pong tail), read back by its marker.
+pub const WRAP: u8 = b'D';
+/// The wrap the binding that names the alias rides under in the slot document.
+pub const BINDING_WRAP: u8 = b'B';
+/// The slot document's section.
+const SLOT_SECTION: &str = "alias_devices_slot";
+/// A slot document past this is refused before it is parsed: a binding (about 10 KB with every egg) and a list of 32-byte keys.
+const SLOT_BYTES_MAX: usize = 1 << 16;
+
+/// The list and the binding that names its alias, as one complete VSF file: what fgtw.org's `alias_devices` slot holds and every Photon fetches and checks.
+pub fn slot_doc(binding: &[u8], list: &DeviceList, now: i64) -> Result<Vec<u8>, String> {
+    let mut sec = VsfSection::new(SLOT_SECTION);
+    sec.add_field("binding", VsfType::v(BINDING_WRAP, binding.to_vec()));
+    sec.add_field("list", VsfType::v(WRAP, list.to_section().encode_far()));
+    vsf::VsfBuilder::new().creation_time_oscillations(now).add_section_direct(sec).build().map_err(|e| format!("alias devices slot: {e}"))
+}
+
+/// Read a slot document back: the file must verify before a field is read; each field is taken by its marker. Only the form is checked here; [`check`] decides whether the list is the person's.
+pub fn from_slot_doc(bytes: &[u8]) -> Result<(Vec<u8>, DeviceList), String> {
+    // WHY/PROOF: the document comes from fgtw.org or another device; the parse runs over whatever length it claims.
+    if bytes.len() > SLOT_BYTES_MAX {
+        return Err(format!("alias devices slot: {} bytes is past the {SLOT_BYTES_MAX} it may be", bytes.len()));
+    }
+    let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| format!("alias devices slot verification: {e}"))?;
+    let sec = header.primary_section(bytes, end).map_err(|e| format!("alias devices slot section: {e}"))?;
+    if sec.name != SLOT_SECTION {
+        return Err("not an alias devices slot".to_string());
+    }
+    let first = |name: &str| sec.get_field(name).and_then(|f| f.values.first());
+    let binding = match first("binding") {
+        Some(VsfType::v(BINDING_WRAP, b)) => b.clone(),
+        _ => return Err("alias devices slot: no binding".to_string()),
+    };
+    let list = match first("list") {
+        Some(VsfType::v(WRAP, b)) => {
+            let mut ptr = 0;
+            DeviceList::from_section(&VsfSection::parse(b, &mut ptr)?)?
+        }
+        _ => return Err("alias devices slot: no list".to_string()),
+    };
+    Ok((binding, list))
+}
+
+/// Whether a list is the person's: the binding is taken against the person's chain (a current member signed it with every egg), names the list's person, and the alias it names signed the list with every egg its bundle holds.
+/// Returns the binding, so a caller keeps the alias it names beside the pin.
+pub fn check(binding: &[u8], list: &DeviceList, chain: &crate::fleet::MembershipBlob) -> Result<crate::binding::Binding, String> {
+    let b = crate::binding::Binding::from_vsf_bytes(binding)?;
+    b.verify(chain).map_err(|e| format!("alias devices: the binding does not hold ({e:?})"))?;
+    if b.handle_proof != list.handle_proof {
+        return Err("alias devices: the list names another person than its binding".to_string());
+    }
+    if !list.verify(&b.alias) {
+        return Err("alias devices: the alias did not sign this list".to_string());
+    }
+    Ok(b)
+}
+
 #[cfg(all(test, feature = "sign"))]
 mod tests {
     use super::*;
@@ -164,5 +221,25 @@ mod tests {
             }
             assert_eq!(DeviceList::from_section(&sec).unwrap(), l);
         }
+    }
+
+    #[test]
+    fn the_slot_holds_a_list_its_binding_vouches_for() {
+        use crate::fleet::MembershipBlob;
+        let member = crate::pq::SigningBundle::derive(b"device a");
+        let mut chain = MembershipBlob::genesis_v2(&member, HP, &[7; 32], 1_000);
+        chain.declare(&member, 1_001);
+        let a = alias();
+        let mask = chain.declared_mask(&member.keypair().public.to_bytes());
+        let binding = crate::binding::Binding::sign(&member, mask, &HP, &[2; 32], &[3; 32], a.bundle().unwrap(), 2_000).to_vsf_bytes().unwrap();
+        let list = DeviceList::sign(&a, &HP, 2_001, vec![member.keypair().public.to_bytes(), [0x8a; 32]], false);
+        let doc = slot_doc(&binding, &list, 2_002).unwrap();
+        let (b, l) = from_slot_doc(&doc).unwrap();
+        assert_eq!(l, list);
+        assert!(check(&b, &l, &chain).is_ok(), "a member vouches for the alias, the alias for the list");
+        let other = DeviceList::sign(&crate::alias::bundle(&crate::alias::seed(&[7; 32], &[2; 32], &[3; 32])), &HP, 2_001, vec![[0x8a; 32]], false);
+        assert!(check(&b, &other, &chain).is_err(), "a list another alias signed is not this binding's");
+        let stranger = MembershipBlob::genesis_v2(&crate::pq::SigningBundle::derive(b"device b"), HP, &[7; 32], 1_000);
+        assert!(check(&b, &l, &stranger).is_err(), "a binding by a device outside the chain is refused");
     }
 }
