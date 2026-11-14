@@ -187,7 +187,8 @@ pub struct Settle {
 ///
 /// - The space's key opens under `fleet_key`: [`Settled::Opened`], nothing written.
 /// - It does not open here ([`Found::Elsewhere`]): when `held` is that key (its id and mint stamp), it is sealed again under `fleet_key` ([`Settled::Resealed`]); else [`Settled::WaitingElsewhere`], and never a mint over it.
-/// - The space has none ([`Found::None`]): `eggs` is called, once and only here, for the independent sources' bytes (each its own source; the caller returns an empty list, or an empty egg, for a source that failed, never fewer sources quietly); a key is minted from them ([`mint`], at least two), stamped `now`, written, and returned as [`Settled::Minted`]; too few eggs is [`Settled::NoEgg`]; the eggs are wiped here either way.
+/// - The space has none ([`Found::None`]) but `held` is a key: it is written back with its own mint stamp ([`Settled::Resealed`]), never a new one minted over it.
+/// - The space has none and nothing is held: `eggs` is called, once and only here, for the independent sources' bytes (each its own source; the caller returns an empty list, or an empty egg, for a source that failed, never fewer sources quietly); a key is minted from them ([`mint`], at least two), stamped `now`, written, and returned as [`Settled::Minted`]; too few eggs is [`Settled::NoEgg`]; the eggs are wiped here either way.
 /// - Two devices minting at once (neither had heard the other's): both facts travel, and at the next settle after they meet, every device opens the first minted (the earliest stamp, then the smaller id) and the other drops its own.
 ///
 /// `held` is the key this device holds and its mint stamp, `by` this device's key, `now` the Eagle time (the mint stamp and the write's).
@@ -204,6 +205,12 @@ pub fn settle(space: &mut Space, handle_proof: &[u8; 32], fleet_key: &[u8; 32], 
             }
             _ => Ok(Settle { what: Settled::WaitingElsewhere { id: fid, minted }, changed: false }),
         },
+        // The space has none but this device holds one: written back with its own mint stamp, never a new key minted over it, which would change every alias the person has (ferros and the Photon session, 2026-11-14).
+        Found::None if held.is_some() => {
+            let (k, m) = held.unwrap();
+            let changed = put(space, k, m, handle_proof, fleet_key, by, now)?;
+            Ok(Settle { what: Settled::Resealed { id: id(k), minted: m }, changed })
+        }
         Found::None => {
             let mut e = eggs();
             let list: Vec<&[u8]> = e.iter().map(|x| x.as_slice()).collect();
@@ -339,6 +346,20 @@ mod tests {
         assert_eq!(s, before);
         // A device holding nothing yet opens it the same.
         let r = settle(&mut s, &HP, &FK, None, no_eggs_wanted, 300, &SIB).unwrap();
+        assert_eq!(r.what, Settled::Opened { key, id: id(&key), minted: 100 });
+    }
+
+    #[cfg(feature = "fanout")]
+    #[test]
+    fn settle_writes_a_held_key_back_and_never_mints_over_it() {
+        // A space with no key while this device holds one: the held key goes back, with its own stamp, and no eggs are asked for.
+        let mut held_in = Space::new();
+        let r = settle(&mut held_in, &HP, &FK, None, eggs(1), 100, &ME).unwrap();
+        let Settled::Minted { key, .. } = r.what else { panic!("{r:?}") };
+        let mut s = Space::new();
+        let r = settle(&mut s, &HP, &FK, Some((&key, 100)), no_eggs_wanted, 500, &ME).unwrap();
+        assert_eq!(r, Settle { what: Settled::Resealed { id: id(&key), minted: 100 }, changed: true });
+        let r = settle(&mut s, &HP, &FK, None, no_eggs_wanted, 600, &SIB).unwrap();
         assert_eq!(r.what, Settled::Opened { key, id: id(&key), minted: 100 });
     }
 
