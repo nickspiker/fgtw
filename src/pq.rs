@@ -155,8 +155,9 @@ pub fn verify_egg(scheme_tag: u8, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool
             use fips205::traits::{SerDes, Verifier};
             let Ok(pk): Result<[u8; 32], _> = pubkey.try_into() else { return false };
             let Ok(vk) = PublicKey::try_from_bytes(&pk) else { return false };
-            let Ok(sig_arr): Result<[u8; SIG_LEN], _> = sig.try_into() else { return false };
-            vk.verify(msg, &sig_arr, &[])
+            // Borrowed, never copied: a 7.8 KiB array by value sat in this frame on every verify (2026-11-14 stack budget).
+            let Ok(sig_arr): Result<&[u8; SIG_LEN], _> = sig.try_into() else { return false };
+            vk.verify(msg, sig_arr, &[])
         }
         _ => false,
     }
@@ -274,6 +275,7 @@ pub use signing::{epoch_bundle, SigningBundle};
 mod signing {
     use super::{scheme, Egg, FleetSigner, KeyBundle};
     use crate::keys::Keypair;
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
     // ChaCha12Rng by name, never `rand::StdRng` (security audit FGTW-09): StdRng is free to change algorithm between rand versions, and every device key and re-signed egg below is a function of this stream.
     // rand 0.8's StdRng IS this generator, so the switch re-derived nothing; `keygen_kat` holds the answers.
@@ -317,24 +319,8 @@ mod signing {
 
         /// The post-quantum halves beside `ed`, each keygen fed a `ChaCha12Rng` seeded from `seed_for` under its own domain.
         fn with_pq(ed: Keypair, seed_for: impl Fn(&str) -> [u8; 32], falcon_domain: &str, sphincs_domain: &str) -> Self {
-            let (falcon_sk, falcon_vk) = {
-                use fn_dsa::{sign_key_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard, FN_DSA_LOGN_512};
-                let mut rng = ChaCha12Rng::from_seed(seed_for(falcon_domain));
-                let mut sk = vec![0u8; sign_key_size(FN_DSA_LOGN_512)];
-                let mut vk = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
-                KeyPairGeneratorStandard::default().keygen(FN_DSA_LOGN_512, &mut rng, &mut sk, &mut vk);
-                (sk, vk)
-            };
-
-            let (sphincs_pk, sphincs_sk) = {
-                use fips205::slh_dsa_sha2_128s;
-                use fips205::traits::SerDes;
-                let mut rng = ChaCha12Rng::from_seed(seed_for(sphincs_domain));
-                // Keygen from a caller-seeded CSPRNG is deterministic by construction; the only failure mode is an internal invariant, which is a bug rather than a runtime condition.
-                let (pk, sk) = slh_dsa_sha2_128s::try_keygen_with_rng(&mut rng).expect("slh-dsa keygen from a seeded rng");
-                (pk.into_bytes(), sk.into_bytes())
-            };
-
+            let (falcon_sk, falcon_vk) = falcon_keygen(seed_for(falcon_domain));
+            let (sphincs_pk, sphincs_sk) = sphincs_keygen(seed_for(sphincs_domain));
             Self { ed, falcon_sk, falcon_vk, sphincs_sk, sphincs_pk }
         }
 
@@ -358,6 +344,66 @@ mod signing {
         SigningBundle::derive(&blake3::derive_key("PHOTON_FLEET_EPOCH_SIGNING_v1", fleet_key))
     }
 
+    // Stack budget (2026-11-14): signing overflowed a 256 KiB thread on ferros, because `eggs` held a decoded Falcon key by value (a 116 KiB `SigningKeyStandard`, moved once out of its `Option`) and every scheme's locals shared one frame.
+    // Each scheme now keygens and signs in a frame of its own, the Falcon key and generator live in a Box, and both are the degree-512 types: the same code at the same degree, with scratch sized for 512 alone, so every key and egg is the one it always was (`keygen_kat`).
+    // `stack_budget` holds every path to a 256 KiB thread.
+
+    /// Falcon-512 keygen from its seed; the generator's scratch is on the heap.
+    #[inline(never)]
+    fn falcon_keygen(seed: [u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        use fn_dsa::{sign_key_size, vrfy_key_size, KeyPairGenerator, KeyPairGenerator512, FN_DSA_LOGN_512};
+        let mut rng = ChaCha12Rng::from_seed(seed);
+        let mut sk = vec![0u8; sign_key_size(FN_DSA_LOGN_512)];
+        let mut vk = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
+        let mut kg = Box::<KeyPairGenerator512>::default();
+        kg.keygen(FN_DSA_LOGN_512, &mut rng, &mut sk, &mut vk);
+        (sk, vk)
+    }
+
+    /// SLH-DSA-SHA2-128s keygen from its seed, as `(public, secret)`.
+    #[inline(never)]
+    fn sphincs_keygen(seed: [u8; 32]) -> ([u8; fips205::slh_dsa_sha2_128s::PK_LEN], [u8; fips205::slh_dsa_sha2_128s::SK_LEN]) {
+        use fips205::slh_dsa_sha2_128s;
+        use fips205::traits::SerDes;
+        let mut rng = ChaCha12Rng::from_seed(seed);
+        // Keygen from a caller-seeded CSPRNG is deterministic by construction; the only failure mode is an internal invariant, which is a bug rather than a runtime condition.
+        let (pk, sk) = slh_dsa_sha2_128s::try_keygen_with_rng(&mut rng).expect("slh-dsa keygen from a seeded rng");
+        (pk.into_bytes(), sk.into_bytes())
+    }
+
+    /// The Falcon-512 egg over `msg`.
+    /// Falcon signing is randomised; its RNG is seeded from the secret and the message so a given (key, message) always produces the same egg.
+    /// Deterministic output is what makes a re-signed op byte-identical, and it removes the RNG as an input an attacker could influence.
+    #[inline(never)]
+    fn falcon_egg(falcon_sk: &[u8], msg: &[u8]) -> Egg {
+        use fn_dsa::{signature_size, SigningKey, SigningKey512, DOMAIN_NONE, HASH_ID_RAW};
+        let mut h = blake3::Hasher::new_derive_key("PHOTON_FALCON512_SIGN_NONCE_v1");
+        h.update(falcon_sk);
+        h.update(msg);
+        let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
+        // The key and its signing scratch are 58 KiB, and fn-dsa's `decode` returns them by value: one copy in its frame and one in ours while it decodes (about 119 KiB, the floor its API allows), then the key signs from the heap.
+        let mut slot = Box::new(SigningKey512::decode(falcon_sk));
+        let sk = Option::as_mut(&mut *slot).expect("stored falcon key decodes");
+        let mut sig = vec![0u8; signature_size(sk.get_logn())];
+        sk.sign(&mut rng, &DOMAIN_NONE, &HASH_ID_RAW, msg, &mut sig);
+        Egg { scheme: scheme::FALCON512, sig }
+    }
+
+    /// The SLH-DSA egg over `msg`.
+    /// Hedged signing guards against fault attacks, and seeding the hedge from (secret, message) keeps the egg deterministic.
+    #[inline(never)]
+    fn sphincs_egg(sphincs_sk: &[u8; fips205::slh_dsa_sha2_128s::SK_LEN], msg: &[u8]) -> Egg {
+        use fips205::slh_dsa_sha2_128s::PrivateKey;
+        use fips205::traits::{SerDes, Signer};
+        let mut h = blake3::Hasher::new_derive_key("PHOTON_SPHINCS_PLUS_SIGN_NONCE_v1");
+        h.update(sphincs_sk);
+        h.update(msg);
+        let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
+        let sk = PrivateKey::try_from_bytes(sphincs_sk).expect("stored slh-dsa key decodes");
+        let sig = sk.try_sign_with_rng(&mut rng, msg, &[], true).expect("slh-dsa sign");
+        Egg { scheme: scheme::SPHINCS_PLUS, sig: sig.to_vec() }
+    }
+
     impl FleetSigner for SigningBundle {
         fn keypair(&self) -> &Keypair {
             &self.ed
@@ -367,35 +413,11 @@ mod signing {
             let mut out = self.ed.eggs(msg, schemes);
 
             if scheme::covers(schemes, 1 << scheme::FALCON512) {
-            // Falcon signing is randomised; seed its RNG from the secret and the message so a given (key, message) always produces the same egg. Deterministic output is what makes a re-signed op byte-identical, and it removes the RNG as an input an attacker could influence.
-            {
-                use fn_dsa::{signature_size, SigningKey, SigningKeyStandard, DOMAIN_NONE, HASH_ID_RAW};
-                let mut h = blake3::Hasher::new_derive_key("PHOTON_FALCON512_SIGN_NONCE_v1");
-                h.update(&self.falcon_sk);
-                h.update(msg);
-                let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
-                let mut sk = SigningKeyStandard::decode(&self.falcon_sk).expect("stored falcon key decodes");
-                let mut sig = vec![0u8; signature_size(sk.get_logn())];
-                sk.sign(&mut rng, &DOMAIN_NONE, &HASH_ID_RAW, msg, &mut sig);
-                out.push(Egg { scheme: scheme::FALCON512, sig });
+                out.push(falcon_egg(&self.falcon_sk, msg));
             }
-            }
-
             if scheme::covers(schemes, 1 << scheme::SPHINCS_PLUS) {
-            // SPHINCS+ hedged signing likewise: hedging guards against fault attacks, and seeding it from (secret, message) keeps the egg deterministic.
-            {
-                use fips205::slh_dsa_sha2_128s::PrivateKey;
-                use fips205::traits::{SerDes, Signer};
-                let mut h = blake3::Hasher::new_derive_key("PHOTON_SPHINCS_PLUS_SIGN_NONCE_v1");
-                h.update(&self.sphincs_sk);
-                h.update(msg);
-                let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
-                let sk = PrivateKey::try_from_bytes(&self.sphincs_sk).expect("stored slh-dsa key decodes");
-                let sig = sk.try_sign_with_rng(&mut rng, msg, &[], true).expect("slh-dsa sign");
-                out.push(Egg { scheme: scheme::SPHINCS_PLUS, sig: sig.to_vec() });
+                out.push(sphincs_egg(&self.sphincs_sk, msg));
             }
-            }
-
             out
         }
 
@@ -533,6 +555,129 @@ mod keygen_kat {
         assert_eq!(public, "aac436f660830fad323dce0c4c1d91c14ecd34ca8ff7209f640b8e5508503b9f");
         assert_eq!(eggs, "ce0f4d84604358c3da0172351b44c50ae1a1ea770c9e0eff39a258912c678247");
         assert_eq!(epoch, "c37ad6f7d3860a4afa334fd8f163f0e8751e16171636f2fdf6b24cf37d04e130");
+    }
+
+    /// Each scheme's egg on its own, and the release and developer bundles, recorded from the build before the stack budget change (2026-11-14: `SigningKeyStandard` held by value in one frame).
+    /// The degree-512 key and generator types and the boxed scratch must sign every byte the same.
+    #[test]
+    fn each_egg_and_every_constructor_match_the_recorded_answers() {
+        const MSG: &[u8] = b"FGTW-09 known answer";
+        const FALCON: scheme::Mask = (1 << scheme::ED25519) | (1 << scheme::FALCON512);
+        const SPHINCS: scheme::Mask = (1 << scheme::ED25519) | (1 << scheme::SPHINCS_PLUS);
+        let answers = |b: &SigningBundle| -> [String; 4] {
+            let eggs = |mask| hex(blake3::hash(&eggs_to_bytes(&b.eggs(MSG, mask))).as_bytes());
+            [hex(blake3::hash(&b.public().to_bytes()).as_bytes()), eggs(FALCON), eggs(SPHINCS), eggs(scheme::MASK_ALL)]
+        };
+        assert_eq!(
+            answers(&SigningBundle::derive(&[0x5a; 32])),
+            [
+                "aac436f660830fad323dce0c4c1d91c14ecd34ca8ff7209f640b8e5508503b9f",
+                "0de75e15a8b94fa5328cd124ec13ce322c520ddd77026336ba614151ddca8753",
+                "7bf58acdf3a989eeeeb6aed8698cd7188c4cf01f376c677cd72e3709bd0e1707",
+                "ce0f4d84604358c3da0172351b44c50ae1a1ea770c9e0eff39a258912c678247",
+            ]
+        );
+        assert_eq!(
+            answers(&SigningBundle::release(&[0x11; 32])),
+            [
+                "a59066f5a063452dfb78ce31c2122d950426637e4b36e76061b6facd3e058e07",
+                "e9d054c02aec0fbfbbc779e9678f7b544f025ec2788c8731c2f4ea6ff41e3288",
+                "5bf8ccec33ae8c1288cd213e89a1050625973e2e110e6456862f9c898689996e",
+                "99e967327c322a420e6d593d2d814076b40bb8d7776e057128640c66883cad83",
+            ]
+        );
+        assert_eq!(
+            answers(&SigningBundle::developer(&[0x22; 32], "FERROS_DEVELOPER_KAT")),
+            [
+                "94b5d80afa6ed2446b6483027b94fc8c1c9fab887593c0bd826f68e326ac301d",
+                "9b8ef100c75bbec54e7fdb71023f13c022493bd0a36d04b358a02d7f21b29a56",
+                "dea7dce1487604fba2095cbb7317e3d93050a17840bf83837057b467e3fde4e0",
+                "e739039c2a518e8fe96faed30e75b75d09fb56d2bf7733a3bfa59db5fcfd14e6",
+            ]
+        );
+        assert_eq!(
+            answers(&epoch_bundle(&[0xa5; 32])),
+            [
+                "c37ad6f7d3860a4afa334fd8f163f0e8751e16171636f2fdf6b24cf37d04e130",
+                "8912c15ef75b1402cd4cb185d5d75c9ac65a20d1d5a388e392ca76c47a95b108",
+                "a75e4bbbfadaae379c509f8f004cb6b7884602d98e72e9038833ff8568eeba10",
+                "d1b77cfbeb8ec23b95ec9ba3804d561dbaa03caa4ded492d14c272256e494632",
+            ]
+        );
+    }
+}
+
+/// Every signing and verifying path on a 256 KiB thread (2026-11-14).
+/// Signing overflowed one on ferros: `eggs` held a 116 KiB decoded Falcon key by value, moved once out of its `Option`, about 370 KiB with fn-dsa's own decode frame.
+/// Measured after the fix on x86_64 (peak depth, debug / release): Falcon egg 119 / 119 KiB, SPHINCS+ egg 156 / 57 KiB, keygen 51 / 5 KiB, verify 74 / 17 KiB.
+/// A thread that overflows aborts the whole test run, which is the point: the budget can't creep back quietly.
+#[cfg(all(test, feature = "sign", feature = "std"))]
+mod stack_budget {
+    use super::*;
+
+    const STACK: usize = 256 << 10;
+
+    fn on_small_stack(name: &str, f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().name(name.into()).stack_size(STACK).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// Sign with exactly `mask` and check every egg, the strict list rule and the envelope rule, all inside the small thread.
+    fn sign_and_verify(make: fn() -> SigningBundle, mask: scheme::Mask) {
+        let b = make();
+        let pubs = b.public();
+        for msg in [&b""[..], b"stack budget", &[0x77u8; 1 << 12][..]] {
+            let eggs = b.eggs(msg, mask);
+            assert_eq!(egg_mask(&eggs), mask);
+            for e in &eggs {
+                assert!(verify_egg(e.scheme, pubs.pubkey(e.scheme).unwrap(), msg, &e.sig), "scheme {} verifies", e.scheme);
+            }
+            assert!(verify_eggs(&eggs, &pubs, msg, mask));
+            assert!(verify_eggs_declared(&eggs, &pubs, msg, mask));
+        }
+    }
+
+    const MASKS: [scheme::Mask; 4] = [
+        scheme::MASK_BASE,
+        (1 << scheme::ED25519) | (1 << scheme::FALCON512),
+        (1 << scheme::ED25519) | (1 << scheme::SPHINCS_PLUS),
+        scheme::MASK_ALL,
+    ];
+
+    #[test]
+    fn every_egg_signs_and_verifies_on_a_256_kib_thread() {
+        for mask in MASKS {
+            on_small_stack("derive", move || sign_and_verify(|| SigningBundle::derive(b"small stack"), mask));
+        }
+    }
+
+    #[test]
+    fn every_constructor_keygens_and_signs_on_a_256_kib_thread() {
+        let makes: [fn() -> SigningBundle; 3] = [
+            || SigningBundle::release(&[0x11; 32]),
+            || SigningBundle::developer(&[0x22; 32], "FERROS_DEVELOPER_KAT"),
+            || epoch_bundle(&[0xa5; 32]),
+        ];
+        for make in makes {
+            on_small_stack("constructor", move || sign_and_verify(make, scheme::MASK_ALL));
+        }
+    }
+
+    /// The envelope path: reserve, sign thru vsf, verify against the declared bundle.
+    #[cfg(feature = "client")]
+    #[test]
+    fn an_envelope_signs_and_verifies_on_a_256_kib_thread() {
+        on_small_stack("envelope", || {
+            let a = SigningBundle::derive(b"small stack envelope");
+            let ke = vsf::VsfType::ke(a.keypair().public.to_bytes().to_vec());
+            let unsigned = vsf::VsfBuilder::new()
+                .creation_time_oscillations(vsf::eagle_time_oscillations())
+                .signed_only_eggs(ke, &reserve_eggs(envelope_mask(&a)))
+                .add_section("relay", vec![("payload".to_string(), vsf::VsfType::v(b'r', vec![1, 2, 3]))])
+                .build()
+                .unwrap();
+            let signed = sign_envelope(unsigned, &a).unwrap();
+            assert_eq!(verify_envelope(&signed, &a.public(), ENVELOPE_TIER).unwrap(), a.keypair().public.to_bytes());
+        });
     }
 }
 
