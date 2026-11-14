@@ -18,6 +18,17 @@ pub const BUNDLE_NAME: &str = "FERROS_KIST_ALIAS";
 /// The X25519 agreement secret's context, one way from the seed.
 pub const AGREEMENT_CONTEXT: &str = "ferros 2026-11-12 kist alias x25519 v0";
 
+/// Photon's developer key as first stowed (ferros docs/PHOTON.md M1: fixed, a constant on every platform, kept if the release key ever moves): the Ed25519 public key of Photon's release key, the `ke` its ferros capsule is signed under (photon src/crypto/self_verify.rs `AUTHOR_PUBKEY`; ferros tools/photon-capsule.sh signs with its secret half), which the ferros gate reads at launch and the kernel derives Photon's alias from.
+/// Public key only.
+pub const PHOTON_DEVELOPER: [u8; 32] = [
+    0xdf, 0xf3, 0xaf, 0x0c, 0x12, 0x7c, 0x0b, 0xeb, 0xe5, 0x39, 0xc4, 0x21, 0xda, 0x37, 0x99, 0x3a, 0x51, 0x7b, 0xfd, 0x78, 0xd2, 0xf5, 0xee, 0x49, 0x1d, 0x52, 0xfb, 0xf6, 0x16, 0x44, 0x47, 0x47,
+];
+
+/// Photon's kist option (ferros docs/PHOTON.md M1), minted 2026-11-08 and never changed: the `option` of its capsule's `kist` section (photon scripts/lib/ferros-kist.sh `FERROS_KIST_OPTION`, ferros tools/photon-capsule.sh `--option`), which the ferros gate reads at launch (`ferros_kist::option_of`).
+pub const PHOTON_OPTION: [u8; 32] = [
+    0x8c, 0x24, 0x11, 0xc6, 0xbf, 0x1c, 0x10, 0xa4, 0x5d, 0x80, 0x21, 0x34, 0x0b, 0x2d, 0xae, 0x4a, 0x7c, 0x69, 0x77, 0x42, 0x35, 0x06, 0x9e, 0xdd, 0xd8, 0x5a, 0xbb, 0xdc, 0x69, 0x59, 0xeb, 0x74,
+];
+
 /// The alias seed of the kist (`developer`, `option`) for the person whose person key this is.
 pub fn seed(person_key: &[u8; 32], developer: &[u8; 32], option: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key(CONTEXT);
@@ -75,6 +86,36 @@ mod tests {
             want[k] = n(hex[2 * k]) << 4 | n(hex[2 * k + 1]);
         }
         assert_eq!(seed(&p, &d, &o), want);
+    }
+
+    /// 32 bytes from 64 hex digits.
+    fn unhex(hex: &[u8; 64]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for k in 0..32 {
+            let n = |c: u8| (c as char).to_digit(16).unwrap() as u8;
+            out[k] = n(hex[2 * k]) << 4 | n(hex[2 * k + 1]);
+        }
+        out
+    }
+
+    #[test]
+    fn photon_kist_identity() {
+        // The bytes as their sources spell them: AUTHOR_PUBKEY's hex (photon self_verify.rs), the `ke` and the `kist` section's `option` of the stowed Photon capsule (read with vsfinfo, 2026-11-14), FERROS_KIST_OPTION (photon ferros-kist.sh).
+        assert_eq!(PHOTON_DEVELOPER, unhex(b"dff3af0c127c0bebe539c421da37993a517bfd78d2f5ee491d52fbf616444747"));
+        assert_eq!(PHOTON_OPTION, unhex(b"8c2411c6bf1c10a45d8021340b2dae4a7c69774235069eddd85abbdc6959eb74"));
+        let (p, _, _) = vector();
+        let s = seed(&p, &PHOTON_DEVELOPER, &PHOTON_OPTION);
+        // The ferros kernel's derivation as it stands (ferros_kernel/src/kvault.rs `alias_seed`, fed the gate's `ke` and option at launch, process.rs `gate`): the same three updates under its own copy of the context.
+        let kernel = {
+            let mut h = blake3::Hasher::new_derive_key("ferros 2026-11-12 kist alias v0");
+            h.update(&p);
+            h.update(&PHOTON_DEVELOPER);
+            h.update(&PHOTON_OPTION);
+            *h.finalize().as_bytes()
+        };
+        assert_eq!(s, kernel);
+        // And computed apart from both (b3sum --derive-key "ferros 2026-11-12 kist alias v0" over the person key 0 to 31, the developer key, the option): Photon's alias for this test person on every platform.
+        assert_eq!(s, unhex(b"8e82202acb567e338497f38bb447a19756e4842ede3b820ea558f0ebfce99e52"));
     }
 
     #[test]
