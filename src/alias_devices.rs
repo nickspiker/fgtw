@@ -57,6 +57,20 @@ impl DeviceList {
         DeviceList { handle_proof: *handle_proof, revision, devices, complete, sig }
     }
 
+    /// The list with `device` in it, signed by the alias: None when the held list already names it, else the held devices and this one, at a revision past the held one (`now`, or one past the held when the clock is behind it), so the new list wins.
+    /// Every Photon of the person's calls this with its own device key on each fetch, so two that add themselves at once converge: the loser of the race finds itself missing in the winner's list and adds itself again.
+    #[cfg(feature = "sign")]
+    pub fn with_device(held: Option<&DeviceList>, alias: &crate::pq::SigningBundle, handle_proof: &Key, device: Key, now: i64) -> Option<Self> {
+        if held.is_some_and(|l| l.contains(&device)) {
+            return None;
+        }
+        let mut devices = held.map(|l| l.devices.clone()).unwrap_or_default();
+        devices.push(device);
+        // WHY the max: the revision must pass the held one for the new list to win, and a device's clock may sit behind the one that signed it.
+        let revision = held.map_or(now, |l| now.max(l.revision + 1));
+        Some(Self::sign(alias, handle_proof, revision, devices, held.is_some_and(|l| l.complete)))
+    }
+
     /// Whether the alias whose public bundle this is signed the list, with every egg that bundle holds (no single eggs), and the list is in its signed form (sorted, no repeats).
     pub fn verify(&self, alias: &KeyBundle) -> bool {
         if self.devices.windows(2).any(|w| w[0] >= w[1]) {
@@ -241,5 +255,17 @@ mod tests {
         assert!(check(&b, &other, &chain).is_err(), "a list another alias signed is not this binding's");
         let stranger = MembershipBlob::genesis_v2(&crate::pq::SigningBundle::derive(b"device b"), HP, &[7; 32], 1_000);
         assert!(check(&b, &l, &stranger).is_err(), "a binding by a device outside the chain is refused");
+    }
+
+    #[test]
+    fn a_device_adds_itself_once_and_the_new_list_wins() {
+        let a = alias();
+        let first = DeviceList::with_device(None, &a, &HP, [4; 32], 100).unwrap();
+        assert_eq!(first.devices, vec![[4; 32]]);
+        assert!(DeviceList::with_device(Some(&first), &a, &HP, [4; 32], 200).is_none(), "already listed: nothing to sign");
+        let second = DeviceList::with_device(Some(&first), &a, &HP, [9; 32], 50).unwrap();
+        assert_eq!(second.devices, vec![[4; 32], [9; 32]], "the held devices kept");
+        assert!(second.newer_than(&first), "a clock behind the held revision still wins");
+        assert!(second.verify(&a.bundle().unwrap()));
     }
 }

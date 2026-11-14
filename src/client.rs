@@ -125,6 +125,40 @@ pub fn device_owned_elsewhere<T: FgtwTransport>(t: &T, device_key: &[u8; 32], ha
     }
 }
 
+// ── The alias's device list (ferros docs/PHOTON.md M3) ──
+
+/// Fetch a person's alias device list slot, or `None` while they have none: the binding and the list, read but NOT trusted until [`crate::alias_devices::check`] against the chain the asker pinned.
+pub fn fetch_alias_devices<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<(Vec<u8>, crate::alias_devices::DeviceList)>, String> {
+    let mut section = vsf::VsfSection::new("alias_devices_get");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    let resp = t.post(unsigned_req(section)?)?;
+    if is_error(&resp.body, "not_found") {
+        return Ok(None);
+    }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw alias_devices_get {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    crate::alias_devices::from_slot_doc(&resp.body).map(Some)
+}
+
+/// Publish a person's alias device list beside the binding that names its alias. The worker keeps it only when it checks against the stored chain and is newer than the list held; an older one comes back as `alias_devices: stale`, which the caller answers by fetching, merging and signing again.
+pub fn publish_alias_devices<T: FgtwTransport>(t: &T, binding: &[u8], list: &crate::alias_devices::DeviceList, now: i64) -> Result<(), String> {
+    let resp = t.post(crate::alias_devices::slot_doc(binding, list, now)?)?;
+    if is_error(&resp.body, "stale") {
+        return Err("alias_devices: stale".to_string());
+    }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw alias_devices {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    Ok(())
+}
+
 /// Publish a new (or extended) chain. The worker accepts it only as a forward extension of what it holds; a stale post gets the `stale` reason frame, surfaced as `"fleet: stale"` so the retry loop can match on it.
 pub fn publish<T: FgtwTransport>(t: &T, blob: &MembershipBlob) -> Result<(), String> {
     let resp = t.post(blob.to_vsf_bytes()?)?;
