@@ -324,6 +324,46 @@ mod signing {
             Self { ed, falcon_sk, falcon_vk, sphincs_sk, sphincs_pk }
         }
 
+        /// The whole bundle, secrets included, for a holder that keeps it sealed rather than deriving it again (the alias's bundle on ferros, sealed to the device in its kist: a Falcon and a SPHINCS+ keygen at every start otherwise, about 120 ms on the Pro; the owner 2026-11-17, "lock it and seal it").
+        /// Form: the Ed25519 seed (32 bytes), the Falcon secret and verifying keys each as `u16 LE length ‖ bytes`, then the SPHINCS+ secret and public keys at their fixed lengths. These are secret keys: the bytes go only into a seal.
+        pub fn to_sealable_bytes(&self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(32 + 4 + self.falcon_sk.len() + self.falcon_vk.len() + self.sphincs_sk.len() + self.sphincs_pk.len());
+            out.extend_from_slice(&self.ed.secret.to_bytes());
+            for part in [&self.falcon_sk, &self.falcon_vk] {
+                out.extend_from_slice(&(part.len() as u16).to_le_bytes());
+                out.extend_from_slice(part);
+            }
+            out.extend_from_slice(&self.sphincs_sk);
+            out.extend_from_slice(&self.sphincs_pk);
+            out
+        }
+
+        /// A bundle back from [`Self::to_sealable_bytes`], every length checked (the bytes come back from storage); `Err` for anything of another shape. The caller compares `public()` with the bundle it expects before signing with it.
+        pub fn from_sealable_bytes(b: &[u8]) -> Result<Self, &'static str> {
+            let take = |b: &mut &[u8], n: usize| -> Result<Vec<u8>, &'static str> {
+                if b.len() < n {
+                    return Err("a sealed signing bundle is cut short");
+                }
+                let (head, rest) = b.split_at(n);
+                *b = rest;
+                Ok(head.to_vec())
+            };
+            let mut rest = b;
+            let seed: [u8; 32] = take(&mut rest, 32)?.try_into().map_err(|_| "a sealed signing bundle is cut short")?;
+            let mut framed = |rest: &mut &[u8]| -> Result<Vec<u8>, &'static str> {
+                let len = u16::from_le_bytes(take(rest, 2)?.try_into().map_err(|_| "a sealed signing bundle is cut short")?) as usize;
+                take(rest, len)
+            };
+            let falcon_sk = framed(&mut rest)?;
+            let falcon_vk = framed(&mut rest)?;
+            let sphincs_sk = take(&mut rest, fips205::slh_dsa_sha2_128s::SK_LEN)?.try_into().map_err(|_| "a sealed signing bundle is cut short")?;
+            let sphincs_pk = take(&mut rest, fips205::slh_dsa_sha2_128s::PK_LEN)?.try_into().map_err(|_| "a sealed signing bundle is cut short")?;
+            if !rest.is_empty() {
+                return Err("a sealed signing bundle runs long");
+            }
+            Ok(Self { ed: Keypair::from_seed(&seed), falcon_sk, falcon_vk, sphincs_sk, sphincs_pk })
+        }
+
         /// The public bundle this signer will declare.
         pub fn public(&self) -> KeyBundle {
             KeyBundle::new(vec![
@@ -430,6 +470,22 @@ mod signing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sealed bundle comes back as the same signer (its public bundle, its signatures), and bytes of another shape are refused.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn a_sealed_signing_bundle_comes_back_whole() {
+        let s = SigningBundle::developer(&[9u8; 32], "FGTW_TEST_DEVELOPER");
+        let bytes = s.to_sealable_bytes();
+        let back = SigningBundle::from_sealable_bytes(&bytes).unwrap();
+        assert_eq!(back.public().to_bytes(), s.public().to_bytes());
+        assert_eq!(back.to_sealable_bytes(), bytes);
+        assert!(SigningBundle::from_sealable_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(SigningBundle::from_sealable_bytes(&long).is_err());
+        assert!(SigningBundle::from_sealable_bytes(&[]).is_err());
+    }
 
     #[test]
     fn bundle_round_trips_and_commits_stably() {
