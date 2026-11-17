@@ -44,6 +44,11 @@ pub fn bundle(seed: &[u8; 32]) -> crate::pq::SigningBundle {
     crate::pq::SigningBundle::developer(seed, BUNDLE_NAME)
 }
 
+/// The alias's Ed25519 public key alone, as [`bundle`] holds it (the seed's own key): a check that reads only this half pays no Falcon or SPHINCS+ keygen (ferros 2026-11-17: a messenger checking its binding spent 380 ms at start deriving the whole bundle for it).
+pub fn ed25519_public(seed: &[u8; 32]) -> [u8; 32] {
+    crate::keys::Keypair::from_seed(seed).public.to_bytes()
+}
+
 /// The alias's X25519 secret for agreement (a sealed note to itself, a key exchange in its lane): one way from the seed, so it never equals the signing seed.
 pub fn agreement_secret(seed: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(AGREEMENT_CONTEXT, seed)
@@ -160,6 +165,7 @@ mod tests {
         assert_eq!(a.to_bytes(), bundle(&s).public().to_bytes());
         // The Ed25519 half is the seed's own key.
         assert_eq!(a.ed25519(), crate::keys::Keypair::from_seed(&s).public.to_bytes());
+        assert_eq!(a.ed25519(), ed25519_public(&s));
         let mut o1 = o;
         o1[0] ^= 1;
         assert_ne!(bundle(&seed(&p, &d, &o1)).public().commit(), a.commit());
