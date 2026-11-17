@@ -294,6 +294,26 @@ mod tests {
         assert_eq!(find(&s, &HP, &FK1), Found::Key { key, id: id(&key), minted: 100 });
     }
 
+    /// A person fact a device cannot open (sealed under the key before a rotation) rides along untouched: merged into a device's own space, written to the document, the whole sealed under the new key for fgtw.org and opened again, it is still there, still under the old key, and a device holding that key opens it (docs/IDENTITY-SPACE.md "A rotation that left the person key behind", 2026-11-17).
+    #[cfg(feature = "fanout")]
+    #[test]
+    fn a_fact_this_device_cannot_open_rides_along() {
+        let key = mint(&[&[7u8; 32], &[8u8; 32]]).unwrap();
+        let mut theirs = Space::new();
+        put(&mut theirs, &key, 100, &HP, &FK, &SIB, 100).unwrap();
+        // This device holds only the new key: its own space merges the fact in without opening it.
+        let mut mine = Space::new();
+        mine.merge(theirs);
+        assert_eq!(find(&mine, &HP, &FK1), Found::Elsewhere { id: id(&key), minted: 100 });
+        // Its push: the document sealed under the new key, as fgtw.org keeps it, and opened again there.
+        let sealed = crate::space::seal(&mine.to_doc(101).unwrap(), &HP, &FK1).unwrap();
+        let back = Space::from_doc(&crate::space::open(&sealed, &HP, &FK1).unwrap()).unwrap();
+        assert_eq!(back, mine);
+        assert_eq!(find(&back, &HP, &FK1), Found::Elsewhere { id: id(&key), minted: 100 });
+        // A device that still holds the old key opens it from that copy, and can seal it again under the new one.
+        assert_eq!(find(&back, &HP, &FK), Found::Key { key, id: id(&key), minted: 100 });
+    }
+
     #[cfg(feature = "fanout")]
     #[test]
     fn two_mints_settle_on_the_first() {

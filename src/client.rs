@@ -1058,9 +1058,17 @@ pub fn recover_or_establish_fleet_key<T: FgtwTransport>(
 
 /// Keep the sealed identity space at fgtw.org (`space_put`): the copy a total loss recovers from; day to day the space lives on the fleet (`protocol::space_push`). Member-gated as `fstate_put` is: the envelope is device-signed and the worker takes it only from a current member of the fleet `handle_proof`; the stamp must be newer than the stored one. A worker that has no space slot yet answers `unknown_op`, returned as an error the caller can name.
 pub fn push_space<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32], device_key: &impl crate::pq::FleetSigner, sealed: &crate::space::Sealed) -> Result<(), String> {
+    push_space_prev(t, handle_proof, device_key, sealed, None)
+}
+
+/// [`push_space`] naming the stored document it replaces (`prev`, the BLAKE3 of the body [`pull_space_seen`] returned): the worker's compare-and-set then takes it only if the slot still holds that body, else answers `stale` and the caller reads, merges and writes again (2026-11-17, docs/IDENTITY-SPACE.md G2: a device pushed its copy over one it could not open). None for a slot read empty, which the worker's compare-and-set cannot name.
+pub fn push_space_prev<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32], device_key: &impl crate::pq::FleetSigner, sealed: &crate::space::Sealed, prev: Option<&[u8; 32]>) -> Result<(), String> {
     let mut section = vsf::VsfSection::new("space_put");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     crate::space::sealed_fields(&mut section, sealed);
+    if let Some(p) = prev {
+        section.add_field("prev", VsfType::hb(p.to_vec()));
+    }
     section.add_field("t", VsfType::e(vsf::types::EtType::e6(crate::now_oscillations())));
     let resp = signed_req(t, device_key, section, "space_put")?;
     if let Some((reason, detail)) = error_frame(&resp.body) {
@@ -1074,6 +1082,11 @@ pub fn push_space<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32], device_key: 
 
 /// The sealed identity space fgtw.org keeps for `handle_proof` (`space_get`), or None when it keeps none. Public, as `fstate_get` is: only the fleet's devices can open it. The stored document is the `space_put` the worker verified; its seal is read back from it.
 pub fn pull_space<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<crate::space::Sealed>, String> {
+    Ok(pull_space_seen(t, handle_proof)?.map(|(s, _)| s))
+}
+
+/// [`pull_space`] with the BLAKE3 of the stored document as served (the worker answers it verbatim), the `prev` a later [`push_space_prev`] names.
+pub fn pull_space_seen<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<(crate::space::Sealed, [u8; 32])>, String> {
     let mut section = vsf::VsfSection::new("space_get");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     let resp = t.post(unsigned_req(section)?)?;
@@ -1087,7 +1100,8 @@ pub fn pull_space<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Op
         return Err(format!("FGTW transport {}", resp.status));
     }
     let (_, stored) = parse_section(&resp.body)?;
-    Ok(crate::space::sealed_from(&stored))
+    let seen = *blake3::hash(&resp.body).as_bytes();
+    Ok(crate::space::sealed_from(&stored).map(|s| (s, seen)))
 }
 
 // ── Fleet state transport ──
