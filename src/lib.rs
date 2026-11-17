@@ -137,6 +137,15 @@ pub fn fanout_blob_epoch(bytes: &[u8]) -> Option<u64> {
     }
 }
 
+/// The fingerprint of the fleet key a fan-out wraps (its `kfp`), readable without the `fanout` feature: what the worker holds a sealed space against, so only a space sealed under the current fleet key is kept (2026-11-17, a member on a stale key replaced the identity's space; ferros docs/IDENTITY-SPACE.md). `None` for a pre-v3 blob or a malformed one. Layout as [`fanout_blob_epoch_pub`].
+pub fn fanout_blob_kfp(bytes: &[u8]) -> Option<[u8; 32]> {
+    // WHY/PROOF: fan-out blobs come from storage and may be truncated; the fixed header slice would panic.
+    if bytes.len() < 44 || &bytes[0..3] != b"PFO" || bytes[3] != 3 {
+        return None;
+    }
+    bytes[12..44].try_into().ok()
+}
+
 /// The fan-out's EPOCH PUBLIC BUNDLE, readable without the `fanout` feature: the keys a verifier checks a current-membership proof against. `None` for a pre-v3 blob or a malformed one. Layout: magic(3) ‖ version(1) ‖ revision(8) ‖ kfp(32) ‖ rotator(32) ‖ u16 BE len ‖ bundle.
 pub fn fanout_blob_epoch_pub(bytes: &[u8]) -> Option<pq::KeyBundle> {
     // WHY/PROOF: fan-out blobs are fetched from FGTW and may be truncated — the fixed header slices would panic.

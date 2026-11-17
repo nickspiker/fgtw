@@ -333,6 +333,9 @@ mod tests {
         // The header carries the epoch public bundle, and the base-feature reader sees it without the fan-out crypto.
         assert_eq!(fanout_from_bytes_full(&bytes).unwrap().epoch_pub, ep);
         assert_eq!(crate::fanout_blob_epoch_pub(&bytes), Some(ep.clone()));
+        // …and the key fingerprint it wraps, for the worker's space check.
+        assert_eq!(crate::fanout_blob_kfp(&bytes), Some(kfp));
+        assert_eq!(crate::fanout_blob_kfp(&bytes[..40]), None);
         assert_eq!(rev, 7);
         assert_eq!(got_kfp, kfp);
         assert_eq!(got_rotator, pk(&a));
