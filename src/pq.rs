@@ -350,7 +350,7 @@ mod signing {
             };
             let mut rest = b;
             let seed: [u8; 32] = take(&mut rest, 32)?.try_into().map_err(|_| "a sealed signing bundle is cut short")?;
-            let mut framed = |rest: &mut &[u8]| -> Result<Vec<u8>, &'static str> {
+            let framed = |rest: &mut &[u8]| -> Result<Vec<u8>, &'static str> {
                 let len = u16::from_le_bytes(take(rest, 2)?.try_into().map_err(|_| "a sealed signing bundle is cut short")?) as usize;
                 take(rest, len)
             };
