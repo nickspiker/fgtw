@@ -339,6 +339,42 @@ pub fn parse_fstate_push(bytes: &[u8]) -> Result<([u8; 32], Vec<u8>, [u8; 32]), 
     Ok((field_handle_proof(&section, "hp").ok_or("fstate_push missing hp")?, field_ge(&section, "bl").ok_or("fstate_push missing bl")?, sender))
 }
 
+// ── A friend's avatar among one person's own devices ──
+
+/// The `avatar_want` frame: "send me your copy of friend `who`'s avatar", to a sibling device of the same person (2026-11-17: avatars lost one restart at a time on every device; any one of the person's devices still holding a friend's picture refills the rest). Only ever among one person's own devices: a friend's picture is never handed to anyone that friend did not share it with.
+pub fn avatar_want(handle_proof: &[u8; 32], who: &[u8; 32], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("avatar_want");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("who", VsfType::hb(who.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read an `avatar_want`: (handle proof, the friend's party id, the sending device).
+pub fn parse_avatar_want(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "avatar_want")?;
+    Ok((field_handle_proof(&section, "hp").ok_or("avatar_want missing hp")?, field_handle_proof(&section, "who").ok_or("avatar_want missing who")?, sender))
+}
+
+/// The `avatar_give` frame: the answer to an `avatar_want`, friend `who`'s avatar as the sender holds it, sealed under a key only the two devices hold (the sealing is the app's).
+pub fn avatar_give(handle_proof: &[u8; 32], who: &[u8; 32], sealed: &[u8], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("avatar_give");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("who", VsfType::hb(who.to_vec()));
+    section.add_field("bl", VsfType::ge(sealed.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read an `avatar_give`: (handle proof, the friend's party id, the sealed avatar, the sending device).
+pub fn parse_avatar_give(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], Vec<u8>, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "avatar_give")?;
+    Ok((
+        field_handle_proof(&section, "hp").ok_or("avatar_give missing hp")?,
+        field_handle_proof(&section, "who").ok_or("avatar_give missing who")?,
+        field_ge(&section, "bl").ok_or("avatar_give missing bl")?,
+        sender,
+    ))
+}
+
 // ── The person's identity space over the mesh (crate::space) ──
 
 /// The `space_push` frame: the person's identity space, sealed under the fleet key, handed among one fleet's own devices: a change goes to each sibling, and a `space_want` is answered with one. The receiver checks the sender is a member, opens it, and merges; the merge is a total order, so the order pushes arrive in does not matter.
@@ -403,6 +439,18 @@ mod tests {
         let frame = fstate_push(&[9u8; 32], &[1, 2, 3, 4], &kp, 77).unwrap();
         assert_eq!(parse_fstate_push(&frame).unwrap(), ([9u8; 32], vec![1, 2, 3, 4], kp.public.to_bytes()));
         assert!(parse_fanout_resp(&frame).is_err(), "a push is not a fan-out answer");
+    }
+
+    /// An avatar_want and an avatar_give round-trip their friend, their sealed bytes and their signer, and are never read as each other.
+    #[test]
+    fn avatar_want_and_give_round_trip() {
+        let kp = Keypair::from_seed(&[0x3Du8; 32]);
+        let want = avatar_want(&[9u8; 32], &[4u8; 32], &kp, 77).unwrap();
+        assert_eq!(parse_avatar_want(&want).unwrap(), ([9u8; 32], [4u8; 32], kp.public.to_bytes()));
+        let give = avatar_give(&[9u8; 32], &[4u8; 32], &[1, 2, 3], &kp, 78).unwrap();
+        assert_eq!(parse_avatar_give(&give).unwrap(), ([9u8; 32], [4u8; 32], vec![1, 2, 3], kp.public.to_bytes()));
+        assert!(parse_avatar_want(&give).is_err());
+        assert!(parse_avatar_give(&want).is_err());
     }
     use crate::keys::Keypair;
 
