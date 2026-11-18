@@ -144,9 +144,33 @@ pub fn fetch_alias_devices<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> 
     crate::alias_devices::from_slot_doc(&resp.body).map(Some)
 }
 
+/// [`fetch_alias_devices`] with the sign-outs the slot carries (verified; [`crate::alias_devices::signouts_from_slot_doc`]).
+pub fn fetch_alias_slot<T: FgtwTransport>(t: &T, handle_proof: &[u8; 32]) -> Result<Option<(Vec<u8>, crate::alias_devices::DeviceList, Vec<crate::alias_devices::SignOut>)>, String> {
+    let mut section = vsf::VsfSection::new("alias_devices_get");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    let resp = t.post(unsigned_req(section)?)?;
+    if is_error(&resp.body, "not_found") {
+        return Ok(None);
+    }
+    if let Some((reason, detail)) = error_frame(&resp.body) {
+        return Err(format!("fgtw alias_devices_get {reason}: {detail}"));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("FGTW transport {}", resp.status));
+    }
+    let (binding, list) = crate::alias_devices::from_slot_doc(&resp.body)?;
+    let signouts = crate::alias_devices::signouts_from_slot_doc(&resp.body)?;
+    Ok(Some((binding, list, signouts)))
+}
+
 /// Publish a person's alias device list beside the binding that names its alias. The worker keeps it only when it checks against the stored chain and is newer than the list held; an older one comes back as `alias_devices: stale`, which the caller answers by fetching, merging and signing again.
 pub fn publish_alias_devices<T: FgtwTransport>(t: &T, binding: &[u8], list: &crate::alias_devices::DeviceList, now: i64) -> Result<(), String> {
-    let resp = t.post(crate::alias_devices::slot_doc(binding, list, now)?)?;
+    publish_alias_slot(t, binding, list, &[], now)
+}
+
+/// [`publish_alias_devices`] with the sign-outs that back the devices the list leaves out; the worker keeps the document whole.
+pub fn publish_alias_slot<T: FgtwTransport>(t: &T, binding: &[u8], list: &crate::alias_devices::DeviceList, signouts: &[crate::alias_devices::SignOut], now: i64) -> Result<(), String> {
+    let resp = t.post(crate::alias_devices::slot_doc_with(binding, list, signouts, now)?)?;
     if is_error(&resp.body, "stale") {
         return Err("alias_devices: stale".to_string());
     }

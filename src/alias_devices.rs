@@ -61,24 +61,24 @@ impl DeviceList {
     /// Every Photon of the person's calls this with its own device key on each fetch, so two that add themselves at once converge: the loser of the race finds itself missing in the winner's list and adds itself again.
     #[cfg(feature = "sign")]
     pub fn with_device(held: Option<&DeviceList>, alias: &crate::pq::SigningBundle, handle_proof: &Key, device: Key, now: i64) -> Option<Self> {
-        Self::revised(held, alias, handle_proof, Some(device), &[], now)
+        Self::revised(held, alias, handle_proof, &[device], &[], now)
     }
 
-    /// The list with `add` in it (when given) and none of `drop`, signed by the alias: None when the held list already says exactly that, else at a revision past the held one (`now`, or one past the held when the clock is behind it), so the new list wins.
+    /// The list with every device of `add` in it and none of `drop`, signed by the alias: None when the held list already says exactly that, else at a revision past the held one (`now`, or one past the held when the clock is behind it), so the new list wins.
     /// A sign-out drops the device itself; a member drops what the chain has locked out.
     #[cfg(feature = "sign")]
-    pub fn revised(held: Option<&DeviceList>, alias: &crate::pq::SigningBundle, handle_proof: &Key, add: Option<Key>, drop: &[Key], now: i64) -> Option<Self> {
+    pub fn revised(held: Option<&DeviceList>, alias: &crate::pq::SigningBundle, handle_proof: &Key, add: &[Key], drop: &[Key], now: i64) -> Option<Self> {
         let mut devices = held.map(|l| l.devices.clone()).unwrap_or_default();
         let before = devices.len();
         devices.retain(|d| !drop.contains(d));
         let dropped = devices.len() != before;
-        let added = match add {
-            Some(d) if !devices.contains(&d) && !drop.contains(&d) => {
-                devices.push(d);
-                true
+        let mut added = false;
+        for d in add {
+            if !devices.contains(d) && !drop.contains(d) {
+                devices.push(*d);
+                added = true;
             }
-            _ => false,
-        };
+        }
         if !dropped && !added && held.is_some() {
             return None;
         }
@@ -152,6 +152,123 @@ impl DeviceList {
     }
 }
 
+/// A device's own word that it left the alias's list (the owner 2026-11-18: "the other needs the device present to sign itself out, thus asserting it wiped its keys"): signed by the leaving device's own key over the person, the device and the list revision it leaves at.
+/// The alias is every Photon's of the person, so a list that merely omits a device proves nothing; a reader takes a device out of the list it acts on only when this record, or the chain, backs the omission ([`unbacked_drops`]).
+/// It rides the slot document beside the list, carried from revision to revision while the device stays out ([`carried`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignOut {
+    /// The person (handle proof) whose list the device leaves.
+    pub handle_proof: Key,
+    /// The leaving device's key, the one that signed.
+    pub device: Key,
+    /// The revision of the list the device leaves at: the first one without it.
+    pub revision: i64,
+    /// The device's eggs over [`SignOut::signing_bytes`], as an egg-list blob: its Ed25519 key, the one every listed device holds.
+    pub sig: Vec<u8>,
+}
+
+/// The wrap a sign-out rides under in the slot document.
+pub const SIGNOUT_WRAP: u8 = b'S';
+
+impl SignOut {
+    /// The bytes the leaving device signs: a domain, the person, the device and the revision it leaves at.
+    pub fn signing_bytes(handle_proof: &Key, device: &Key, revision: i64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(96);
+        m.extend_from_slice(b"fgtw.alias.signout.v1");
+        m.extend_from_slice(handle_proof);
+        m.extend_from_slice(device);
+        m.extend_from_slice(&revision.to_le_bytes());
+        m
+    }
+
+    /// The leaving device signs its own sign-out with its Ed25519 key.
+    pub fn sign(device: &impl crate::pq::FleetSigner, handle_proof: &Key, revision: i64) -> Self {
+        let me = device.keypair().public.to_bytes();
+        let msg = Self::signing_bytes(handle_proof, &me, revision);
+        let sig = crate::pq::eggs_to_bytes(&device.eggs(&msg, crate::fleet::scheme::MASK_BASE));
+        SignOut { handle_proof: *handle_proof, device: me, revision, sig }
+    }
+
+    /// Whether the device it names signed it.
+    pub fn verify(&self) -> bool {
+        let msg = Self::signing_bytes(&self.handle_proof, &self.device, self.revision);
+        eggs_from_bytes(&self.sig).is_ok_and(|eggs| crate::pq::verify_eggs(&eggs, &KeyBundle::ed25519_only(&self.device), &msg, crate::fleet::scheme::MASK_BASE))
+    }
+
+    /// The record as a VSF section.
+    pub fn to_section(&self) -> VsfSection {
+        let mut sec = VsfSection::new("alias_signout");
+        sec.add_field("handle_proof", VsfType::hP(self.handle_proof.to_vec()));
+        sec.add_field("device", VsfType::ke(self.device.to_vec()));
+        sec.add_field("revision", VsfType::e(EtType::e6(self.revision)));
+        sec.add_field("sig", VsfType::ge(self.sig.clone()));
+        sec
+    }
+
+    /// Read a record back; a field of the wrong type is an error, never defaulted.
+    pub fn from_section(sec: &VsfSection) -> Result<Self, String> {
+        if sec.name != "alias_signout" {
+            return Err("not an alias sign-out".to_string());
+        }
+        let first = |name: &str| sec.get_field(name).and_then(|f| f.values.first());
+        let handle_proof = match first("handle_proof") {
+            Some(VsfType::hP(b)) if b.len() == 32 => b.as_slice().try_into().map_err(|_| "handle proof".to_string())?,
+            _ => return Err("alias sign-out missing its person".to_string()),
+        };
+        let device = match first("device") {
+            Some(VsfType::ke(b)) if b.len() == 32 => b.as_slice().try_into().map_err(|_| "device key".to_string())?,
+            _ => return Err("alias sign-out missing its device".to_string()),
+        };
+        let revision = sec.eagle("revision").ok_or("alias sign-out missing its revision")?;
+        let sig = match first("sig") {
+            Some(VsfType::ge(b)) => b.clone(),
+            _ => return Err("alias sign-out missing its signature".to_string()),
+        };
+        Ok(SignOut { handle_proof, device, revision, sig })
+    }
+}
+
+/// The devices the chain itself backs leaving the list: every device it has locked out, and every device that was a member and left (a member's departure is a Remove the leaver signed its own consent to).
+pub fn chain_drops(chain: &crate::fleet::MembershipBlob) -> Vec<Key> {
+    let mut drops = chain.all_locked().unwrap_or_default();
+    let members = chain.fold().unwrap_or_default();
+    for op in &chain.ops {
+        if matches!(op.kind, crate::fleet::OpKind::Genesis | crate::fleet::OpKind::Add) && !members.contains(&op.device_pubkey) && !drops.contains(&op.device_pubkey) {
+            drops.push(op.device_pubkey);
+        }
+    }
+    drops
+}
+
+/// Whether `device` signed itself out of `handle_proof`'s list at a revision past `after` (the revision of the newest list known to name it), by a record among `signouts` that verifies.
+pub fn signed_out(device: &Key, handle_proof: &Key, after: i64, signouts: &[SignOut]) -> bool {
+    signouts.iter().any(|s| s.device == *device && s.handle_proof == *handle_proof && s.revision > after && s.verify())
+}
+
+/// The devices `held` names that `next` leaves out with nothing backing their leaving: neither the device's own sign-out past `held`'s revision nor the chain ([`chain_drops`]).
+/// Empty when `next` may replace `held` as the list a reader acts on; otherwise the reader keeps the devices (it keeps `held`), and an honest holder publishes them back ([`DeviceList::revised`]).
+pub fn unbacked_drops(held: &DeviceList, next: &DeviceList, signouts: &[SignOut], chain: &crate::fleet::MembershipBlob) -> Vec<Key> {
+    let backed = chain_drops(chain);
+    held.devices
+        .iter()
+        .filter(|d| !next.contains(d) && !backed.contains(d) && !signed_out(d, &held.handle_proof, held.revision, signouts))
+        .copied()
+        .collect()
+}
+
+/// The sign-outs a slot document carries with `list`: each verified record of a device the list leaves out, the newest per device; a device listed again drops its record (it came back after it).
+pub fn carried(signouts: &[SignOut], list: &DeviceList) -> Vec<SignOut> {
+    let mut out: Vec<SignOut> = Vec::new();
+    for s in signouts.iter().filter(|s| s.handle_proof == list.handle_proof && !list.contains(&s.device) && s.verify()) {
+        match out.iter_mut().find(|o| o.device == s.device) {
+            Some(o) if s.revision > o.revision => *o = s.clone(),
+            Some(_) => {}
+            None => out.push(s.clone()),
+        }
+    }
+    out
+}
+
 /// The wrap a list rides under inside another document (the slot document, a pong tail), read back by its marker.
 pub const WRAP: u8 = b'D';
 /// The wrap the binding that names the alias rides under in the slot document.
@@ -163,10 +280,40 @@ const SLOT_BYTES_MAX: usize = 1 << 16;
 
 /// The list and the binding that names its alias, as one complete VSF file: what fgtw.org's `alias_devices` slot holds and every Photon fetches and checks.
 pub fn slot_doc(binding: &[u8], list: &DeviceList, now: i64) -> Result<Vec<u8>, String> {
+    slot_doc_with(binding, list, &[], now)
+}
+
+/// [`slot_doc`] with the sign-outs that back the devices the list leaves out, each its own typed record under [`SIGNOUT_WRAP`]; none is left out, never written as an empty field.
+/// A reader built before sign-outs reads the binding and the list by name and passes the rest by.
+pub fn slot_doc_with(binding: &[u8], list: &DeviceList, signouts: &[SignOut], now: i64) -> Result<Vec<u8>, String> {
     let mut sec = VsfSection::new(SLOT_SECTION);
     sec.add_field("binding", VsfType::v(BINDING_WRAP, binding.to_vec()));
     sec.add_field("list", VsfType::v(WRAP, list.to_section().encode_far()));
+    if !signouts.is_empty() {
+        sec.add_field_multi("signout", signouts.iter().map(|s| VsfType::v(SIGNOUT_WRAP, s.to_section().encode_far())).collect());
+    }
     vsf::VsfBuilder::new().creation_time_oscillations(now).add_section_direct(sec).build().map_err(|e| format!("alias devices slot: {e}"))
+}
+
+/// The sign-outs a slot document carries, as they verify: a record that does not parse, names another person, or was not signed by the device it names is passed by (it backs nothing, and a forged one cannot make the rest of the slot unreadable).
+pub fn signouts_from_slot_doc(bytes: &[u8]) -> Result<Vec<SignOut>, String> {
+    let (_, list) = from_slot_doc(bytes)?;
+    let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| format!("alias devices slot verification: {e}"))?;
+    let sec = header.primary_section(bytes, end).map_err(|e| format!("alias devices slot section: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(f) = sec.get_field("signout") {
+        for v in &f.values {
+            if let VsfType::v(SIGNOUT_WRAP, b) = v {
+                let mut ptr = 0;
+                if let Ok(s) = VsfSection::parse(b, &mut ptr).and_then(|s| SignOut::from_section(&s)) {
+                    if s.handle_proof == list.handle_proof && s.verify() {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Read a slot document back: the file must verify before a field is read; each field is taken by its marker. Only the form is checked here; [`check`] decides whether the list is the person's.
@@ -317,7 +464,7 @@ mod tests {
         assert!(check(&binding, &stolen, &chain).is_err(), "the alias signs, the chain refuses");
         assert!(check_signed(&binding, &stolen, &chain).is_ok(), "the signature itself is the person's");
         assert_eq!(locked_named(&stolen, &chain).unwrap(), vec![ferros]);
-        let pruned = DeviceList::revised(Some(&stolen), &a, &HP, None, &[ferros], 2_004).unwrap();
+        let pruned = DeviceList::revised(Some(&stolen), &a, &HP, &[], &[ferros], 2_004).unwrap();
         assert!(pruned.newer_than(&stolen));
         assert!(check(&binding, &pruned, &chain).is_ok(), "the holder's revision without it checks");
 
@@ -354,11 +501,48 @@ mod tests {
     fn a_device_signs_itself_out_of_the_list() {
         let a = alias();
         let list = DeviceList::sign(&a, &HP, 100, vec![[4; 32], [9; 32]], true);
-        let out = DeviceList::revised(Some(&list), &a, &HP, None, &[[9; 32]], 50).unwrap();
+        let out = DeviceList::revised(Some(&list), &a, &HP, &[], &[[9; 32]], 50).unwrap();
         assert_eq!(out.devices, vec![[4; 32]]);
         assert!(out.complete, "the cutover mark is kept");
         assert!(out.newer_than(&list));
-        assert!(DeviceList::revised(Some(&out), &a, &HP, None, &[[9; 32]], 200).is_none(), "already gone: nothing to sign");
+        assert!(DeviceList::revised(Some(&out), &a, &HP, &[], &[[9; 32]], 200).is_none(), "already gone: nothing to sign");
+    }
+
+    /// The owner's rule for a sign out: only the device itself can sign it, it backs the omission only past the list that last named the device, it rides the slot document, and a list that merely omits a device is no removal; the chain backs a lock or a member's departure.
+    #[test]
+    fn only_the_device_itself_signs_it_out() {
+        use crate::fleet::MembershipBlob;
+        let a = alias();
+        let member = crate::pq::SigningBundle::derive(b"device a");
+        let chain = MembershipBlob::genesis_v2(&member, HP, &[7; 32], 1_000);
+        let mpk = member.keypair().public.to_bytes();
+        let ferros = crate::keys::Keypair::from_seed(&[0x8a; 32]);
+        let fpk = ferros.public.to_bytes();
+        let held = DeviceList::sign(&a, &HP, 100, vec![mpk, fpk], false);
+        let omitted = DeviceList::revised(Some(&held), &a, &HP, &[], &[fpk], 101).unwrap();
+        assert_eq!(unbacked_drops(&held, &omitted, &[], &chain), vec![fpk], "an omission alone is no removal");
+
+        let out = SignOut::sign(&ferros, &HP, omitted.revision);
+        assert!(out.verify());
+        assert!(unbacked_drops(&held, &omitted, &[out.clone()], &chain).is_empty(), "the device's own sign out backs it");
+        let mut forged = out.clone();
+        forged.device = mpk;
+        assert!(!forged.verify(), "another key cannot sign a device out");
+        assert_eq!(unbacked_drops(&held, &omitted, &[forged], &chain), vec![fpk]);
+        let old = SignOut::sign(&ferros, &HP, held.revision);
+        assert_eq!(unbacked_drops(&held, &omitted, &[old], &chain), vec![fpk], "a sign out from before the list that names it again backs nothing");
+
+        let binding = crate::binding::Binding::sign(&member, chain.declared_mask(&mpk), &HP, &[2; 32], &[3; 32], a.bundle().unwrap(), 2_000).to_vsf_bytes().unwrap();
+        let doc = slot_doc_with(&binding, &omitted, &carried(&[out.clone()], &omitted), 2_001).unwrap();
+        assert_eq!(signouts_from_slot_doc(&doc).unwrap(), vec![out.clone()], "the record rides the slot");
+        assert_eq!(from_slot_doc(&doc).unwrap().1, omitted, "the list reads as before");
+        assert!(signouts_from_slot_doc(&slot_doc(&binding, &omitted, 2_001).unwrap()).unwrap().is_empty());
+        let back = DeviceList::revised(Some(&omitted), &a, &HP, &[fpk], &[], 2_002).unwrap();
+        assert!(carried(&[out], &back).is_empty(), "a device listed again drops its record");
+
+        let mut locked_chain = chain.clone();
+        locked_chain.lock_listed(&member, fpk, 1_001);
+        assert!(unbacked_drops(&held, &omitted, &[], &locked_chain).is_empty(), "the chain's lock backs it");
     }
 
     #[test]
