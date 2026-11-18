@@ -7,7 +7,7 @@
 //! The wire format is the one photon shipped; moving it here changed no byte.
 
 use crate::fleet::{scheme, BindRequest};
-use crate::pq::{eggs_from_bytes, eggs_to_bytes, envelope_mask, reserve_eggs, sign_envelope, FleetSigner, KeyBundle};
+use crate::pq::{eggs_from_bytes, eggs_to_bytes, FleetSigner, KeyBundle};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -57,25 +57,8 @@ pub fn parse_beacon(bytes: &[u8]) -> Option<([u8; 32], u16, Option<[u8; 32]>)> {
 
 // ── Envelopes ──
 
-/// A device-signed envelope around `section`, stamped `time`.
-pub fn signed_frame(section: VsfSection, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
-    let ke = signer.keypair().public.to_bytes();
-    let unsigned = VsfBuilder::new()
-        .creation_time_oscillations(time)
-        .signed_only_eggs(VsfType::ke(ke.to_vec()), &reserve_eggs(envelope_mask(signer)))
-        .add_section_direct(section)
-        .build()
-        .map_err(|e| alloc::format!("frame build: {e}"))?;
-    sign_envelope(unsigned, signer)
-}
-
-/// Verify a device-signed envelope and read its section: (the section, the signing device). Fails unless the anchor egg verifies under the header's own `ke`.
-pub fn open_frame(bytes: &[u8]) -> Result<(VsfSection, [u8; 32]), String> {
-    let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("frame verification failed: {e}"))?;
-    let signer = vsf::verification::extract_signer_pubkey(bytes)?;
-    let section = header.primary_section(bytes, end).map_err(|e| alloc::format!("frame section: {e}"))?;
-    Ok((section, signer))
-}
+/// The device-signed envelope pair, kept in `pq` so a build without `fanout` shares it; named here too, where every client has always found it.
+pub use crate::pq::{open_frame, signed_frame};
 
 /// `open_frame` for one expected section name.
 fn open_named(bytes: &[u8], name: &str) -> Result<(VsfSection, [u8; 32]), String> {

@@ -212,6 +212,27 @@ pub fn sign_envelope(unsigned: Vec<u8>, signer: &(impl FleetSigner + ?Sized)) ->
     vsf::verification::sign_file_with(unsigned, |file_hash| signer.eggs(file_hash, mask))
 }
 
+/// A device-signed envelope around `section`, stamped `time`: the header reserves one egg per scheme at the envelope tier and [`sign_envelope`] fills them.
+/// Lives here, not in `protocol`, so a build without `fanout` (the FGTW worker) reads and writes the same frames every client does.
+pub fn signed_frame(section: vsf::VsfSection, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let ke = signer.keypair().public.to_bytes();
+    let unsigned = vsf::VsfBuilder::new()
+        .creation_time_oscillations(time)
+        .signed_only_eggs(vsf::VsfType::ke(ke.to_vec()), &reserve_eggs(envelope_mask(signer)))
+        .add_section_direct(section)
+        .build()
+        .map_err(|e| alloc::format!("frame build: {e}"))?;
+    sign_envelope(unsigned, signer)
+}
+
+/// Verify a device-signed envelope and read its section: (the section, the signing device). Fails unless the anchor egg verifies under the header's own `ke`.
+pub fn open_frame(bytes: &[u8]) -> Result<(vsf::VsfSection, [u8; 32]), String> {
+    let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("frame verification failed: {e}"))?;
+    let signer = vsf::verification::extract_signer_pubkey(bytes)?;
+    let section = header.primary_section(bytes, end).map_err(|e| alloc::format!("frame section: {e}"))?;
+    Ok((section, signer))
+}
+
 /// Verify a signed VSF document's header eggs against the signer's declared `bundle`, requiring `required` — the policy half that vsf leaves to us. vsf has already checked the Ed25519 anchor; this checks the rest and that nothing required is missing. Returns the signer's device key.
 /// The ENVELOPE rule, one step looser than [`verify_eggs`]: every egg for a scheme the bundle HAS must verify, and those verified eggs must cover `required`; an egg for a scheme the bundle lacks is skipped, not fatal.
 ///

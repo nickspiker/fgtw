@@ -1,6 +1,7 @@
 //! The relay pipe — sans-io codec for the seed's live per-device WebSocket relay.
 //!
 //! A device opens `wss://<seed>/pipe?dev=<hex>[&svc=<tag>]` as its receive socket, and sends by pushing a signed relay envelope either up that same socket (full-duplex, the worker forwards it) or as an HTTPS POST.
+//! The seed binds the socket to the device only after the device answers its first frame, a seed-signed challenge, with a frame signed by its own key ([`challenge`], [`open_answer`], [`check_answer`]); an unproven socket carries nothing for the device (outside the seed's dated window for released clients) and never displaces a proven one.
 //! The envelope is a whole signed VSF — section `relay` `{recipient, payload[, svc]}`, signed by the sender's device key — so the receiver learns "via relay, from device X" from authenticated bytes.
 //!
 //! **Service tags.** Two apps sharing one device key (photon and the rustdesk fork share the fleet identity on purpose) must not share a pipe: the worker names the hub `<hex>` for a svc-less pipe (photon, unchanged) and `<hex>:<svc>` otherwise, so the two pipes have independent lifecycles — closing photon to update it can never drop the rustdesk session doing the updating — and a frame addressed to a service can only land on that service's socket.
@@ -120,6 +121,116 @@ fn peel_relay_section(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>, Vec<Egg>, [u8;
     Some((sender_key, payload, eggs, file_hash, section))
 }
 
+// ── the open handshake: a pipe is bound only to the device that proves its key ──
+//
+// The seed's first frame on a fresh pipe is a [`Challenge`] it signs with its own key: a fresh nonce, the seed's Eagle time, and the device and service the socket was opened for.
+// The device answers with [`open_answer`], a device-signed envelope whose one field commits to the domain [`OPEN_DOMAIN`] and the challenge's exact bytes.
+// The seed binds the pipe only when the answer's signer IS the device the pipe is named for and the commitment matches the challenge it sent on that socket.
+// A socket that never answers is unproven: it never displaces a proven pipe, and it carries no frame for the device (beyond the worker's dated window for released clients that open unsigned).
+
+/// The domain the answer commits to, so a pipe answer is never mistaken for any other signature the device key makes.
+pub const OPEN_DOMAIN: &str = "photon pipe open";
+/// The challenge's section name.
+pub const CHALLENGE_SECTION: &str = "pipe_challenge";
+/// The answer's section name.
+pub const OPEN_SECTION: &str = "pipe_open";
+
+/// A challenge as the device reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Challenge {
+    /// Fresh random material, one per socket.
+    pub nonce: [u8; 32],
+    /// The seed's Eagle time when it issued the challenge, in oscillations.
+    pub time: i64,
+    /// The device the pipe was opened for.
+    pub dev: [u8; 32],
+    /// The service hub the pipe was opened for (`None` = the photon hub).
+    pub svc: Option<String>,
+}
+
+/// The seed's challenge for a pipe opened for `dev` (and `svc`), signed with the seed's Ed25519 secret.
+/// `nonce` must be fresh for every socket; the worker draws it from the platform's random source.
+pub fn challenge(seed_secret: &[u8; 32], dev: &[u8; 32], svc: Option<&str>, nonce: &[u8; 32], time: i64) -> Result<Vec<u8>, String> {
+    let seed_public = ed25519_dalek::SigningKey::from_bytes(seed_secret).verifying_key().to_bytes();
+    let mut fields = vec![("nonce".to_string(), VsfType::hR(nonce.to_vec())), ("dev".to_string(), VsfType::ke(dev.to_vec()))];
+    if let Some(svc) = svc {
+        fields.push(("svc".to_string(), VsfType::d(vsf::Ascii::new(svc).map_err(|e| format!("pipe challenge svc: {e}"))?)));
+    }
+    let unsigned = vsf::VsfBuilder::new()
+        .creation_time_oscillations(time)
+        .signed_only(VsfType::ke(seed_public.to_vec()))
+        .add_section(CHALLENGE_SECTION, fields)
+        .build()
+        .map_err(|e| format!("pipe challenge build: {e}"))?;
+    vsf::verification::sign_file(unsigned, seed_secret)
+}
+
+/// Read a challenge off the pipe, verified under the seed's pinned key `seed_public`.
+/// `None` for anything else: a relay envelope, a frame signed by any other key, a malformed one.
+pub fn read_challenge(bytes: &[u8], seed_public: &[u8; 32]) -> Option<Challenge> {
+    // Every relay frame passes through here first, so anything that does not even claim to be the seed's challenge is turned away before a signature is hashed.
+    let (claimed, claimed_end) = vsf::file_format::VsfHeader::decode(bytes).ok()?;
+    let seed_signed = matches!(&claimed.signer_pubkey, Some(VsfType::ke(k)) if k.as_slice() == seed_public.as_slice());
+    if !seed_signed || !claimed.primary_section(bytes, claimed_end).is_ok_and(|s| s.name == CHALLENGE_SECTION) {
+        return None;
+    }
+    let (header, end) = vsf::verification::read_verified(bytes, Some(*seed_public)).ok()?;
+    let section = header.primary_section(bytes, end).ok()?;
+    if section.name != CHALLENGE_SECTION {
+        return None;
+    }
+    let time = match &header.creation_time {
+        Some(VsfType::e(et)) => crate::fleet::try_et_to_osc(et)?,
+        _ => return None,
+    };
+    let nonce = match section.get_field("nonce").and_then(|f| f.values.first()) {
+        Some(VsfType::hR(b)) if b.len() == 32 => b.as_slice().try_into().ok()?,
+        _ => return None,
+    };
+    let dev = match section.get_field("dev").and_then(|f| f.values.first()) {
+        Some(VsfType::ke(b)) if b.len() == 32 => b.as_slice().try_into().ok()?,
+        _ => return None,
+    };
+    let svc = match section.get_field("svc").and_then(|f| f.values.first()) {
+        None => None,
+        Some(VsfType::d(s)) => Some(s.as_str().to_string()),
+        Some(_) => return None,
+    };
+    Some(Challenge { nonce, time, dev, svc })
+}
+
+/// The commitment an answer carries: BLAKE3 in derive-key mode under [`OPEN_DOMAIN`] over the challenge's exact bytes.
+/// The whole challenge is committed (nonce, time, device, service and the seed's signature), so an answer fits the one socket it was asked on and no other.
+pub fn open_binding(challenge_bytes: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(OPEN_DOMAIN).update(challenge_bytes).finalize().as_bytes()
+}
+
+/// The device's answer to `challenge_bytes`: a signed frame (`pipe_open` `{ch}`) under the device key, stamped `time`.
+pub fn open_answer(challenge_bytes: &[u8], device_key: &(impl crate::pq::FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = vsf::VsfSection::new(OPEN_SECTION);
+    section.add_field("ch", VsfType::hb(open_binding(challenge_bytes).to_vec()));
+    crate::pq::signed_frame(section, device_key, time)
+}
+
+/// The seed's check of an answer: `Some(signer)` when it is a well-signed `pipe_open` whose commitment is `binding`.
+/// The caller still holds the signer to the device the pipe is named for; this returns it rather than taking it so a refusal can say which half failed.
+pub fn check_answer(bytes: &[u8], binding: &[u8; 32]) -> Option<[u8; 32]> {
+    let (section, signer) = crate::pq::open_frame(bytes).ok()?;
+    if section.name != OPEN_SECTION {
+        return None;
+    }
+    match section.get_field("ch").and_then(|f| f.values.first()) {
+        Some(VsfType::hb(b)) if b.as_slice() == binding.as_slice() => Some(signer),
+        _ => None,
+    }
+}
+
+/// Whether a frame names itself an answer (its primary section is `pipe_open`), read without verifying, so the seed can route it before paying for a signature check.
+pub fn is_open_answer(bytes: &[u8]) -> bool {
+    let Ok((header, end)) = vsf::file_format::VsfHeader::decode(bytes) else { return false };
+    header.primary_section(bytes, end).is_ok_and(|s| s.name == OPEN_SECTION)
+}
+
 // ── the rustdesk stream frame ──
 //
 // The envelope's inner payload for SVC_RUSTDESK is a byte-stream segment, NOT a VSF file: this is the per-video-frame hot path, the bytes are opaque to every relay hop (only the two rustdesk ends read them, and rustdesk's own session encryption rides inside), so a fixed 29-byte header beats a parse.
@@ -190,6 +301,67 @@ mod tests {
 
     fn kp(tag: u8) -> crate::keys::Keypair {
         derive_device_keypair(&[tag; 16])
+    }
+
+    const SEED_SECRET: [u8; 32] = [0x5e; 32];
+
+    fn seed_public() -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&SEED_SECRET).verifying_key().to_bytes()
+    }
+
+    /// The device reads the seed's challenge back exactly, and only under the seed's own key.
+    #[test]
+    fn a_challenge_reads_back_under_the_seed_key_only() {
+        let dev = kp(10).public.to_bytes();
+        let ch = challenge(&SEED_SECRET, &dev, Some(SVC_RUSTDESK), &[3u8; 32], 1 << 40).unwrap();
+        let read = read_challenge(&ch, &seed_public()).expect("reads under the seed key");
+        assert_eq!(read, Challenge { nonce: [3u8; 32], time: 1 << 40, dev, svc: Some(SVC_RUSTDESK.to_string()) });
+        assert!(read_challenge(&ch, &kp(11).public.to_bytes()).is_none(), "another key's challenge is not the seed's");
+        let photon = challenge(&SEED_SECRET, &dev, None, &[4u8; 32], 1 << 40).unwrap();
+        assert_eq!(read_challenge(&photon, &seed_public()).unwrap().svc, None);
+        let mut tampered = ch.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(read_challenge(&tampered, &seed_public()).is_none(), "a tampered challenge is refused");
+    }
+
+    /// A relay envelope is never read as a challenge, and a challenge is never peeled as a relay frame (so a released client that cannot answer drops it harmlessly).
+    #[test]
+    fn a_challenge_and_a_relay_frame_never_pass_for_each_other() {
+        let dev = kp(12);
+        let ch = challenge(&SEED_SECRET, &dev.public.to_bytes(), None, &[5u8; 32], 1 << 40).unwrap();
+        assert!(peel_relay_envelope(&ch).is_none());
+        let env = build_relay_envelope(&dev, &[9u8; 32], None, b"x").unwrap();
+        assert!(read_challenge(&env, &dev.public.to_bytes()).is_none());
+        assert!(!is_open_answer(&env));
+        assert!(!is_open_answer(&ch));
+    }
+
+    /// The seed accepts the device's answer to the challenge it sent and names the device that signed it.
+    #[test]
+    fn an_answer_names_its_signer_and_fits_only_its_own_challenge() {
+        let dev = kp(13);
+        let ch = challenge(&SEED_SECRET, &dev.public.to_bytes(), None, &[6u8; 32], 1 << 40).unwrap();
+        let answer = open_answer(&ch, &dev, (1 << 40) + 1).unwrap();
+        assert!(is_open_answer(&answer));
+        assert_eq!(check_answer(&answer, &open_binding(&ch)), Some(dev.public.to_bytes()));
+        // An answer to one socket's challenge is refused on any other socket's.
+        let other = challenge(&SEED_SECRET, &dev.public.to_bytes(), None, &[7u8; 32], 1 << 40).unwrap();
+        assert!(check_answer(&answer, &open_binding(&other)).is_none());
+        // A claimant without the key can only sign as itself: the seed reads the impostor as the signer, never as the device.
+        let impostor = open_answer(&ch, &kp(14), (1 << 40) + 1).unwrap();
+        assert_eq!(check_answer(&impostor, &open_binding(&ch)), Some(kp(14).public.to_bytes()));
+        let mut tampered = answer.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(check_answer(&tampered, &open_binding(&ch)).is_none());
+    }
+
+    /// The commitment carries the domain: the bare BLAKE3 of the challenge is not it.
+    #[test]
+    fn the_binding_is_domain_separated() {
+        let ch = challenge(&SEED_SECRET, &[1u8; 32], None, &[8u8; 32], 1 << 40).unwrap();
+        assert_ne!(open_binding(&ch), *blake3::hash(&ch).as_bytes());
     }
 
     #[test]
