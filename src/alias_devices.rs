@@ -61,11 +61,27 @@ impl DeviceList {
     /// Every Photon of the person's calls this with its own device key on each fetch, so two that add themselves at once converge: the loser of the race finds itself missing in the winner's list and adds itself again.
     #[cfg(feature = "sign")]
     pub fn with_device(held: Option<&DeviceList>, alias: &crate::pq::SigningBundle, handle_proof: &Key, device: Key, now: i64) -> Option<Self> {
-        if held.is_some_and(|l| l.contains(&device)) {
+        Self::revised(held, alias, handle_proof, Some(device), &[], now)
+    }
+
+    /// The list with `add` in it (when given) and none of `drop`, signed by the alias: None when the held list already says exactly that, else at a revision past the held one (`now`, or one past the held when the clock is behind it), so the new list wins.
+    /// A sign-out drops the device itself; a member drops what the chain has locked out.
+    #[cfg(feature = "sign")]
+    pub fn revised(held: Option<&DeviceList>, alias: &crate::pq::SigningBundle, handle_proof: &Key, add: Option<Key>, drop: &[Key], now: i64) -> Option<Self> {
+        let mut devices = held.map(|l| l.devices.clone()).unwrap_or_default();
+        let before = devices.len();
+        devices.retain(|d| !drop.contains(d));
+        let dropped = devices.len() != before;
+        let added = match add {
+            Some(d) if !devices.contains(&d) && !drop.contains(&d) => {
+                devices.push(d);
+                true
+            }
+            _ => false,
+        };
+        if !dropped && !added && held.is_some() {
             return None;
         }
-        let mut devices = held.map(|l| l.devices.clone()).unwrap_or_default();
-        devices.push(device);
         // WHY the max: the revision must pass the held one for the new list to win, and a device's clock may sit behind the one that signed it.
         let revision = held.map_or(now, |l| now.max(l.revision + 1));
         Some(Self::sign(alias, handle_proof, revision, devices, held.is_some_and(|l| l.complete)))
@@ -179,9 +195,27 @@ pub fn from_slot_doc(bytes: &[u8]) -> Result<(Vec<u8>, DeviceList), String> {
     Ok((binding, list))
 }
 
-/// Whether a list is the person's: the binding is taken against the person's chain (a current member signed it with every egg), names the list's person, and the alias it names signed the list with every egg its bundle holds.
+/// Whether a list is the person's AND names no device the person's chain has locked out: [`check_signed`], then the locks.
+/// The alias is every Photon's of the person, a stolen one's too, so the alias's signature alone cannot keep a locked device out of a list; the chain, which only a member can write, does (the owner 2026-11-18, the stolen ferros threat).
 /// Returns the binding, so a caller keeps the alias it names beside the pin.
 pub fn check(binding: &[u8], list: &DeviceList, chain: &crate::fleet::MembershipBlob) -> Result<crate::binding::Binding, String> {
+    let b = check_signed(binding, list, chain)?;
+    let named = locked_named(list, chain)?;
+    if !named.is_empty() {
+        return Err(format!("alias devices: the list names {} device(s) the chain has locked out", named.len()));
+    }
+    Ok(b)
+}
+
+/// The devices in `list` the chain has locked out (members by Lock, the rest by LockListed): what an honest holder drops in its next revision.
+pub fn locked_named(list: &DeviceList, chain: &crate::fleet::MembershipBlob) -> Result<Vec<Key>, String> {
+    let locked = chain.all_locked().map_err(|e| format!("alias devices: the chain does not fold ({e:?})"))?;
+    Ok(list.devices.iter().filter(|d| locked.contains(d)).copied().collect())
+}
+
+/// Whether a list is the person's: the binding is taken against the person's chain (a current member signed it with every egg), names the list's person, and the alias it names signed the list with every egg its bundle holds.
+/// Says nothing about locks: [`check`] is what a reader trusts; this is for the holder that prunes a list naming a locked device.
+pub fn check_signed(binding: &[u8], list: &DeviceList, chain: &crate::fleet::MembershipBlob) -> Result<crate::binding::Binding, String> {
     let b = crate::binding::Binding::from_vsf_bytes(binding)?;
     b.verify(chain).map_err(|e| format!("alias devices: the binding does not hold ({e:?})"))?;
     if b.handle_proof != list.handle_proof {
@@ -255,6 +289,76 @@ mod tests {
         assert!(check(&b, &other, &chain).is_err(), "a list another alias signed is not this binding's");
         let stranger = MembershipBlob::genesis_v2(&crate::pq::SigningBundle::derive(b"device b"), HP, &[7; 32], 1_000);
         assert!(check(&b, &l, &stranger).is_err(), "a binding by a device outside the chain is refused");
+    }
+
+    /// The stolen ferros threat (the owner 2026-11-18): the alias is every Photon's, so a stolen one signs a list naming itself again; a member's LockListed on the chain makes every check refuse it, a member's Lock does the same for a member, and an honest holder's revision without the locked device checks again.
+    #[test]
+    fn a_list_naming_a_chain_locked_device_is_refused() {
+        use crate::fleet::{bindreq_signing_bytes, MembershipBlob};
+        let member = crate::pq::SigningBundle::derive(b"device a");
+        let other = crate::pq::SigningBundle::derive(b"device b");
+        let mut chain = MembershipBlob::genesis_v2(&member, HP, &[7; 32], 1_000);
+        chain.declare(&member, 1_001);
+        let opk = other.keypair().public.to_bytes();
+        let consent = other.eggs(&bindreq_signing_bytes(&HP, &opk, 1_002), other.public().mask());
+        chain.add_declared(&member, opk, 1_002, 1_002, consent, other.public());
+        let a = alias();
+        let mask = chain.declared_mask(&member.keypair().public.to_bytes());
+        let binding = crate::binding::Binding::sign(&member, mask, &HP, &[2; 32], &[3; 32], a.bundle().unwrap(), 2_000).to_vsf_bytes().unwrap();
+        let mpk = member.keypair().public.to_bytes();
+        let ferros = [0x8a; 32];
+        let list = DeviceList::sign(&a, &HP, 2_001, vec![mpk, opk, ferros], false);
+        assert!(check(&binding, &list, &chain).is_ok());
+
+        chain.lock_listed(&member, ferros, 2_002);
+        assert_eq!(chain.listed_locked().unwrap(), vec![ferros]);
+        assert_eq!(chain.fold().unwrap().len(), 2, "a device outside the membership is locked without touching it");
+        let stolen = DeviceList::sign(&a, &HP, 2_003, vec![mpk, opk, ferros], false);
+        assert!(check(&binding, &stolen, &chain).is_err(), "the alias signs, the chain refuses");
+        assert!(check_signed(&binding, &stolen, &chain).is_ok(), "the signature itself is the person's");
+        assert_eq!(locked_named(&stolen, &chain).unwrap(), vec![ferros]);
+        let pruned = DeviceList::revised(Some(&stolen), &a, &HP, None, &[ferros], 2_004).unwrap();
+        assert!(pruned.newer_than(&stolen));
+        assert!(check(&binding, &pruned, &chain).is_ok(), "the holder's revision without it checks");
+
+        chain.lock(&member, opk, 2_005);
+        assert!(check(&binding, &pruned, &chain).is_err(), "a member locked by Lock is refused in a list as well");
+        assert_eq!(locked_named(&pruned, &chain).unwrap(), vec![opk]);
+    }
+
+    /// LockListed folds only from a live member, over a device outside the membership, once.
+    #[test]
+    fn lock_listed_names_a_non_member_once() {
+        use crate::fleet::{FoldError, MembershipBlob};
+        let member = crate::pq::SigningBundle::derive(b"device a");
+        let mut chain = MembershipBlob::genesis_v2(&member, HP, &[7; 32], 1_000);
+        let mpk = member.keypair().public.to_bytes();
+        let mut bad = chain.clone();
+        bad.lock_listed(&member, mpk, 1_001);
+        assert!(matches!(bad.fold(), Err(FoldError::LockMalformed { .. })), "a member is locked with Lock, never LockListed");
+        chain.lock_listed(&member, [0x8a; 32], 1_001);
+        let mut bad = chain.clone();
+        bad.lock_listed(&member, [0x8a; 32], 1_002);
+        assert!(matches!(bad.fold(), Err(FoldError::LockMalformed { .. })), "twice");
+        let stranger = crate::pq::SigningBundle::derive(b"device z");
+        let mut bad = chain.clone();
+        bad.lock_listed(&stranger, [0x8b; 32], 1_002);
+        assert!(matches!(bad.fold(), Err(FoldError::SignerNotMember { .. })), "a non-member cannot lock");
+        let bytes = chain.to_vsf_bytes().unwrap();
+        let back = MembershipBlob::from_vsf_bytes(&bytes).unwrap();
+        assert_eq!(back.listed_locked().unwrap(), vec![[0x8a; 32]], "the wire carries the kind");
+        assert_eq!(back.all_locked().unwrap(), vec![[0x8a; 32]]);
+    }
+
+    #[test]
+    fn a_device_signs_itself_out_of_the_list() {
+        let a = alias();
+        let list = DeviceList::sign(&a, &HP, 100, vec![[4; 32], [9; 32]], true);
+        let out = DeviceList::revised(Some(&list), &a, &HP, None, &[[9; 32]], 50).unwrap();
+        assert_eq!(out.devices, vec![[4; 32]]);
+        assert!(out.complete, "the cutover mark is kept");
+        assert!(out.newer_than(&list));
+        assert!(DeviceList::revised(Some(&out), &a, &HP, None, &[[9; 32]], 200).is_none(), "already gone: nothing to sign");
     }
 
     #[test]

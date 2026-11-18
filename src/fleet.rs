@@ -83,6 +83,11 @@ pub enum OpKind {
     Lock = 5,
     /// The owner's deliberate reversal of a `Lock`, by a current unlocked member. The device counts toward the floor and may sign again.
     Unlock = 6,
+    /// A current unlocked member locks out a device that is NOT a member: a Photon the alias's device list names that never joins the chain (a ferros one, docs/PHOTON.md M3), lost, stolen or gone without signing out (the owner 2026-11-18).
+    /// Every Photon of the person holds the same alias, so a stolen one could sign a device list naming itself again; the chain is the one record the alias alone cannot write, so a list naming a device locked here is refused wherever it is checked ([`crate::alias_devices::check`]).
+    /// No unlock op: the lock stands for that key for good, and a device that is wiped comes back under a new key.
+    /// A chain-format flag day like Checkpoint: a build before this kind refuses the parse on 7, and a chain carries one only from the moment the owner locks such a device out.
+    LockListed = 7,
 }
 
 impl OpKind {
@@ -95,6 +100,7 @@ impl OpKind {
             4 => Some(OpKind::Declare),
             5 => Some(OpKind::Lock),
             6 => Some(OpKind::Unlock),
+            7 => Some(OpKind::LockListed),
             _ => None,
         }
     }
@@ -500,6 +506,8 @@ struct FoldState {
     floor: scheme::Mask,
     bundles: Vec<([u8; 32], crate::pq::KeyBundle)>,
     locked: Vec<[u8; 32]>,
+    /// Devices outside the membership the chain has locked out ([`OpKind::LockListed`]), in the order they were locked.
+    listed_locked: Vec<[u8; 32]>,
     /// Every plate a device ever declared, keyed by device, the newest declaration winning. Kept for departed devices too: a plate locked or departed stays known.
     plates: Vec<([u8; 32], [u8; 32])>,
     /// What each device last said its plate names ([`plate`] constants), newest wins; absent = unstated.
@@ -561,7 +569,7 @@ pub enum FoldError {
     SignerNotMember { index: usize },
     /// The op's signer is locked out — a locked device holds no authority over the chain, least of all the authority to unlock itself.
     SignerLocked { index: usize },
-    /// A Lock names a non-member, an already-locked device, or the signer itself; an Unlock names a device that is not locked.
+    /// A Lock names a non-member, an already-locked device, or the signer itself; an Unlock names a device that is not locked; a LockListed names a current member or a device it already locked.
     LockMalformed { index: usize },
     AddExistingMember { index: usize },
     RemoveNonMember { index: usize },
@@ -620,6 +628,8 @@ impl MembershipBlob {
         let mut members: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         // Members the fleet has locked out, each with the step it was locked at. Still members — still hosts — but they carry no authority and the floor stops waiting on them.
         let mut locked: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        // Devices outside the membership the fleet has locked out (LockListed), each with the step it was locked at. Never members, so never in the tally.
+        let mut listed_locked: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         // What each member has declared it can sign with — the full public bundle, so later ops by that device can be verified against it. Absent = Ed25519 alone: no special "undeclared" state, because every device genuinely holds an Ed25519 key.
         // A device's bundle is its FIRST entry here (an Add pushes even for a device that was a member before, and the lookup always found the first); `bundle_at` names that entry.
         let mut bundles: Vec<([u8; 32], crate::pq::KeyBundle)> = Vec::new();
@@ -847,6 +857,16 @@ impl MembershipBlob {
                     // Only a member can be locked and a departure clears the lock, so the unlocked device is a member and comes back into the tally.
                     tally(&mut lacking, mask_of(&bundles, &bundle_at, &op.device_pubkey), true);
                 }
+                OpKind::LockListed => {
+                    if !members.contains_key(&op.signer_pubkey) {
+                        return Err(FoldError::SignerNotMember { index: i });
+                    }
+                    // The subject is outside the membership (a member is locked with Lock) and not locked here already; the signer, a member, can never be it.
+                    if members.contains_key(&op.device_pubkey) || listed_locked.contains_key(&op.device_pubkey) {
+                        return Err(FoldError::LockMalformed { index: i });
+                    }
+                    listed_locked.insert(op.device_pubkey, i);
+                }
                 OpKind::Checkpoint => {
                     // Membership is untouched; the op only pins the epoch spine, so the gates are: a current member signed it, the fields are non-void, and k advances by exactly one.
                     if !members.contains_key(&op.signer_pubkey) {
@@ -868,7 +888,17 @@ impl MembershipBlob {
             floor |= live;
             expected_prev = op.chain_hash();
         }
-        Ok(FoldState { members: in_step_order(members), floor, bundles, locked: in_step_order(locked), plates, kinds })
+        Ok(FoldState { members: in_step_order(members), floor, bundles, locked: in_step_order(locked), listed_locked: in_step_order(listed_locked), plates, kinds })
+    }
+
+    /// The devices outside the membership the chain has LOCKED OUT ([`OpKind::LockListed`]): Photons on the alias alone that the owner locked from a member.
+    pub fn listed_locked(&self) -> Result<Vec<[u8; 32]>, FoldError> {
+        self.fold_inner().map(|f| f.listed_locked)
+    }
+
+    /// Every device the chain has locked out, members ([`OpKind::Lock`]) and the rest ([`OpKind::LockListed`]): what a device list may not name.
+    pub fn all_locked(&self) -> Result<Vec<[u8; 32]>, FoldError> {
+        self.fold_inner().map(|f| f.locked.into_iter().chain(f.listed_locked).collect())
     }
 
     /// The devices the chain has LOCKED OUT: still members, but excluded from the floor and from signing. What a host checks beside the epoch proof, and what a fleet UI shows as "locked".
@@ -1089,6 +1119,11 @@ impl MembershipBlob {
     /// Reverse a [`lock`](Self::lock). See [`OpKind::Unlock`].
     pub fn unlock(&mut self, signer: &impl crate::pq::FleetSigner, device: [u8; 32], eagle_time: i64) {
         self.lock_op(signer, device, eagle_time, OpKind::Unlock);
+    }
+
+    /// Lock out `device`, a device outside the membership (a Photon the alias's list names), signed by `signer`, a current unlocked member. See [`OpKind::LockListed`].
+    pub fn lock_listed(&mut self, signer: &impl crate::pq::FleetSigner, device: [u8; 32], eagle_time: i64) {
+        self.lock_op(signer, device, eagle_time, OpKind::LockListed);
     }
 
     fn lock_op(&mut self, signer: &impl crate::pq::FleetSigner, device: [u8; 32], eagle_time: i64, kind: OpKind) {
@@ -2191,7 +2226,7 @@ mod tests {
                 }
                 OpKind::Lock => locked.push(d),
                 OpKind::Unlock => locked.retain(|m| *m != d),
-                OpKind::Checkpoint => {}
+                OpKind::Checkpoint | OpKind::LockListed => {}
             }
             let live = members
                 .iter()
