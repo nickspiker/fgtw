@@ -1280,6 +1280,14 @@ impl MembershipBlob {
         self.ops.iter().rev().find(|op| op.kind == OpKind::Checkpoint).map(|op| (op.ckpt_k, op.ckpt_commit, op.ckpt_fanout_epoch))
     }
 
+    /// The fleet epoch that followed `device`'s lock: the `k` of the first Checkpoint after the op that locked it (Lock or LockListed), the first epoch whose fold has it locked out; with no checkpoint after the lock yet, the one the next checkpoint will carry.
+    /// What a re-key the lock owes waits for, wherever a device stands when it learns of the lock: an epoch it already holds past this one means the re-key goes at once. `None` when the chain never locked the device. Does no validation itself; callers fold first.
+    pub fn epoch_after_lock(&self, device: &[u8; 32]) -> Option<u64> {
+        let at = self.ops.iter().rposition(|op| matches!(op.kind, OpKind::Lock | OpKind::LockListed) && op.device_pubkey == *device)?;
+        let after = self.ops[at..].iter().find(|op| op.kind == OpKind::Checkpoint).map(|op| op.ckpt_k);
+        Some(after.unwrap_or_else(|| self.latest_checkpoint().map_or(0, |(k, _, _)| k) + 1))
+    }
+
     // ── VSF wire form: section "fleet" with one repeated "op" multi-value field per op (same shape as PhonebookResponse's "peer" fields, so the FGTW worker mirrors the parse with the existing pattern).
     //    Positional op layout: hP(handle_proof) hb(prev) u(kind) ke(device) e6(time) ke(signer), then GENESIS-ONLY ke(identity_pubkey) ge(identity_sig), then ADD-ONLY e6(consent_t) ge(consent_sig), then CHECKPOINT-ONLY u(k) hb(commit) u(fanout_epoch), then (u scheme, ge sig) egg pairs to the end.
     //    The identity/consent/checkpoint groups are gated by kind (known at value index 2) and mutually exclusive, so no op carries waste and the egg tail stays unambiguous. Appending a PQ egg = two more trailing values; nothing before them moves. ──
@@ -2287,6 +2295,27 @@ mod tests {
 
     /// A locked-out member is still a member but no longer holds the floor down: with the last undeclared device locked, the fleet promotes; an unlock puts it back in the AND without lowering the ratchet; and a locked device signs nothing that folds — including its own unlock.
     #[cfg(feature = "client")]
+    /// The epoch a lock's re-key waits for is fixed by the chain, not by where a device stands when it learns of the lock: the first checkpoint after the lock, or the next one while none has come.
+    #[test]
+    fn the_epoch_after_a_lock_is_the_first_checkpoint_past_it() {
+        let a = key(1);
+        let b = key(2);
+        let mut blob = MembershipBlob::genesis(&a, HP, &SEED, 100);
+        let bpk = b.public.to_bytes();
+        let consent = b.eggs(&bindreq_signing_bytes(&HP, &bpk, 101), scheme::MASK_BASE);
+        blob.add(&a, bpk, 101, 101, consent);
+        blob.checkpoint(&a, 102, 1, [0x11; 32], 1);
+        assert_eq!(blob.epoch_after_lock(&bpk), None, "never locked");
+        blob.lock(&a, bpk, 103);
+        assert_eq!(blob.epoch_after_lock(&bpk), Some(2), "no checkpoint past the lock yet: the next one");
+        blob.checkpoint(&a, 104, 2, [0x22; 32], 2);
+        blob.checkpoint(&a, 105, 3, [0x33; 32], 3);
+        assert!(blob.fold().is_ok());
+        assert_eq!(blob.epoch_after_lock(&bpk), Some(2), "the first checkpoint past the lock, however far the chain has gone since");
+        blob.lock_listed(&a, [0x8a; 32], 106);
+        assert_eq!(blob.epoch_after_lock(&[0x8a; 32]), Some(4));
+    }
+
     #[test]
     fn a_locked_device_stops_pinning_the_floor_and_holds_no_authority() {
         use crate::pq::SigningBundle;
