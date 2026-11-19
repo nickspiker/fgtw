@@ -205,6 +205,10 @@ pub mod phonebook;
 pub mod traverse;
 pub mod pipe;
 
+/// A rough place from the request's network address, for a GPS receiver before its first lock: the anonymous ask, the seed's signed reply and its check.
+/// no_std; the seed is the last resort (see the module).
+pub mod rough_place;
+
 /// The FGTW wire protocol — the GENERIC frames between fleet devices: the LAN beacon, the binding and departure requests, the membership chain and fan-out over the mesh (2026-10-31). no_std codec, behind `fanout` (the pairing commitments and words).
 /// The photon-specific messages (chat, CLUTCH, PT) stay in photon; announce/challenge, avatar and blob are still photon's ⏳.
 #[cfg(feature = "fanout")]
