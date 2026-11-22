@@ -20,6 +20,8 @@ enum Q {
     Reachable(Key),
     User(UserOp),
     Nfc([u8; 32]),
+    /// Unbind pressed with this handle proof typed.
+    Unbind { proof: Key, salt: [u8; 32], hold: bool },
 }
 
 struct Dev {
@@ -82,6 +84,13 @@ impl Net {
         self.run();
     }
 
+    /// The person on device `i` removes it: Remove, the handle typed (its proof), Unbind.
+    fn leave(&mut self, i: usize, salt: [u8; 32]) {
+        self.queue.push((i, Q::User(UserOp::Remove)));
+        self.queue.push((i, Q::Unbind { proof: HP, salt, hold: false }));
+        self.run();
+    }
+
     fn tell_members(&mut self) {
         for i in 0..self.devs.len() {
             self.queue.push((i, Q::Members));
@@ -102,6 +111,7 @@ impl Net {
                 Q::Reachable(k) => self.devs[i].m.step(Event::Reachable { from: *k }, self.now),
                 Q::User(op) => self.devs[i].m.step(Event::User(*op), self.now),
                 Q::Nfc(s) => self.devs[i].m.step(Event::NfcRead { secret: *s }, self.now),
+                Q::Unbind { proof, salt, hold } => self.devs[i].m.step(Event::Unbind { proof: *proof, intent: 1, salt: *salt, hold: *hold }, self.now),
             };
             self.carry(i, step.actions);
         }
@@ -160,10 +170,14 @@ impl Net {
 const SALT: [u8; 32] = [0x5a; 32];
 const LEAVE: UserOp = UserOp::Leave { intent: 1, salt: SALT };
 
+fn builds_a_request(a: &[Action]) -> bool {
+    a.iter().any(|x| matches!(x, Action::Build { frame: super::Frame::DepartReq { .. }, .. }))
+}
+
 #[test]
 fn the_last_device_cannot_ask_to_leave() {
     let mut net = Net::new(1);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     assert!(net.noted(0, |n| *n == Note::LastDevice));
     assert!(!net.devs[0].m.asking());
 }
@@ -172,7 +186,7 @@ fn the_last_device_cannot_ask_to_leave() {
 fn a_fleet_not_known_yet_is_treated_as_one_device() {
     let kp = Keypair::from_seed(&[9; 32]);
     let mut m = Depart::new(HP, kp.public.to_bytes(), true);
-    let s = m.step(Event::User(LEAVE), 1);
+    let s = m.step(Event::User(UserOp::Remove), 1);
     assert_eq!(s.actions, vec![Action::Note(Note::LastDevice)]);
 }
 
@@ -180,7 +194,7 @@ fn a_fleet_not_known_yet_is_treated_as_one_device() {
 fn approve_on_one_device_removes_the_leaver_and_it_wipes() {
     let mut net = Net::new(3);
     let leaver = net.key(0);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     assert!(net.noted(0, |n| *n == Note::DepartAsking));
     assert!(net.noted(1, |n| *n == Note::DepartAsked { leaver }));
     assert!(net.noted(2, |n| *n == Note::DepartAsked { leaver }));
@@ -196,7 +210,7 @@ fn approve_on_one_device_removes_the_leaver_and_it_wipes() {
 fn deny_tells_the_leaver_and_every_device_refuses_that_salt() {
     let mut net = Net::new(3);
     let (leaver, denier) = (net.key(0), net.key(1));
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     let frame = {
         // The request as the fleet received it, to replay after the deny.
         let o = net.devs[0].m.to_section();
@@ -217,7 +231,7 @@ fn deny_tells_the_leaver_and_every_device_refuses_that_salt() {
     assert_eq!(net.devs[2].m.asked(), None);
     // A real second request is stamped later; a denied consent stamp is refused like a denied salt.
     net.now += 1;
-    net.user(0, UserOp::Leave { intent: 1, salt: [0x6b; 32] });
+    net.leave(0, [0x6b; 32]);
     assert_eq!(net.devs[2].m.asked(), Some((leaver, 1, [0x6b; 32])));
 }
 
@@ -226,7 +240,7 @@ fn a_request_lost_to_a_failed_send_is_handed_again_when_the_device_is_reachable(
     let mut net = Net::new(3);
     let (leaver, far) = (net.key(0), net.key(2));
     net.down.push(far);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     assert_eq!(net.devs[2].m.asked(), None, "the send gave up");
     net.down.clear();
     net.queue.push((0, Q::Reachable(far)));
@@ -240,7 +254,7 @@ fn a_locked_member_is_not_asked_and_cannot_deny() {
     let (leaver, locked) = (net.key(0), net.key(2));
     net.locked.push(locked);
     net.tell_members();
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     assert_eq!(net.devs[2].m.asked(), None);
     // A deny signed by the locked device changes nothing.
     let deny = build(&super::Frame::DepartDeny { hp: HP, leaver, salt: SALT, t: net.now }, &net.devs[2].kp, net.now).unwrap();
@@ -253,7 +267,7 @@ fn a_locked_member_is_not_asked_and_cannot_deny() {
 fn a_tap_of_the_leaving_device_approves() {
     let mut net = Net::new(2);
     let leaver = net.key(0);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     net.queue.push((1, Q::Nfc(SALT)));
     net.run();
     assert!(net.wiped.contains(&leaver));
@@ -264,7 +278,7 @@ fn a_failed_approval_keeps_the_request_for_another_try() {
     let mut net = Net::new(2);
     let leaver = net.key(0);
     net.approve_fails = true;
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     net.user(1, UserOp::Approve);
     assert!(net.noted(1, |n| matches!(n, Note::DepartApproveFailed { leaver: l, .. } if *l == leaver)));
     assert_eq!(net.devs[1].m.asked(), Some((leaver, 1, SALT)));
@@ -278,7 +292,7 @@ fn the_state_survives_a_restart_and_the_request_goes_out_again() {
     let mut net = Net::new(3);
     let (leaver, far) = (net.key(0), net.key(2));
     net.down.push(far);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     let doc = net.devs[0].m.to_vsf(net.now).unwrap();
     let back = Depart::from_vsf(&doc, HP, net.key(0), true).unwrap();
     net.devs[0].m = back;
@@ -303,7 +317,7 @@ fn a_member_never_reached_is_handed_the_request_when_it_shows_up() {
     let mut net = Net::with(3, false);
     let (leaver, far) = (net.key(0), net.key(2));
     net.silent.push(far);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     assert_eq!(net.devs[2].m.asked(), None, "the first send vanished and no Sent came back");
     net.silent.clear();
     net.queue.push((0, Q::Reachable(far)));
@@ -314,7 +328,7 @@ fn a_member_never_reached_is_handed_the_request_when_it_shows_up() {
 #[test]
 fn a_frame_reports_its_signer_and_address() {
     let mut net = Net::new(2);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     let frame = build(&super::Frame::DepartReq { hp: HP, t: net.now + 1, intent: 1, salt: [7; 32] }, &net.devs[0].kp, net.now).unwrap();
     let addr: core::net::SocketAddr = "192.0.2.7:4383".parse().unwrap();
     let s = net.devs[1].m.step(Event::Frame { bytes: &frame, from: Some(addr) }, net.now);
@@ -327,7 +341,7 @@ fn a_send_in_flight_is_not_sent_again_when_its_device_shows_up() {
     let mut net = Net::new(3);
     let far = net.key(2);
     net.silent.push(far);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     let s = net.devs[0].m.step(Event::Reachable { from: far }, net.now);
     assert!(s.actions.iter().all(|a| !matches!(a, Action::Send { .. })), "still in flight, so no second send");
     // A send that gave up is handed again.
@@ -341,7 +355,7 @@ fn a_send_in_flight_is_not_sent_again_when_its_device_shows_up() {
 fn the_approver_hands_the_leaver_the_new_chain() {
     let mut net = Net::new(2);
     let leaver = net.key(0);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     net.user(1, UserOp::Approve);
     assert!(net.pushed_chain.contains(&leaver));
 }
@@ -350,7 +364,7 @@ fn the_approver_hands_the_leaver_the_new_chain() {
 fn a_withdrawn_request_leaves_the_approvers() {
     let mut net = Net::new(2);
     let leaver = net.key(0);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     let t = net.devs[1].m.asked_t().unwrap();
     assert!(net.devs[0].m.own_frame().is_some(), "the leaver keeps its signed request");
     net.queue.push((1, Q::Members));
@@ -363,9 +377,67 @@ fn a_withdrawn_request_leaves_the_approvers() {
 #[test]
 fn the_saved_state_holds_no_handle_proof() {
     let mut net = Net::new(2);
-    net.user(0, LEAVE);
+    net.leave(0, SALT);
     let sec = net.devs[0].m.to_section();
     assert!(sec.get_field("hp").is_none());
     let doc = net.devs[0].m.to_vsf(net.now).unwrap();
     assert!(!doc.windows(32).any(|w| w == HP), "the handle proof never reaches the disk");
+}
+
+#[test]
+fn leave_alone_sends_nothing_the_handle_must_be_typed() {
+    let mut net = Net::new(3);
+    let a = net.devs[0].m.step(Event::User(LEAVE), net.now);
+    assert!(!builds_a_request(&a.actions), "a bare Leave is refused");
+    assert!(!net.devs[0].m.asking());
+    // Unbind without Remove first is refused too.
+    let a = net.devs[0].m.step(Event::Unbind { proof: HP, intent: 1, salt: SALT, hold: false }, net.now);
+    assert!(!builds_a_request(&a.actions));
+    assert!(!net.devs[0].m.asking());
+}
+
+#[test]
+fn a_wrong_handle_sends_nothing_and_says_so() {
+    let mut net = Net::new(3);
+    net.user(0, UserOp::Remove);
+    assert_eq!(net.devs[0].m.removal(), super::depart::Removal::TypeHandle { wrong: false });
+    let a = net.devs[0].m.step(Event::Unbind { proof: [0x22; 32], intent: 1, salt: SALT, hold: false }, net.now);
+    assert!(!builds_a_request(&a.actions));
+    assert_eq!(net.devs[0].m.removal(), super::depart::Removal::TypeHandle { wrong: true });
+    assert!(!net.noted(1, |n| matches!(n, Note::DepartAsked { .. })), "no other device hears of it");
+    // The right handle then asks the fleet at once (no Fleet page needed there: the note is the approver's notification).
+    net.queue.push((0, Q::Unbind { proof: HP, salt: SALT, hold: false }));
+    net.run();
+    assert!(net.devs[0].m.asking());
+    assert!(net.noted(1, |n| *n == Note::DepartAsked { leaver: net.key(0) }));
+}
+
+#[test]
+fn a_held_removal_asks_only_on_leave_and_survives_a_restart() {
+    let mut net = Net::new(2);
+    net.user(0, UserOp::Remove);
+    net.queue.push((0, Q::Unbind { proof: HP, salt: SALT, hold: true }));
+    net.run();
+    assert!(!net.devs[0].m.asking(), "held: nothing out yet");
+    assert_eq!(net.devs[0].m.removal(), super::depart::Removal::Held { intent: 1 });
+    let me = net.key(0);
+    let doc = net.devs[0].m.to_vsf(net.now).unwrap();
+    net.devs[0].m = Depart::from_vsf(&doc, HP, me, true).unwrap();
+    net.tell_members();
+    assert_eq!(net.devs[0].m.removal(), super::depart::Removal::Held { intent: 1 });
+    net.user(0, LEAVE);
+    assert!(net.devs[0].m.asking());
+    assert!(net.noted(1, |n| *n == Note::DepartAsked { leaver: me }));
+}
+
+#[test]
+fn give_up_drops_a_held_removal() {
+    let mut net = Net::new(2);
+    net.user(0, UserOp::Remove);
+    net.queue.push((0, Q::Unbind { proof: HP, salt: SALT, hold: true }));
+    net.run();
+    net.user(0, UserOp::GiveUp);
+    assert_eq!(net.devs[0].m.removal(), super::depart::Removal::Idle);
+    net.user(0, LEAVE);
+    assert!(!net.devs[0].m.asking());
 }

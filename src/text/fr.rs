@@ -115,5 +115,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "le départ a été refusé sur {name}"),
         Msg::DepartNotStarted => o.write_str("le départ n’a pas commencé"),
         Msg::LastDevice => o.write_str("C\u{2019}est le dernier appareil de ton identité.\nIl ne peut pas partir. Ajoute d\u{2019}abord un autre appareil, puis retire celui-ci."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Cette identité a déjà des appareils.\nAjouter celui-ci ? Rien ne leur parvient avant ton oui."),
+        Msg::JoinConfirmYes => o.write_str("Oui, je veux vraiment ajouter cet appareil, c’est bien mon identité et pas une faute de frappe"),
+        Msg::JoinTogether => o.write_str("Rapproche les deux appareils, l’écran de l’autre allumé et sa page flotte ouverte, dans Photon ou ferros.\nOu touche le nom de cet appareil sur cette page, puis son bouton vert."),
+        Msg::JoinShowWords => o.write_str("Hors de portée ? Afficher les mots à copier/coller ou dicter"),
+        Msg::RemoveTypeHandle => o.write_str("Tape ton handle pour retirer cet appareil, puis appuie sur Délier."),
+        Msg::UnbindPill => o.write_str("Délier"),
+        Msg::RemoveHandleWrong => o.write_str("Ce n\u{2019}est pas le handle de cette identité. Rien n\u{2019}a été envoyé."),
+        Msg::RemoveChecking => o.write_str("Vérification du handle\u{2026}"),
     }
 }

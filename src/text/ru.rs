@@ -112,5 +112,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "уход отклонён на устройстве {name}"),
         Msg::DepartNotStarted => o.write_str("уход не начался"),
         Msg::LastDevice => o.write_str("Это последнее устройство твоей личности.\nЕму нельзя уйти. Сначала добавь другое устройство, а потом отправь это на покой."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("У этой личности уже есть устройства.\nДобавить это? Им ничего не придёт, пока ты не скажешь да."),
+        Msg::JoinConfirmYes => o.write_str("Да, я правда хочу добавить это устройство, это моя личность, и это не опечатка"),
+        Msg::JoinTogether => o.write_str("Приложи устройства друг к другу, у другого экран включён и открыта страница флота, в Photon или ferros.\nИли коснись имени этого устройства на той странице, затем его зелёной кнопки."),
+        Msg::JoinShowWords => o.write_str("Не рядом? Показать слова, чтобы скопировать/вставить или продиктовать"),
+        Msg::RemoveTypeHandle => o.write_str("Введи свой handle, чтобы убрать это устройство, затем нажми Отвязать."),
+        Msg::UnbindPill => o.write_str("Отвязать"),
+        Msg::RemoveHandleWrong => o.write_str("Это не handle этой личности. Ничего не отправлено."),
+        Msg::RemoveChecking => o.write_str("Проверяю handle\u{2026}"),
     }
 }

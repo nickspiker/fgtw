@@ -107,5 +107,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "kuondoka kumekataliwa kwenye {name}"),
         Msg::DepartNotStarted => o.write_str("kuondoka hakukuanza"),
         Msg::LastDevice => o.write_str("Hiki ndicho kifaa cha mwisho cha utambulisho wako.\nHakiwezi kuondoka. Ongeza kifaa kingine kwanza, kisha ukistaafishe hiki."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Utambulisho huu tayari una vifaa.\nUongeze hiki? Hakuna kinachowafikia hadi useme ndiyo."),
+        Msg::JoinConfirmYes => o.write_str("Ndiyo, kweli nataka kuongeza kifaa hiki, huu ni utambulisho wangu na si kosa la kuandika"),
+        Msg::JoinTogether => o.write_str("Weka vifaa viwili pamoja, skrini ya kingine ikiwa imewashwa na ukurasa wake wa kundi ukiwa wazi, katika Photon au ferros.\nAu gusa jina la kifaa hiki kwenye ukurasa huo, kisha kitufe chake cha kijani."),
+        Msg::JoinShowWords => o.write_str("Haupo karibu? Onyesha maneno ya kunakili/kubandika au kuyasoma kwa sauti"),
+        Msg::RemoveTypeHandle => o.write_str("Andika handle yako ili kuondoa kifaa hiki, kisha bonyeza Tenganisha."),
+        Msg::UnbindPill => o.write_str("Tenganisha"),
+        Msg::RemoveHandleWrong => o.write_str("Hiyo si handle ya utambulisho huu. Hakuna kilichotumwa."),
+        Msg::RemoveChecking => o.write_str("Inakagua handle\u{2026}"),
     }
 }

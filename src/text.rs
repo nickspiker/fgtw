@@ -367,6 +367,23 @@ pub enum Msg<'a> {
     DepartNotStarted,
     /// Photon's. Wrapping. The identity's last device cannot ask to leave: add another device first.
     LastDevice,
+    // ---- the owner's join and removal (2026-11-22) ----
+    /// ferros's (9c987372). Wrapping, one forced break. The joiner's question once the identity is found to have a fleet: nothing is sent before the yes.
+    JoinConfirmPrompt,
+    /// The owner's words. Wrapping (a sentence on a wide button the drawer wraps). The yes that lets the join out.
+    JoinConfirmYes,
+    /// ferros's (9c987372). Wrapping, one forced break. How to finish after the yes: the two devices together (NFC), else the touch to add (BLE).
+    JoinTogether,
+    /// ferros's (9c987372). Wrapping. The button behind which the words wait (never shown by default: shoulder surfing); pressing it also gives fgtw.org's registry the request.
+    JoinShowWords,
+    /// Wrapping. After Remove: the handle is asked for.
+    RemoveTypeHandle,
+    /// One-line. The button that sends the removal once the handle is typed.
+    UnbindPill,
+    /// Wrapping. The handle typed is not this identity's: nothing went out.
+    RemoveHandleWrong,
+    /// One-line. The typed handle's proof runs.
+    RemoveChecking,
 }
 
 /// Message `m` in language `l`, written into `o`.
@@ -500,6 +517,14 @@ mod tests {
         add(Msg::DepartDeniedOn(H), 1, false);
         add(Msg::DepartNotStarted, 0, true);
         add(Msg::LastDevice, 0, false);
+        add(Msg::JoinConfirmPrompt, 0, false);
+        add(Msg::JoinConfirmYes, 0, false);
+        add(Msg::JoinTogether, 0, false);
+        add(Msg::JoinShowWords, 0, false);
+        add(Msg::RemoveTypeHandle, 0, false);
+        add(Msg::UnbindPill, 0, true);
+        add(Msg::RemoveHandleWrong, 0, false);
+        add(Msg::RemoveChecking, 0, true);
         v
     }
 

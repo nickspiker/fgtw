@@ -107,5 +107,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "ayrılma şu cihazda reddedildi: {name}"),
         Msg::DepartNotStarted => o.write_str("ayrılış başlamadı"),
         Msg::LastDevice => o.write_str("Bu, kimliğinin son cihazı.\nAyrılamaz. Önce başka bir cihaz ekle, sonra bunu emekliye ayır."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Bu kimliğin zaten cihazları var.\nBu da eklensin mi? Sen evet diyene kadar onlara hiçbir şey gitmez."),
+        Msg::JoinConfirmYes => o.write_str("Evet, bu cihazı gerçekten eklemek istiyorum, bu benim kimliğim ve yazım hatası değil"),
+        Msg::JoinTogether => o.write_str("İki cihazı birbirine yaklaştır, diğerinin ekranı açık ve filo sayfası açık olsun, Photon veya ferros'ta.\nYa da o sayfada bu cihazın adına dokun, sonra yeşil düğmesine."),
+        Msg::JoinShowWords => o.write_str("Menzilde değil mi? Kopyalayıp yapıştırmak veya dikte etmek için kelimeleri göster"),
+        Msg::RemoveTypeHandle => o.write_str("Bu cihazı kaldırmak için handle'ını yaz, sonra Bağı çöz'e bas."),
+        Msg::UnbindPill => o.write_str("Bağı çöz"),
+        Msg::RemoveHandleWrong => o.write_str("Bu, bu kimliğin handle'ı değil. Hiçbir şey gönderilmedi."),
+        Msg::RemoveChecking => o.write_str("Handle denetleniyor\u{2026}"),
     }
 }

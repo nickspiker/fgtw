@@ -79,12 +79,34 @@ fn a_device_without_the_fleet_key_does_not_open_the_flow() {
 }
 
 #[test]
-fn a_lan_request_while_the_page_is_closed_notifies_once() {
+fn a_lan_request_lights_nothing_while_the_page_is_closed() {
     let mut rig = Rig::new(1);
+    let j = joiner(0);
+    let r = request(&j, &[0; 32]);
+    assert!(!rig.hear(&j, &r).iter().any(|a| matches!(a, Action::Note(_))), "deaf ears: the page is closed, nothing is said");
+    // Kept quietly: the page opening lists it.
+    rig.open();
+    assert!(rig.m.view().rows.iter().any(|row| row.device == j.public.to_bytes()));
+}
+
+#[test]
+fn a_lan_request_while_the_page_is_open_is_said_once() {
+    let mut rig = Rig::new(1);
+    rig.open();
     let j = joiner(0);
     let r = request(&j, &[0; 32]);
     assert!(has_note(&rig.hear(&j, &r), Note::AsksToJoin { device: j.public.to_bytes() }));
     assert!(!rig.hear(&j, &r).iter().any(|a| matches!(a, Action::Note(_))), "the same request again says nothing");
+}
+
+#[test]
+fn a_lan_request_is_not_said_where_the_page_shows_without_the_fleet_key() {
+    let mut rig = Rig::new(1);
+    rig.step(Event::FleetKey { held: false });
+    rig.open();
+    let j = joiner(0);
+    let r = request(&j, &[0; 32]);
+    assert!(!rig.hear(&j, &r).iter().any(|a| matches!(a, Action::Note(Note::AsksToJoin { .. }))));
 }
 
 #[test]

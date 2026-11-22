@@ -106,5 +106,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "a saída foi recusada em {name}"),
         Msg::DepartNotStarted => o.write_str("a saída não começou"),
         Msg::LastDevice => o.write_str("Este é o último dispositivo da sua identidade.\nEle não pode sair. Adicione outro dispositivo primeiro e só então aposente este."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Esta identidade já tem dispositivos.\nAdicionar este? Nada chega a eles até você dizer sim."),
+        Msg::JoinConfirmYes => o.write_str("Sim, eu realmente quero adicionar este dispositivo, esta é a minha identidade e não é um erro de digitação"),
+        Msg::JoinTogether => o.write_str("Junte os dois dispositivos, com a tela do outro ligada e a página da frota aberta, no Photon ou no ferros.\nOu toque no nome deste dispositivo nessa página e depois no botão verde."),
+        Msg::JoinShowWords => o.write_str("Fora de alcance? Mostrar palavras para copiar/colar ou ditar"),
+        Msg::RemoveTypeHandle => o.write_str("Digite seu handle para remover este dispositivo e depois toque em Desvincular."),
+        Msg::UnbindPill => o.write_str("Desvincular"),
+        Msg::RemoveHandleWrong => o.write_str("Esse não é o handle desta identidade. Nada foi enviado."),
+        Msg::RemoveChecking => o.write_str("Conferindo o handle\u{2026}"),
     }
 }

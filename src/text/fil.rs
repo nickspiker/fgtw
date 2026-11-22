@@ -106,5 +106,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "tinanggihan ang pag-alis sa {name}"),
         Msg::DepartNotStarted => o.write_str("hindi nagsimula ang pag-alis"),
         Msg::LastDevice => o.write_str("Ito na ang huling device ng pagkakakilanlan mo.\nHindi ito puwedeng umalis. Magdagdag muna ng ibang device, saka iretiro ito."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("May mga device na ang pagkakakilanlang ito.\nIdagdag ito? Walang aabot sa kanila hangga't hindi ka pumapayag."),
+        Msg::JoinConfirmYes => o.write_str("Oo, gusto ko talagang idagdag ang device na ito, ito ang aking pagkakakilanlan at hindi typo"),
+        Msg::JoinTogether => o.write_str("Pagdikitin ang dalawang device, nakabukas ang screen ng isa at ang pahina ng armada nito, sa Photon o ferros.\nO pindutin ang pangalan ng device na ito sa pahinang iyon, saka ang berdeng button nito."),
+        Msg::JoinShowWords => o.write_str("Wala sa abot? Ipakita ang mga salita para kopyahin/i-paste o idikta"),
+        Msg::RemoveTypeHandle => o.write_str("I-type ang iyong handle para alisin ang device na ito, saka pindutin ang I-unbind."),
+        Msg::UnbindPill => o.write_str("I-unbind"),
+        Msg::RemoveHandleWrong => o.write_str("Hindi iyan ang handle ng pagkakakilanlang ito. Walang naipadala."),
+        Msg::RemoveChecking => o.write_str("Sinusuri ang handle\u{2026}"),
     }
 }

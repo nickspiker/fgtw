@@ -126,5 +126,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "odejście odrzucono na urządzeniu {name}"),
         Msg::DepartNotStarted => o.write_str("odejście się nie rozpoczęło"),
         Msg::LastDevice => o.write_str("To ostatnie urządzenie twojej tożsamości.\nNie może odejść. Najpierw dodaj inne, potem wycofaj to."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Ta tożsamość ma już urządzenia.\nDodać to? Nic do nich nie dotrze, dopóki nie powiesz tak."),
+        Msg::JoinConfirmYes => o.write_str("Tak, naprawdę chcę dodać to urządzenie, to moja tożsamość, a nie literówka"),
+        Msg::JoinTogether => o.write_str("Zbliż oba urządzenia, ekran drugiego włączony i otwarta jego strona floty, w Photon lub ferros.\nAlbo dotknij nazwy tego urządzenia na tamtej stronie, potem jego zielonego przycisku."),
+        Msg::JoinShowWords => o.write_str("Poza zasięgiem? Pokaż słowa do skopiowania/wklejenia lub podyktowania"),
+        Msg::RemoveTypeHandle => o.write_str("Wpisz swój handle, aby usunąć to urządzenie, potem naciśnij Odwiąż."),
+        Msg::UnbindPill => o.write_str("Odwiąż"),
+        Msg::RemoveHandleWrong => o.write_str("To nie jest handle tej tożsamości. Nic nie wysłano."),
+        Msg::RemoveChecking => o.write_str("Sprawdzam handle\u{2026}"),
     }
 }

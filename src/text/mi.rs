@@ -107,5 +107,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "i whakakāhoretia te wehe i {name}"),
         Msg::DepartNotStarted => o.write_str("kāore te wehenga i tīmata"),
         Msg::LastDevice => o.write_str("Ko te pūrere whakamutunga tēnei o tō tuakiri.\nKāore e taea te wehe. Tāpirihia he pūrere kē i te tuatahi, kātahi ka whakatā i tēnei."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("He pūrere kē tō tēnei tuakiri.\nMe tāpiri tēnei? Kāore he aha e tae atu ki a rātou kia whakaae rā anō koe."),
+        Msg::JoinConfirmYes => o.write_str("Āe, e tino hiahia ana ahau ki te tāpiri i tēnei pūrere, ko tōku tuakiri tēnei, ehara i te hapa patopato"),
+        Msg::JoinTogether => o.write_str("Whakatataria ngā pūrere e rua, kia ara te mata o tērā atu, kia tuwhera tōna whārangi kāhui, i Photon, i ferros rānei.\nKo te mea kē, pāwhiria te ingoa o tēnei pūrere i taua whārangi, kātahi ko tōna pātene kākāriki."),
+        Msg::JoinShowWords => o.write_str("Kāore i te tata? Whakaaturia ngā kupu hei tārua/whakapiri, hei whakahua rānei"),
+        Msg::RemoveTypeHandle => o.write_str("Patohia tō handle hei tango i tēnei pūrere, kātahi pēhia Wetewete."),
+        Msg::UnbindPill => o.write_str("Wetewete"),
+        Msg::RemoveHandleWrong => o.write_str("Ehara tērā i te handle o tēnei tuakiri. Kāore he mea i tukuna."),
+        Msg::RemoveChecking => o.write_str("E arowhai ana i te handle\u{2026}"),
     }
 }

@@ -11,11 +11,14 @@ use crate::pq::FleetSigner;
 pub mod add;
 pub mod deliver;
 pub mod depart;
+pub mod join;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod add_tests;
+#[cfg(test)]
+mod join_tests;
 
 /// A device key (Ed25519 public key).
 pub type Key = [u8; 32];
@@ -96,7 +99,7 @@ pub enum Note {
     DepartApproveFailed { leaver: Key, reason: String },
     /// This device holds no fleet key, so it cannot add a device (nothing was written).
     AddNoFleetKey,
-    /// A device on this network is asking to join (LAN only; a request seen only on fgtw.org notifies nowhere).
+    /// A device on this network is asking to join, said only while the Fleet page is open on this device (owner, 2026-11-22: deaf ears otherwise; a request seen only on fgtw.org notifies nowhere).
     AsksToJoin { device: Key },
     /// A device was picked: it should turn green on its own screen.
     Picked { device: Key },
@@ -156,6 +159,10 @@ pub enum Action {
 pub enum Wake {
     /// A request heard on the LAN or a device heard nearby lapses then (the add screen's candidates change by time alone).
     Lapse,
+    /// The joiner's window for hearing a fleet device on this network has closed ([`join::UNHEARD_OSC`]): with none heard, fgtw.org's registry is the last rung.
+    Unheard,
+    /// The joiner's binding request nears the end of its freshness ([`join::REMINT_OSC`]): mint it again with a new stamp.
+    Remint,
 }
 
 /// A step's result: the actions in order, and at most one deadline.
@@ -174,7 +181,7 @@ impl Step {
 /// The person's choices a machine reacts to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserOp {
-    /// Ask the fleet to let this device go. `salt` is 32 fresh random bytes from the app (a machine draws no randomness).
+    /// Ask the fleet to let this device go, once a removal the person confirmed with their handle is held for it ([`Event::Unbind`] with `hold`, Photon's "Copy, then release"); refused otherwise. `salt` is 32 fresh random bytes from the app (a machine draws no randomness).
     Leave { intent: u8, salt: [u8; 32] },
     /// Forget our own request.
     GiveUp,
@@ -190,6 +197,14 @@ pub enum UserOp {
     No,
     /// "Not nearby? Look through fgtw.org", or opening "type its words": read fgtw.org's requests once.
     LookFarther,
+    /// The joiner's "Yes, I really would like to add this device and this is my identity and not a typo". `nfc_secret` is 32 fresh random bytes from the app, the tap secret this join serves.
+    Confirm { nfc_secret: [u8; 32] },
+    /// The joiner's "Not in range? Show words to copy/paste or dictate": the words shown, and fgtw.org's registry given the request at once.
+    ShowWords,
+    /// The joiner backs out of a confirmed join: the request withdrawn, the radios stopped, the question asked again.
+    Back,
+    /// The leaver's first press of Remove (Photon's Release): the handle is asked for next.
+    Remove,
 }
 
 /// What the app tells a machine.
@@ -241,4 +256,17 @@ pub enum Event<'a> {
     ListFailed { reason: &'a str },
     /// The person chose.
     User(UserOp),
+    /// The joiner's look-up has answered, after the memory-hard proof of the handle typed: whether the identity has a fleet, whether this device is already a member of it, and whether this device is bound to another identity (the device-busy gate, checked post-proof so it is never a cheap handle oracle).
+    Looked { has_fleet: bool, member: bool, busy: bool },
+    /// The joiner's binding request as minted and signed (the `bind_req` frame) with its stamp, or why it could not be.
+    Minted { t: i64, result: Result<&'a [u8], &'a str> },
+    /// fgtw.org's registry answered the joiner's post: taken, or refused (`device_owned...` is the one-owner verdict, final).
+    Posted { result: Result<(), &'a str> },
+    /// A device of the fleet picked this joiner on its Fleet page; the app checked the sender folds as a live, unlocked member of a chain whose genesis is this identity's.
+    Picked { by: Key },
+    /// A chain whose genesis is this identity's folds this joiner in: it is a member.
+    InFleet,
+    /// The leaver's handle, typed after Remove and then Unbind pressed, as its memory-hard proof (the app runs the proof off the machine, as for attest; the typed text never enters a machine).
+    /// The departure goes out only when `proof` is this identity's handle proof. `hold`: keep the confirmed removal for [`UserOp::Leave`] (Photon's "Copy, then release") instead of asking now. `salt` is 32 fresh random bytes from the app.
+    Unbind { proof: Key, intent: u8, salt: [u8; 32], hold: bool },
 }

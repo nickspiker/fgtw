@@ -106,5 +106,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "việc rời đi bị từ chối trên {name}"),
         Msg::DepartNotStarted => o.write_str("việc rời đi chưa bắt đầu"),
         Msg::LastDevice => o.write_str("Đây là thiết bị cuối cùng của danh tính bạn.\nNó không thể rời đi. Hãy thêm một thiết bị khác trước, rồi mới cho cái này nghỉ."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Danh tính này đã có thiết bị.\nThêm thiết bị này? Không gì đến được chúng cho tới khi bạn đồng ý."),
+        Msg::JoinConfirmYes => o.write_str("Có, tôi thật sự muốn thêm thiết bị này, đây là danh tính của tôi và không phải lỗi gõ"),
+        Msg::JoinTogether => o.write_str("Đặt hai thiết bị sát nhau, màn hình của thiết bị kia bật và trang đội của nó đang mở, trong Photon hoặc ferros.\nHoặc chạm vào tên thiết bị này trên trang đó, rồi chạm nút xanh lá của nó."),
+        Msg::JoinShowWords => o.write_str("Không ở gần? Hiện các từ để sao chép/dán hoặc đọc"),
+        Msg::RemoveTypeHandle => o.write_str("Nhập handle của bạn để gỡ thiết bị này, rồi nhấn Hủy liên kết."),
+        Msg::UnbindPill => o.write_str("Hủy liên kết"),
+        Msg::RemoveHandleWrong => o.write_str("Đó không phải handle của danh tính này. Chưa gửi gì cả."),
+        Msg::RemoveChecking => o.write_str("Đang kiểm tra handle\u{2026}"),
     }
 }

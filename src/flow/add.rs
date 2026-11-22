@@ -388,8 +388,8 @@ impl Add {
         let offered = sponsor::offer_lan(&mut self.lan, req);
         self.rebuild(now);
         self.rematch(false, s);
-        // Join notices are LAN only (owner): a device on this network asking while the page is closed is announced once.
-        if offered == sponsor::Offered::New && !self.open && !self.members.contains(&device) {
+        // Deaf ears (owner, 2026-11-22: "don't want someone typing Nick in in Germany a bunch of times and making my device light up"): a request is said only while the Fleet page is open here and this device may add; with it closed the request is kept quietly, for the rows when the page opens, and nothing lights up.
+        if offered == sponsor::Offered::New && self.open && !self.members.contains(&device) {
             s.push(Action::Note(Note::AsksToJoin { device }));
         }
     }

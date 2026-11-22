@@ -1,6 +1,6 @@
 # Fleet flows move into fgtw
 
-Status: **plan, 2026-11-10; the owner's decisions are in (below).** Nothing here is built yet. `fgtw::text` (the shared wording, 8b0f48e) has landed and Photon uses it (photon 06e10e1d).
+Status: **plan, 2026-11-10; the owner's decisions are in (below).** Built: the scaffold, Depart, Add, and Join with the departure's typed-handle confirmation (2026-11-22). `fgtw::text` (the shared wording, 8b0f48e) has landed and Photon uses it (photon 06e10e1d).
 
 ## Why
 
@@ -83,8 +83,8 @@ It replaces ferros's depart resend and gives Photon one; Add, Depart, Lock and c
 | Machine | Today in Photon | Today in ferros | The owner's rules it carries |
 |---|---|---|---|
 | **Add** (sponsor) | `open_add_device_flow`, `select_candidate`, `add_in_background`, `spawn_bind_device`, `spawn_confirm_add`, the Bound/Rotated arms | `open_add`, `sponsor_step`, `select`, `bind_picked`, `grow_for_newcomer` | add only with the Fleet page open; NFC match or typed words bind and grow at once; a touch on a row selects (`bind_select`, green, "Is your new device bright green?" Yes / No, No = Back); the sponsor must hold the fleet key; one add at a time; contention shuts the network path |
-| **Join** (new device) | `submit_join_step` (one 330-line thread), `end_join_flow`, the JoinUpdate arms | `mint_request`, `beacon`, `join_check`, `select_from` | join notices are LAN only; fgtw.org's mailbox only after "ask through fgtw.org"; green when a chain folds us in; Selected only from a live unlocked member of a genesis-matched chain |
-| **Depart** (leaver and approver) | `request_fleet_departure`, `complete_departure_approval`, `approve/deny_pending_departure`, the depart arms | `leave`, `depart_hand`, `on_depart_req`, `answer_depart`, `approve_now` | the last device cannot leave; Approve frees the hardware; a denied salt is refused for good; the leaver wipes when de-folded |
+| **Join** (new device) | `submit_join_step` (one 330-line thread), `end_join_flow`, the JoinUpdate arms | `mint_request`, `beacon`, `join_check`, `select_from` | **built 2026-11-22** (`flow::join`): nothing out before the yes, asked only when the identity has a fleet and this device is unbound; peers first (LAN beacon, NFC, BLE), fgtw.org only on the "no fleet device heard" edge or "Not in range?"; the words only behind that press; green when a chain folds us in; Selected only from a live unlocked member of a genesis-matched chain |
+| **Depart** (leaver and approver) | `request_fleet_departure`, `complete_departure_approval`, `approve/deny_pending_departure`, the depart arms | `leave`, `depart_hand`, `on_depart_req`, `answer_depart`, `approve_now` | the last device cannot leave; **nothing out before Remove, the handle typed (its memory-hard proof matched) and Unbind (2026-11-22)**; Approve frees the hardware; a denied salt is refused for good; the leaver wipes when de-folded |
 | **Lock** (lock, revoke, reinstate) | `revoke_device`, `reinstate_fleet_device`, `apply_locked_set`, the tombstone ack-quorum | (not built) | arm then confirm; the last other live unlocker is warned |
 | **Chain** (news, refold, adoption) | `chain_news`, `refold_own_chain`, `ask_siblings_for_chain`, the fold drain's adoption table | `on_frame` FleetResp, `hold_chain` | peers first, fgtw.org only when nobody answers; genesis pinned; adopt only by extension; a new head is passed on once |
 | **State** (fleet settings, roster, key heal) | `spawn_settings_push`, `merge_into_slot`, the roster pull retry/park/breaker, `fanout_needs_rotation`, the checkpoint spine | space push/want | siblings first, fgtw.org as compare-and-set backup |
@@ -109,6 +109,34 @@ A device with none asks the people and devices it knows (BLE, LAN, WAN, fgtw.org
 "Pending" then means no copy anywhere it asked.
 
 **Stages:** P1, the record and its merge in fgtw; Photon signs its own name and avatar pin as records, carries them in the pong tail (beside the old bare fields, which older peers still read), adopts only newer ones, keeps them through a pong answered by another device, and merges the roster per field by revision. P2, `profile_want` and the hand-on; friend avatars readable on every one of our devices, not only the one that ran CLUTCH; group member names re-signed on change. P3, the You page's other fields, shared with ferros.
+
+### Join and Remove: the owner's rules of 2026-11-22 (built)
+
+The owner's spec, verbatim in photon `Claude memories/feedback_add_device_confirm_first.md`: a typed handle (a typo, or a stranger's) must never ring a person's devices; words on screen can be read over a shoulder; a removal is the owner's own act and must be unmistakable.
+
+**Join, `flow::join::Join`** (the new device). No state on disk: it holds the identity seed (a root), so a restart asks the question again. Its acts are its own enum, `join::Do`, not the members' `Action`: a joiner is not a member, and what it does (mint, beacon, post to the registry) is nothing a member does.
+
+| Phase | Entered on | What is out |
+|---|---|---|
+| `Looking` | the handle typed once, attest tapped (the app runs the memory-hard proof and the look-up, a question that rings nobody) | nothing |
+| `Refused(Busy)` | `Looked { busy }`: this device is bound to another identity (the device-busy gate, post-proof so it is never a cheap oracle) | nothing |
+| `NotJoining` | `Looked`: no fleet (a fresh identity, the mint path) or already a member (attest goes on) | nothing |
+| `Confirm` | `Looked { has_fleet }`, this device unbound: "are you sure?" (`text::Msg::JoinConfirmPrompt`, the button `JoinConfirmYes`, the owner's sentence) | **nothing**: no request minted, nothing handed to a fleet device, no tap secret, no BLE beacon, no LAN beacon under the handle, no words, no fgtw.org |
+| `Asking` | `UserOp::Confirm { nfc_secret }`, the yes | `Do::Nfc`, `Do::Mint`, `Do::LanBeacon`, `Do::Watch { registry: false }`; on `Minted` the BLE beacon for the stamp and the request handed (`Do::Hand`) to every fleet device heard on this network (`Event::LanHeard`), once per stamp; the advice `JoinTogether` (NFC, else the touch to add) |
+| `Asking`, registry | the last-rung edge `Wake::Unheard` with no fleet device heard, or `UserOp::ShowWords` ("Not in range?", `JoinShowWords`) at once | `Do::PostRegistry`, then `Do::Watch { registry: true }`; the words in the view only after `ShowWords` |
+| `Refused(Owned)` | `Posted` with `device_owned` (the one-owner verdict) | radios stopped |
+| `Joined` | `InFleet`: a genesis-matched chain folds this device in | radios stopped, the registry copy withdrawn |
+
+- **The last-rung edge** is "no fleet device heard on this network": the yes sends one LAN beacon and every Photon fleet device answers it at once (a LAN round trip), and a ferros one beacons every 3 s on its own. The window is `join::UNHEARD_OSC`, 4¼ s, past one ferros beacon period with a second of margin (ferros's identity service waits 2^22 µs for the same reason); any `LanHeard` closes it with no post. It is one deadline per yes, never a poll. A WAN peer answer would close it too; Photon and ferros have no WAN path for an unbound device yet, so the LAN is the whole test.
+- **Persistence without a cadence:** the request is minted again at `join::REMINT_OSC` (three quarters into `BINDREQ_FRESH_OSC`, the protocol's own clock), and each fresh stamp is beaconed again and handed again; a link coming up beacons again; a fleet device that comes up later beacons itself and is handed the request.
+- `UserOp::Back` withdraws (the radios stopped, the registry copy withdrawn) and asks again.
+- `Picked { by }` turns the joiner green; the app checks `by` folds as a live member of a genesis-matched chain (that check moves into the machine with stage 6's chain parser).
+
+**The sponsor (Add): deaf ears.** `Note::AsksToJoin` is said only while the Fleet page is open on that device and it may add. With the page closed the request is kept quietly (it is a row when the page opens) and nothing lights up anywhere: no toast, notification or light ("don't want someone typing Nick in in Germany a bunch of times and making my device light up").
+
+**Remove (the leaver), in `flow::depart::Depart`** (`Removal`): `UserOp::Remove` (the first press; refused on the last device) → `TypeHandle` → `Event::Unbind { proof, .. }` with the typed handle's memory-hard proof (the app runs it, as for attest; the text never enters a machine) → the request goes out at once only when `proof` is this identity's handle proof, else `TypeHandle { wrong }` and nothing is sent. `hold` keeps the confirmed removal (`Held`, saved) for Photon's "Copy, then release", which then sends on `UserOp::Leave`; a bare `Leave` is refused. The fleet is told straight away (a member's `DepartAsked` notifies with no page open); the removal stays bilateral (a member approves, 2026-08-31), and the leaver wipes the moment the fold no longer lists it (`Action::Wipe`; Photon closes, ferros its killswitch).
+
+**Not built: a join over BLE or NFC with no shared network.** A fleet device matches a BLE beacon id or a tap secret only against requests it already holds (from the LAN, or fgtw.org's registry once the person looks there); the ~10.7 KB request cannot ride a BLE advert. Until the request itself is carried over a BLE connection or NFC, an add where the two devices share no network and the registry has no copy cannot complete. This is the next step for Join.
 
 ### Add (sponsor side): the design, for review before it is built
 
@@ -144,7 +172,7 @@ Each stage lands in fgtw with its tests, then Photon adopts it (Photon's code be
 1. **Scaffold**: `flow` feature, Event / Action / Step / Wake, the VSF state codec, `Deliver`, and a test harness that wires two or three machines together in memory (frames passed by hand, sends failing on demand). Delete Photon's `relay.rs` copy of `fgtw::pipe`.
 2. **Depart**: with `Deliver` (Photon gains the resend, ferros gains the last-device gate). First, because both bugs are live on the owner's devices and it is the smaller machine to prove the scaffold on.
 3. **Add**: the most duplicated. Port the union of both apps' behaviour, fix the divergences above, tests for every owner rule.
-4. **Join**.
+4. **Join**: built 2026-11-22 with the owner's confirm-first rules (above); Photon executes it; ferros adopts it next. The BLE or NFC data path for a join with no shared network is the open step.
 5. **Lock**.
 6. **Chain** and the fleet-frame parser (`parse_fleet_frame`, `STRANGER_SECTIONS` from fgtw); the held-chain statics move into fgtw.
 7. **State** (settings, roster, key heal, checkpoint spine) and the `FleetStore` trait. Beside it, **Profile** (owner 2026-11-10: the You page's content managed in ferros too): the person's preferred name, avatar pin and contact details as records signed by their owner with a revision; any holder of a newer signed copy passes it on (to the owner's devices when theirs is older or missing, to anyone showing it as Pending), and a device with none asks the people and devices it knows, fgtw.org last. "Pending" then means no copy anywhere it asked. Today's Pending names and avatars are being traced first.

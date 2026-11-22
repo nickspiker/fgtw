@@ -107,5 +107,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "permintaan keluar ditolak di {name}"),
         Msg::DepartNotStarted => o.write_str("kepergiannya tidak dimulai"),
         Msg::LastDevice => o.write_str("Ini perangkat terakhir identitasmu.\nIa tidak bisa keluar. Tambahkan perangkat lain dulu, lalu pensiunkan yang ini."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Identitas ini sudah punya perangkat.\nTambahkan yang ini? Tidak ada yang sampai ke mereka sebelum kamu bilang ya."),
+        Msg::JoinConfirmYes => o.write_str("Ya, saya sungguh ingin menambahkan perangkat ini, ini identitas saya dan bukan salah ketik"),
+        Msg::JoinTogether => o.write_str("Dekatkan kedua perangkat, layar perangkat yang lain menyala dan halaman armadanya terbuka, di Photon atau ferros.\nAtau sentuh nama perangkat ini di halaman itu, lalu tombol hijaunya."),
+        Msg::JoinShowWords => o.write_str("Tidak dalam jangkauan? Tampilkan kata untuk disalin/ditempel atau didiktekan"),
+        Msg::RemoveTypeHandle => o.write_str("Ketik handle-mu untuk melepas perangkat ini, lalu tekan Lepas ikatan."),
+        Msg::UnbindPill => o.write_str("Lepas ikatan"),
+        Msg::RemoveHandleWrong => o.write_str("Itu bukan handle identitas ini. Tidak ada yang dikirim."),
+        Msg::RemoveChecking => o.write_str("Memeriksa handle\u{2026}"),
     }
 }

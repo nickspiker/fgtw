@@ -107,5 +107,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "{name} पर जाना मना कर दिया गया"),
         Msg::DepartNotStarted => o.write_str("जाना शुरू नहीं हुआ"),
         Msg::LastDevice => o.write_str("यह तुम्हारी पहचान का आख़िरी डिवाइस है।\nयह नहीं जा सकता। पहले कोई और डिवाइस जोड़ो, फिर इसे रिटायर करो।"),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("इस पहचान के पहले से डिवाइस हैं।\nइसे जोड़ें? जब तक तुम हाँ नहीं कहते, उन तक कुछ नहीं पहुँचता।"),
+        Msg::JoinConfirmYes => o.write_str("हाँ, मैं सच में यह डिवाइस जोड़ना चाहता हूँ, यह मेरी पहचान है और कोई टाइपो नहीं है"),
+        Msg::JoinTogether => o.write_str("दोनों डिवाइस पास लाओ, दूसरे की स्क्रीन चालू और उसका बेड़ा पेज खुला हो, Photon या ferros में।\nया उस पेज पर इस डिवाइस का नाम छुओ, फिर उसका हरा बटन।"),
+        Msg::JoinShowWords => o.write_str("पास नहीं? कॉपी/पेस्ट या बोलकर लिखवाने के लिए शब्द दिखाओ"),
+        Msg::RemoveTypeHandle => o.write_str("यह डिवाइस हटाने के लिए अपना हैंडल लिखो, फिर अनबाइंड दबाओ।"),
+        Msg::UnbindPill => o.write_str("अनबाइंड"),
+        Msg::RemoveHandleWrong => o.write_str("यह इस पहचान का हैंडल नहीं है। कुछ नहीं भेजा गया।"),
+        Msg::RemoveChecking => o.write_str("हैंडल जाँच रहे हैं\u{2026}"),
     }
 }

@@ -116,5 +116,14 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::DepartDeniedOn(name) => write!(o, "вихід відхилено на пристрої {name}"),
         Msg::DepartNotStarted => o.write_str("вихід не розпочався"),
         Msg::LastDevice => o.write_str("Це останній пристрій твоєї ідентичності.\nВін не може піти. Спершу додай інший пристрій, а тоді відправ цей на спочинок."),
+        // ---- the owner's join and removal (2026-11-22): the joiner's confirmation and advice in ferros's words (ferros 9c987372), the removal's typed handle ----
+        Msg::JoinConfirmPrompt => o.write_str("Ця ідентичність уже має пристрої.\nДодати цей? Їм нічого не надійде, доки ти не скажеш так."),
+        Msg::JoinConfirmYes => o.write_str("Так, я справді хочу додати цей пристрій, це моя ідентичність, і це не одрук"),
+        Msg::JoinTogether => o.write_str("Приклади пристрої один до одного, на іншому екран увімкнено і відкрито сторінку флоту, у Photon чи ferros.\nАбо торкнися назви цього пристрою на тій сторінці, тоді його зеленої кнопки."),
+        Msg::JoinShowWords => o.write_str("Не поруч? Показати слова, щоб скопіювати/вставити чи продиктувати"),
+        Msg::RemoveTypeHandle => o.write_str("Введи свій handle, щоб прибрати цей пристрій, тоді натисни Відв\u{2019}язати."),
+        Msg::UnbindPill => o.write_str("Відв\u{2019}язати"),
+        Msg::RemoveHandleWrong => o.write_str("Це не handle цієї ідентичності. Нічого не надіслано."),
+        Msg::RemoveChecking => o.write_str("Перевіряю handle\u{2026}"),
     }
 }

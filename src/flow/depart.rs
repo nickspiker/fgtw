@@ -3,6 +3,7 @@
 //! Each member asks its person, Approve or Deny: Approve countersigns and publishes the consented Remove; Deny refuses that salt for good on every device.
 //! The leaver is done when the fold no longer lists it, and wipes.
 //! The last device cannot ask: an identity must live somewhere.
+//! Nothing goes out until the person on the leaving device has pressed Remove, typed the handle and pressed Unbind (owner, 2026-11-22): the handle is checked by its memory-hard proof, as attest checks it, and only a match asks the fleet ([`Removal`]).
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -46,11 +47,23 @@ struct DenyOut {
     deliver: Option<Deliver>,
 }
 
+/// The leaver's confirmation, before any request exists: Remove pressed, the handle typed, Unbind pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// Nothing pressed.
+    Idle,
+    /// Remove pressed: the handle is asked for; `wrong` after a typed handle that is not this identity's.
+    TypeHandle { wrong: bool },
+    /// The handle matched and the person chose to release once their files are copied: the request goes out on [`UserOp::Leave`].
+    Held { intent: u8 },
+}
+
 /// One device's departure state: its own request (as leaver) and the request it was asked about (as approver).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Depart {
     hp: Key,
     me: Key,
+    removal: Removal,
     /// The fold as last told: every member, this device among them.
     members: Vec<Key>,
     locked: Vec<Key>,
@@ -69,12 +82,22 @@ pub struct Depart {
 impl Depart {
     /// A fresh machine for device `me` of the fleet `hp`. `reports_sent`: the app reports every send's outcome as [`Event::Sent`]. Tell it the members before anything else.
     pub fn new(hp: Key, me: Key, reports_sent: bool) -> Self {
-        Depart { hp, me, members: Vec::new(), locked: Vec::new(), known: false, own: None, asked: None, denied: Vec::new(), denies: Vec::new(), next_build: 0, reports_sent }
+        Depart { hp, me, removal: Removal::Idle, members: Vec::new(), locked: Vec::new(), known: false, own: None, asked: None, denied: Vec::new(), denies: Vec::new(), next_build: 0, reports_sent }
     }
 
     /// Our request is out (or being built).
     pub fn asking(&self) -> bool {
         self.own.is_some()
+    }
+
+    /// Where the leaver's confirmation stands (Remove, the handle, Unbind).
+    pub fn removal(&self) -> Removal {
+        self.removal
+    }
+
+    /// The last device cannot ask (identity never dies), and a fleet not known yet is treated as one device: fail toward refusal.
+    fn last_device(&self) -> bool {
+        !self.known || self.members.len() <= 1
     }
 
     /// The request this device's person is asked about: (leaver, intent, salt).
@@ -183,19 +206,41 @@ impl Depart {
                 }
             }
             Event::User(op) => match op {
-                UserOp::Leave { intent, salt } => self.leave(intent, salt, now, &mut s),
+                UserOp::Remove => {
+                    if self.own.is_some() {
+                        return s;
+                    }
+                    if self.last_device() {
+                        s.push(Action::Note(Note::LastDevice));
+                        return s;
+                    }
+                    self.removal = Removal::TypeHandle { wrong: false };
+                }
+                // A request goes out on Leave only from a removal the person confirmed with their handle and chose to hold; anything else is refused (owner, 2026-11-22: the removal is the owner's own act and must be unmistakable).
+                UserOp::Leave { intent, salt } => {
+                    if let Removal::Held { .. } = self.removal {
+                        self.removal = Removal::Idle;
+                        self.leave(intent, salt, now, &mut s);
+                    }
+                }
                 UserOp::GiveUp => {
-                    if self.own.take().is_some() {
+                    let held = matches!(self.removal, Removal::Held { .. });
+                    self.removal = Removal::Idle;
+                    let asked = self.own.take().is_some();
+                    if asked {
                         s.push(Action::NfcServe(None));
+                    }
+                    if asked || held {
                         s.push(Action::Persist);
                     }
                 }
                 UserOp::Approve => self.approve(&mut s),
                 UserOp::Deny => self.deny(&mut s),
-                // The add screen's choices belong to the Add machine.
+                // The add screen's and the joiner's choices belong to their machines.
                 _ => {}
             },
-            // The add flow's events belong to the Add machine.
+            Event::Unbind { proof, intent, salt, hold } => self.unbind(proof, intent, salt, hold, now, &mut s),
+            // The add flow's and the join's events belong to their machines.
             _ => {}
         }
         s
@@ -233,6 +278,24 @@ impl Depart {
                 s.push(Action::Note(Note::DepartSettled { leaver }));
             }
         }
+    }
+
+    /// Unbind pressed after the handle was typed: the request goes out (or is held) only when the typed handle's proof is this identity's.
+    fn unbind(&mut self, proof: Key, intent: u8, salt: [u8; 32], hold: bool, now: i64, s: &mut Step) {
+        if !matches!(self.removal, Removal::TypeHandle { .. }) {
+            return;
+        }
+        if proof != self.hp {
+            self.removal = Removal::TypeHandle { wrong: true };
+            return;
+        }
+        if hold {
+            self.removal = Removal::Held { intent };
+            s.push(Action::Persist);
+            return;
+        }
+        self.removal = Removal::Idle;
+        self.leave(intent, salt, now, s);
     }
 
     fn leave(&mut self, intent: u8, salt: [u8; 32], now: i64, s: &mut Step) {
@@ -425,6 +488,10 @@ impl Depart {
     pub fn to_section(&self) -> VsfSection {
         let mut sec = VsfSection::new("depart");
         sec.add_field("me", VsfType::ke(self.me.to_vec()));
+        // A removal confirmed with the handle and held for its copies outlives a restart, so "Copy, then release" still releases.
+        if let Removal::Held { intent } = self.removal {
+            sec.add_field("held_intent", VsfType::u(intent as usize, false));
+        }
         if let Some(o) = self.own.as_ref() {
             sec.add_field("own_t", VsfType::e(EtType::e6(o.t)));
             sec.add_field("own_salt", VsfType::hb(o.salt.to_vec()));
@@ -486,6 +553,9 @@ impl Depart {
         let mut m = Depart::new(hp, me, reports_sent);
         if saved_me != me {
             return Ok(m);
+        }
+        if let Some(intent) = small("held_intent") {
+            m.removal = Removal::Held { intent };
         }
         if let (Some(t), Some(salt), Some(intent)) = (sec.eagle("own_t"), key("own_salt"), small("own_intent")) {
             let deliver = first("own_frame").and_then(|v| match v {
