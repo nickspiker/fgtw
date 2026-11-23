@@ -171,6 +171,9 @@ pub mod scoped_blob;
 /// The person's identity space: their facts across their fleet (kists, answers, the home screen's arrangement), merged by a total order, sealed under the fleet key, reconciled with a device's own copy. no_std; the seal behind `fanout`.
 pub mod space;
 
+/// The person's number base and language as facts of their identity space: one reader and writer each, shared by ferros and Photon. no_std.
+pub mod prefs;
+
 /// A kist's alias (ferros docs/FACETS.md): the one derivation of a kist's per-person seed from the person key and the kist's identity, and the keys a kist makes from it. no_std, BLAKE3 only; the bundle behind `sign`.
 pub mod alias;
 
