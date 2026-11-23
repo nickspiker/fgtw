@@ -259,6 +259,23 @@ pub fn parse_fleet_req(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
     Ok((field_handle_proof(&section, "hp").ok_or("fleet_req missing hp")?, sender))
 }
 
+/// A `fanout_req`: "your state does not open under my key; hand me your fan-out for fleet `hp` if it is newer than revision `rev`", from a device to its sibling (2026-11-22, peers before fgtw.org: a sibling that minted holds the fan-out it sealed).
+pub fn fanout_req(handle_proof: &[u8; 32], held_revision: u64, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("fanout_req");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("rev", VsfType::u(held_revision as usize, false));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `fanout_req`: (the handle proof, the revision the asker holds, the asking device).
+pub fn parse_fanout_req(bytes: &[u8]) -> Result<([u8; 32], u64, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "fanout_req")?;
+    let hp = field_handle_proof(&section, "hp").ok_or("fanout_req missing hp")?;
+    // Any width: an auto-sized u decodes as its smallest concrete width.
+    let rev = section.get_field("rev").and_then(|f| f.values.first()).and_then(|v| v.as_u64()).ok_or("fanout_req missing rev")?;
+    Ok((hp, rev, sender))
+}
+
 /// The `bind_select` frame (2026-11-10, owner: "if you tap, it shouldn't become part of the fleet, it should just get notified it was selected"): a sponsor tells the joining device `joiner` that the person picked it for fleet `hp`, by the candidate button or an NFC tap.
 /// Nothing is bound by it: the joiner checks the sender folds as a current member of that fleet's chain, lights green ("Selected"), and waits for the new keys, which come only when the person presses Add on the sponsor.
 pub fn bind_select(handle_proof: &[u8; 32], joiner: &[u8; 32], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
@@ -478,8 +495,13 @@ mod tests {
         assert_eq!(parse_fleet_resp(&fleet_resp(&hp, &chain, &kp, 1).unwrap()).unwrap(), (hp, chain, kp.public.to_bytes()));
         let blob = vec![0xCDu8; 3000];
         assert_eq!(parse_fanout_resp(&fanout_resp(&hp, &blob, &kp, 1).unwrap()).unwrap(), (hp, blob, kp.public.to_bytes()));
+        // The held revision reads back at any width, small (one byte on the wire) or large.
+        for rev in [0u64, 7, 2762, 1 << 40] {
+            assert_eq!(parse_fanout_req(&fanout_req(&hp, rev, &kp, 1).unwrap()).unwrap(), (hp, rev, kp.public.to_bytes()));
+        }
         // A frame of one kind never parses as another.
         assert!(parse_fleet_req(&frame).is_err());
+        assert!(parse_fanout_req(&fleet_req(&hp, &kp, 1).unwrap()).is_err());
     }
 
     #[test]
