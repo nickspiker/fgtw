@@ -406,10 +406,84 @@ pub fn parse_space_want(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), 
     Ok((field_handle_proof(&section, "hp").ok_or("space_want missing hp")?, section.bytes32("dg").ok_or("space_want missing dg")?, sender))
 }
 
+/// The `capsule_want` frame (2026-11-23, ferros docs/IDENTITY-SPACE.md "Capsules", source 2; the owner's order: the fleet's own devices before fgtw.org): a device of the fleet asks its siblings for a kist's capsule by its blake3, from `offset`. A sibling that holds it answers a `capsule_piece`, one that does not a `capsule_none`. Taken only from a member of the chain under the same handle proof; the bytes are checked by the asker's stower whoever sent them.
+pub fn capsule_want(handle_proof: &[u8; 32], capsule: &[u8; 32], offset: u64, signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("capsule_want");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("cap", VsfType::hb(capsule.to_vec()));
+    section.add_field("at", VsfType::u(offset as usize, false));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `capsule_want`: (handle proof, the capsule's blake3, the offset, the asking device).
+pub fn parse_capsule_want(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], u64, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "capsule_want")?;
+    let hp = field_handle_proof(&section, "hp").ok_or("capsule_want missing hp")?;
+    let cap = section.bytes32("cap").ok_or("capsule_want missing cap")?;
+    // Any width: an auto-sized u decodes as its smallest concrete width.
+    let at = section.get_field("at").and_then(|f| f.values.first()).and_then(|v| v.as_u64()).ok_or("capsule_want missing at")?;
+    Ok((hp, cap, at, sender))
+}
+
+/// The `capsule_piece` frame: the capsule's bytes from `offset` (one piece of at most what the asker's transport carries), and its whole length.
+pub fn capsule_piece(handle_proof: &[u8; 32], capsule: &[u8; 32], offset: u64, total: u64, piece: &[u8], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("capsule_piece");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("cap", VsfType::hb(capsule.to_vec()));
+    section.add_field("at", VsfType::u(offset as usize, false));
+    section.add_field("len", VsfType::u(total as usize, false));
+    section.add_field("v", VsfType::v(b'r', piece.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `capsule_piece`: (handle proof, the capsule's blake3, the offset, the whole length, the bytes, the sending device).
+pub fn parse_capsule_piece(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], u64, u64, Vec<u8>, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "capsule_piece")?;
+    let hp = field_handle_proof(&section, "hp").ok_or("capsule_piece missing hp")?;
+    let cap = section.bytes32("cap").ok_or("capsule_piece missing cap")?;
+    let num = |name: &str| section.get_field(name).and_then(|f| f.values.first()).and_then(|v| v.as_u64());
+    let at = num("at").ok_or("capsule_piece missing at")?;
+    let total = num("len").ok_or("capsule_piece missing len")?;
+    let piece = match section.get_field("v").and_then(|f| f.values.first()) {
+        Some(VsfType::v(_, b)) => b.clone(),
+        _ => return Err("capsule_piece missing v".into()),
+    };
+    Ok((hp, cap, at, total, piece, sender))
+}
+
+/// The `capsule_none` frame: the sibling does not hold that capsule (the asker tries its other siblings, then fgtw.org).
+pub fn capsule_none(handle_proof: &[u8; 32], capsule: &[u8; 32], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("capsule_none");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("cap", VsfType::hb(capsule.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `capsule_none`: (handle proof, the capsule's blake3, the sending device).
+pub fn parse_capsule_none(bytes: &[u8]) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "capsule_none")?;
+    Ok((field_handle_proof(&section, "hp").ok_or("capsule_none missing hp")?, section.bytes32("cap").ok_or("capsule_none missing cap")?, sender))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fleet::Egg;
+
+    /// The capsule frames round-trip, a piece's bytes and lengths whatever their width, and none is read as another.
+    #[test]
+    fn capsule_frames_round_trip() {
+        let kp = Keypair::from_seed(&[0x3Bu8; 32]);
+        let want = capsule_want(&[9u8; 32], &[6u8; 32], 1 << 40, &kp, 77).unwrap();
+        assert_eq!(parse_capsule_want(&want).unwrap(), ([9u8; 32], [6u8; 32], 1 << 40, kp.public.to_bytes()));
+        let bytes: Vec<u8> = (0..(1u32 << 16)).map(|i| (i * 31) as u8).collect();
+        let piece = capsule_piece(&[9u8; 32], &[6u8; 32], 1 << 16, 106_000_000, &bytes, &kp, 78).unwrap();
+        assert_eq!(parse_capsule_piece(&piece).unwrap(), ([9u8; 32], [6u8; 32], 1 << 16, 106_000_000, bytes, kp.public.to_bytes()));
+        let none = capsule_none(&[9u8; 32], &[6u8; 32], &kp, 79).unwrap();
+        assert_eq!(parse_capsule_none(&none).unwrap(), ([9u8; 32], [6u8; 32], kp.public.to_bytes()));
+        assert!(parse_capsule_want(&piece).is_err() && parse_capsule_piece(&want).is_err() && parse_capsule_none(&want).is_err());
+        assert!(parse_space_want(&want).is_err());
+    }
 
     /// A bind_select round-trips the fleet, the selected joiner and the selecting sponsor, and is not read as another frame.
     #[test]
