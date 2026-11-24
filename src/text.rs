@@ -365,7 +365,7 @@ pub enum Msg<'a> {
     DepartDeniedOn(&'a str),
     /// ferros's. One-line. The request did not go out.
     DepartNotStarted,
-    /// Photon's. Wrapping. The identity's last device cannot ask to leave: add another device first.
+    /// Photon's, the verb the owner's since 2026-11-24 (unbind, never retire). Wrapping. The identity's last device cannot ask to leave: add another device first.
     LastDevice,
     // ---- the owner's join and removal (2026-11-22) ----
     /// ferros's (9c987372). Wrapping, one forced break. The joiner's question once the identity is found to have a fleet: nothing is sent before the yes.
@@ -384,6 +384,44 @@ pub enum Msg<'a> {
     RemoveHandleWrong,
     /// One-line. The typed handle's proof runs.
     RemoveChecking,
+    // ---- the Security page (`crate::security`; owner, 2026-11-24: "I'd like to get it synchronized in the FGTW crate so ferros and Photon render the same") ----
+    // The owner's words for leaving (2026-11-24): "not retire, unbind/bind, shit like that. retire means never again which is wrong." So unbind and bind, never retire, in every language; and a revoke for the remote act on another device, since it bars that device until reinstated, where an unbound device may be bound again by anyone.
+    // ferros's lower-case voice for the buttons, as its settings pages have; a sentence for each note.
+    /// Wrapping. The page's first line once a person has attested: its rows go from the least destructive to the most.
+    SecIntro,
+    /// Wrapping. The page's first line with nobody attested: the wipe alone.
+    SecIntroWipe,
+    /// One-line. The buttons.
+    SecLock,
+    SecRevoke,
+    SecReinstate,
+    SecShred,
+    SecUnbind,
+    /// One-line. The wipe's button; `armed` after its first press (a second press of it wipes).
+    SecWipe { armed: bool },
+    /// Wrapping. Under each button: what it does.
+    SecLockNote,
+    SecRevokeNote,
+    SecShredNote,
+    SecUnbindNote,
+    SecWipeNote,
+    /// Wrapping. A warning under a revoke: the one other live device; revoking it leaves this device alone able to reinstate it.
+    SecRevokeLastOther,
+    /// Wrapping. A warning under shred on the identity's last live device.
+    SecShredLast,
+    /// One-line. A device of the fleet over its revoke button, by name; and one revoked, over its reinstate button.
+    SecDevice(&'a str),
+    SecDeviceRevoked(&'a str),
+    /// One-line. A revoke and a reinstatement under way, done, failed; by name.
+    SecRevoking(&'a str),
+    SecRevoked(&'a str),
+    SecRevokeFailed(&'a str),
+    SecReinstating(&'a str),
+    SecReinstated(&'a str),
+    SecReinstateFailed(&'a str),
+    /// One-line. A shred or a wipe under way (it ends in the app starting fresh), and one that did not start.
+    SecShredding,
+    SecShredFailed,
 }
 
 /// Message `m` in language `l`, written into `o`.
@@ -525,6 +563,32 @@ mod tests {
         add(Msg::UnbindPill, 0, true);
         add(Msg::RemoveHandleWrong, 0, false);
         add(Msg::RemoveChecking, 0, true);
+        add(Msg::SecIntro, 0, false);
+        add(Msg::SecIntroWipe, 0, false);
+        add(Msg::SecLock, 0, true);
+        add(Msg::SecRevoke, 0, true);
+        add(Msg::SecReinstate, 0, true);
+        add(Msg::SecShred, 0, true);
+        add(Msg::SecUnbind, 0, true);
+        add(Msg::SecWipe { armed: false }, 0, true);
+        add(Msg::SecWipe { armed: true }, 0, true);
+        add(Msg::SecLockNote, 0, false);
+        add(Msg::SecRevokeNote, 0, false);
+        add(Msg::SecShredNote, 0, false);
+        add(Msg::SecUnbindNote, 0, false);
+        add(Msg::SecWipeNote, 0, false);
+        add(Msg::SecRevokeLastOther, 0, false);
+        add(Msg::SecShredLast, 0, false);
+        add(Msg::SecDevice(H), 1, true);
+        add(Msg::SecDeviceRevoked(H), 1, true);
+        add(Msg::SecRevoking(H), 1, true);
+        add(Msg::SecRevoked(H), 1, true);
+        add(Msg::SecRevokeFailed(H), 1, true);
+        add(Msg::SecReinstating(H), 1, true);
+        add(Msg::SecReinstated(H), 1, true);
+        add(Msg::SecReinstateFailed(H), 1, true);
+        add(Msg::SecShredding, 0, true);
+        add(Msg::SecShredFailed, 0, true);
         v
     }
 

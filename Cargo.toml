@@ -39,6 +39,8 @@ profile = ["protocol", "vsf/x-compact"]
 flow = ["protocol"]
 # `text` is the fleet and identity words in all sixteen languages and the one language list (src/text.rs), shared by Photon and ferros. No deps of its own.
 text = []
+# `security` is the Security page as one model for every app (src/security.rs): the actions, the rows, their confirmations and the page's state, in `text`'s words; with `protocol`, the chain work of a revoke and a reinstatement too.
+security = ["text"]
 
 [dependencies]
 # vsf codec (VsfType/VsfBuilder/VsfSection/VsfHeader/EtType) — the fleet op wire form. crypto+inspect match the worker + photon so the feature union is a no-op.

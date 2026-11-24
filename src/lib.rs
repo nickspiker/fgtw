@@ -194,6 +194,10 @@ pub mod alias_devices;
 #[cfg(feature = "text")]
 pub mod text;
 
+/// The Security page written once for every TOKEN app (photon docs/settings-panel.md "Security"; owner, 2026-11-24): its actions (lock, revoke, reinstate, shred, unbind this device, and the wipe before attest), the rows in order with when each is enabled and the confirmation each needs, the page's state across presses, and the chain work of a revoke. Drawing, collecting a confirmation and the storage behind lock and shred stay each app's. no_std; the chain work behind `protocol`.
+#[cfg(feature = "security")]
+pub mod security;
+
 /// Fleet-shared encrypted state — the codec for the slot each app writes its shared state into (photon: the contact roster; calendar: events).
 /// Data model + serialize + CRDT merge; the seal-and-push transport is the client's.
 #[cfg(all(feature = "fanout", feature = "std"))]
