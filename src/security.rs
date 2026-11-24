@@ -5,7 +5,14 @@
 //! - **revoke** a device of the fleet, remotely (lost, stolen, sold, maybe offline): the chain's Lock op, the worker's refusal that survives a wipe, and a fresh fleet key wrapped to every device but it (photon docs/device-lifecycle.md 3: rotate on remove is not optional). From then on it cannot announce, write, or open anything sealed after. **reinstate** undoes it. Revoke, not "unbind remotely": an unbound device may be bound again by anyone, a revoked one is barred until its fleet reinstates it.
 //! - **shred**: a crypto-shred of this device's copy of the identity: its keys destroyed, then its data deleted. The device stays in the fleet (the chain still lists it, the fan-out still wraps to it), so attesting again here with the same handle fetches everything back from the fleet: "wipe and refetch from my fleet".
 //! - **unbind this device**: it leaves the fleet (the departure, `flow::depart`) and its data here is erased; anyone may bind it again.
-//! - **wipe**, before attest: the narrowed page on a device with nobody attested (unbound, or bound to an identity whose handle is lost or another's). It grants nothing: the vault is sealed under the handle's seed, and the old fleet still holds the hardware until it lets it go (settings-panel.md's three reasons).
+//! - **wipe** before attest: not offered (owner, 2026-11-24: "if you cannot attest, there's ZERO reason my shit should get wiped"). Before attest the page has no row; `Act::Wipe` and its words stay only until every app has dropped them.
+//!
+//! **Destroying is a key operation** (owner, 2026-11-24, on unbind's bulk erase: "whoever's dumbfuck idea to add more writes to an SSD that has a fixed number of writes is beyond me but it's dead wrong. Sand on a beach my friend."): what is sealed is made unreadable by destroying its keys (wiped from memory) and renewing the device-only secret every key here is made from, one small write; nothing is deleted or overwritten, and the store's own rotation reclaims the room when it needs it.
+//!
+//! **Nothing is destroyed without the person** (owner, 2026-11-24: "if it does not get my consent from my other devices or a correct handle entry, nothing gets wiped. Lock is fine, but no wipe and certainly no unbind."; and on shred: "if you cannot attest, there's ZERO reason my shit should get wiped and pretty sure we discussed, that's mostly key management formalities and proper lifecycle/design."):
+//! - shred takes a correct attest (the handle, the identity confirmation) and destroys only this device's keys; the device stays in its fleet;
+//! - unbinding takes a correct attest and the fleet's consent: [`UNBIND`], in order;
+//! - a wrong handle, no consent, a deny, no device reachable or a power cut at any step changes nothing: the device stays bound and its keys and secret stay; at most it locks.
 //!
 //! What is here: the actions, the rows each app draws and their order ([`rows`]), when each is enabled and why not, the confirmation each needs ([`Confirm`]), the page's own state across presses ([`Page`]), the words ([`crate::text::Msg`]'s `Sec*`), and the chain work of a revoke and a reinstatement ([`revoke`], [`reinstate`], [`rotate`]).
 //! What stays each app's: the drawing (a [`Tone`] names the colour's meaning, the app picks the colour), how an identity confirmation is collected (ferros: the approve on the attest screen, the device locking at once; Photon: the handle typed, its memory-hard proof matched), and the storage behind lock, shred and wipe (ferros: the kernel's lock and release and the vault process's drops; Photon: kete's vault and the session clear).
@@ -32,7 +39,7 @@ pub enum Act {
     Shred,
     /// This device leaves the fleet, its data erased.
     Unbind,
-    /// Before attest: erase whatever an earlier identity left here.
+    /// Before attest: not offered (owner, 2026-11-24: nothing is destroyed without an attest); kept until every app has dropped it.
     Wipe,
 }
 
@@ -147,6 +154,26 @@ impl Row {
     }
 }
 
+/// One step of unbinding this device, in the owner's order (2026-11-24). Each app carries it out with its own hooks; none may skip ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnbindStep {
+    /// The handle typed (the identity confirmation: ferros's approve on the attest screen, Photon's typed handle and its proof).
+    Handle,
+    /// The departure request to the fleet (`flow::depart`, `UserOp::Remove` then `Event::Unbind`), handed to every member reachable and kept until answered; the identity's last device refuses here.
+    Request,
+    /// A member's consent: its person approves (`UserOp::Approve`). Waited for, however long: no timer acts in its place. A deny ends it, nothing changed.
+    Consent,
+    /// The device signs itself out of the chain: the consented Remove carries the leaving device's own signature over its departure (its request's consent) with the approver's beside it (`sponsor::approve_departure`, the approver publishing).
+    SignOut,
+    /// The fleet rotates its key on the approving device ([`rotate_after_departure`]): the device that left has no wrap in the new fan-out, so it opens nothing sealed after.
+    Rotate,
+    /// The device that left, once the fold no longer lists it (`Action::Wipe`): its keys wiped from memory and the device-only secret renewed. Nothing deleted.
+    Forget,
+}
+
+/// The unbind sequence, in order.
+pub const UNBIND: [UnbindStep; 6] = [UnbindStep::Handle, UnbindStep::Request, UnbindStep::Consent, UnbindStep::SignOut, UnbindStep::Rotate, UnbindStep::Forget];
+
 /// The words at the top of the page.
 pub const fn intro(f: &Facts) -> Msg<'static> {
     if f.present {
@@ -156,11 +183,10 @@ pub const fn intro(f: &Facts) -> Msg<'static> {
     }
 }
 
-/// The page's rows, in the order both apps draw them: lock, each other device (revoke or reinstate), shred, unbind this device; before attest the wipe alone.
+/// The page's rows, in the order both apps draw them: lock, each other device (revoke or reinstate), shred, unbind this device; before attest none (nothing is destroyed without an attest).
 pub fn rows(f: &Facts) -> Vec<Row> {
     let mut v = Vec::new();
     if !f.present {
-        v.push(Row { act: Act::Wipe, enabled: true, tone: Tone::Warn, lead: None, note: Some(Msg::SecWipeNote), warn: None });
         return v;
     }
     v.push(Row { act: Act::Lock, enabled: true, tone: Tone::Calm, lead: None, note: Some(Msg::SecLockNote), warn: None });
@@ -377,6 +403,16 @@ pub fn reinstate<T: crate::client::FgtwTransport>(t: &T, signer: &impl crate::pq
     live_now(t, handle_proof)
 }
 
+/// The approving device's half of a departure ([`UnbindStep::Rotate`]): once the consented Remove is published, a fresh fleet key wrapped to the live members alone (the chain fetched again, so it is the fold after the Remove), as after a revoke. Returns (revision, key); the caller seals its state again under the key (Photon: the fstate slot; ferros: the identity space and the person key fact).
+#[cfg(feature = "protocol")]
+pub fn rotate_after_departure<T: crate::client::FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, handle_proof: &Key, leaver: &Key, identity_seed: &Key) -> Result<(u64, Key), alloc::string::String> {
+    let live = live_now(t, handle_proof)?;
+    if live.contains(leaver) {
+        return Err("the device is still a member: the Remove did not land".into());
+    }
+    rotate(t, signer, handle_proof, &live, identity_seed)
+}
+
 /// The fresh fleet key after a revoke, wrapped to `live` alone and published (`client::mint_fleet_key`): the revoked device has no wrap, so it opens nothing sealed from now on. Returns (revision, key). The caller seals its state again under the key (Photon: the fstate slot; ferros: the identity space and the person key fact).
 #[cfg(feature = "protocol")]
 pub fn rotate<T: crate::client::FgtwTransport>(t: &T, signer: &impl crate::pq::FleetSigner, handle_proof: &Key, live: &[Key], identity_seed: &Key) -> Result<(u64, Key), alloc::string::String> {
@@ -423,7 +459,7 @@ mod tests {
     #[test]
     fn the_rows_and_their_order() {
         let pre = Facts { present: false, member: false, fleet_key: false, leaving: false, others: &[] };
-        assert_eq!(acts(&rows(&pre)), vec![Act::Wipe]);
+        assert!(rows(&pre).is_empty(), "nothing is destroyed without an attest");
         assert_eq!(intro(&pre), Msg::SecIntroWipe);
         let others = [Other { key: [2; 32], revoked: false }, Other { key: [3; 32], revoked: true }];
         let r = rows(&facts(&others));
@@ -480,18 +516,12 @@ mod tests {
         assert_eq!(p.status(), None, "said once");
 
         let pre = rows(&Facts { present: false, member: false, fleet_key: false, leaving: false, others: &[] });
-        let mut w = Page::new();
-        assert_eq!(w.press(&pre, Act::Wipe), Do::Nothing);
-        assert!(w.armed(Act::Wipe));
-        assert_eq!(w.press(&pre, Act::Wipe), Do::Carry(Act::Wipe));
         let mut x = Page::new();
-        x.press(&pre, Act::Wipe);
-        x.press(&pre, Act::Lock);
-        assert!(!x.armed(Act::Wipe), "any other press disarms");
-        x.press(&pre, Act::Wipe);
-        x.left();
-        assert_eq!(x.press(&pre, Act::Wipe), Do::Nothing, "leaving the page disarms");
-        assert_eq!(x.press(&pre, Act::Unbind), Do::Nothing, "a row not drawn");
+        assert_eq!(x.press(&pre, Act::Wipe), Do::Nothing, "before attest no row is drawn");
+        assert_eq!(x.press(&pre, Act::Shred), Do::Nothing);
+        assert_eq!(x.press(&pre, Act::Unbind), Do::Nothing);
+        assert_eq!(UNBIND.first(), Some(&UnbindStep::Handle), "the handle first");
+        assert_eq!(UNBIND.last(), Some(&UnbindStep::Forget), "forgetting last, after consent and the rotation");
     }
 
     /// A revoke on the chain leaves the device a member, out of the live set (no wrap in the next fan-out) and barred from signing; a reinstatement brings it back; the checks refuse what the fold would.

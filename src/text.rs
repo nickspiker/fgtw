@@ -389,7 +389,7 @@ pub enum Msg<'a> {
     // ferros's lower-case voice for the buttons, as its settings pages have; a sentence for each note.
     /// Wrapping. The page's first line once a person has attested: its rows go from the least destructive to the most.
     SecIntro,
-    /// Wrapping. The page's first line with nobody attested: the wipe alone.
+    /// Wrapping. The page's first line with nobody attested: nothing can be changed or destroyed (owner, 2026-11-24: "if you cannot attest, there's ZERO reason my shit should get wiped").
     SecIntroWipe,
     /// One-line. The buttons.
     SecLock,
@@ -397,7 +397,7 @@ pub enum Msg<'a> {
     SecReinstate,
     SecShred,
     SecUnbind,
-    /// One-line. The wipe's button; `armed` after its first press (a second press of it wipes).
+    /// One-line. The wipe before attest's button and note: no longer offered (owner, 2026-11-24); kept until every app has dropped them.
     SecWipe { armed: bool },
     /// Wrapping. Under each button: what it does.
     SecLockNote,

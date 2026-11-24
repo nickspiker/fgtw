@@ -136,6 +136,13 @@ The owner's spec, verbatim in photon `Claude memories/feedback_add_device_confir
 
 **Remove (the leaver), in `flow::depart::Depart`** (`Removal`): `UserOp::Remove` (the first press; refused on the last device) → `TypeHandle` → `Event::Unbind { proof, .. }` with the typed handle's memory-hard proof (the app runs it, as for attest; the text never enters a machine) → the request goes out at once only when `proof` is this identity's handle proof, else `TypeHandle { wrong }` and nothing is sent. `hold` keeps the confirmed removal (`Held`, saved) for Photon's "Copy, then release", which then sends on `UserOp::Leave`; a bare `Leave` is refused. The fleet is told straight away (a member's `DepartAsked` notifies with no page open); the removal stays bilateral (a member approves, 2026-08-31), and the leaver wipes the moment the fold no longer lists it (`Action::Wipe`; Photon closes, ferros its killswitch).
 
+**Unbind and shred, the owner's rules of 2026-11-24** (`security::UNBIND`, `security::UnbindStep`):
+- "if it does not get my consent from my other devices or a correct handle entry, nothing gets wiped. Lock is fine, but no wipe and certainly no unbind."
+- "if you cannot attest, there's ZERO reason my shit should get wiped and pretty sure we discussed, that's mostly key management formalities and proper lifecycle/design."
+- On the bulk erase unbind did until then: "whoever's dumbfuck idea to add more writes to an SSD that has a fixed number of writes is beyond me but it's dead wrong. Sand on a beach my friend."
+
+So unbinding goes: the handle typed; the request to the fleet; a member's consent, waited for with no timer acting in its place (the last device still refuses); the device signs itself out (the consented Remove carries its own signature over its departure, beside the approver's); the approving device rotates the fleet key (`security::rotate_after_departure`; rotate on remove); the device that left wipes its keys from memory and renews its device-only secret, deleting nothing. Shred takes the handle alone and destroys only this device's keys the same way. Before attest nothing is offered: the wipe before attest is gone.
+
 **Not built: a join over BLE or NFC with no shared network.** A fleet device matches a BLE beacon id or a tap secret only against requests it already holds (from the LAN, or fgtw.org's registry once the person looks there); the ~10.7 KB request cannot ride a BLE advert. Until the request itself is carried over a BLE connection or NFC, an add where the two devices share no network and the registry has no copy cannot complete. This is the next step for Join.
 
 ### Add (sponsor side): the design, for review before it is built
