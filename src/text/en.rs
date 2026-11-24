@@ -111,8 +111,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Yes, I really would like to add this device and this is my identity and not a typo"),
         Msg::JoinTogether => o.write_str("Put the two devices together, the other one's screen on and its Fleet page open, in Photon or ferros.\nOr touch this device's name on that page, then its green button."),
         Msg::JoinShowWords => o.write_str("Not in range? Show words to copy/paste or dictate"),
-        Msg::RemoveTypeHandle => o.write_str("Type your handle to remove this device, then press Unbind."),
-        Msg::UnbindPill => o.write_str("Unbind"),
+        Msg::RemoveTypeHandle => o.write_str("Type your handle to remove this device, then press unbind."),
+        Msg::UnbindPill => o.write_str("unbind"),
         Msg::RemoveHandleWrong => o.write_str("That isn't this identity's handle. Nothing was sent."),
         Msg::RemoveChecking => o.write_str("Checking the handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

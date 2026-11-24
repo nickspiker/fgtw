@@ -131,8 +131,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Tak, naprawdę chcę dodać to urządzenie, to moja tożsamość, a nie literówka"),
         Msg::JoinTogether => o.write_str("Zbliż oba urządzenia, ekran drugiego włączony i otwarta jego strona floty, w Photon lub ferros.\nAlbo dotknij nazwy tego urządzenia na tamtej stronie, potem jego zielonego przycisku."),
         Msg::JoinShowWords => o.write_str("Poza zasięgiem? Pokaż słowa do skopiowania/wklejenia lub podyktowania"),
-        Msg::RemoveTypeHandle => o.write_str("Wpisz swój handle, aby usunąć to urządzenie, potem naciśnij Odwiąż."),
-        Msg::UnbindPill => o.write_str("Odwiąż"),
+        Msg::RemoveTypeHandle => o.write_str("Wpisz swój handle, aby usunąć to urządzenie, potem naciśnij odwiąż."),
+        Msg::UnbindPill => o.write_str("odwiąż"),
         Msg::RemoveHandleWrong => o.write_str("To nie jest handle tej tożsamości. Nic nie wysłano."),
         Msg::RemoveChecking => o.write_str("Sprawdzam handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

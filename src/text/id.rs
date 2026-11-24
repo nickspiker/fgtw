@@ -112,8 +112,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Ya, saya sungguh ingin menambahkan perangkat ini, ini identitas saya dan bukan salah ketik"),
         Msg::JoinTogether => o.write_str("Dekatkan kedua perangkat, layar perangkat yang lain menyala dan halaman armadanya terbuka, di Photon atau ferros.\nAtau sentuh nama perangkat ini di halaman itu, lalu tombol hijaunya."),
         Msg::JoinShowWords => o.write_str("Tidak dalam jangkauan? Tampilkan kata untuk disalin/ditempel atau didiktekan"),
-        Msg::RemoveTypeHandle => o.write_str("Ketik handle-mu untuk melepas perangkat ini, lalu tekan Lepas ikatan."),
-        Msg::UnbindPill => o.write_str("Lepas ikatan"),
+        Msg::RemoveTypeHandle => o.write_str("Ketik handle-mu untuk melepas perangkat ini, lalu tekan lepas ikatan."),
+        Msg::UnbindPill => o.write_str("lepas ikatan"),
         Msg::RemoveHandleWrong => o.write_str("Itu bukan handle identitas ini. Tidak ada yang dikirim."),
         Msg::RemoveChecking => o.write_str("Memeriksa handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

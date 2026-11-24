@@ -111,8 +111,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Có, tôi thật sự muốn thêm thiết bị này, đây là danh tính của tôi và không phải lỗi gõ"),
         Msg::JoinTogether => o.write_str("Đặt hai thiết bị sát nhau, màn hình của thiết bị kia bật và trang đội của nó đang mở, trong Photon hoặc ferros.\nHoặc chạm vào tên thiết bị này trên trang đó, rồi chạm nút xanh lá của nó."),
         Msg::JoinShowWords => o.write_str("Không ở gần? Hiện các từ để sao chép/dán hoặc đọc"),
-        Msg::RemoveTypeHandle => o.write_str("Nhập handle của bạn để gỡ thiết bị này, rồi nhấn Hủy liên kết."),
-        Msg::UnbindPill => o.write_str("Hủy liên kết"),
+        Msg::RemoveTypeHandle => o.write_str("Nhập handle của bạn để gỡ thiết bị này, rồi nhấn hủy liên kết."),
+        Msg::UnbindPill => o.write_str("hủy liên kết"),
         Msg::RemoveHandleWrong => o.write_str("Đó không phải handle của danh tính này. Chưa gửi gì cả."),
         Msg::RemoveChecking => o.write_str("Đang kiểm tra handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

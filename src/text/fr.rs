@@ -120,8 +120,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Oui, je veux vraiment ajouter cet appareil, c’est bien mon identité et pas une faute de frappe"),
         Msg::JoinTogether => o.write_str("Rapproche les deux appareils, l’écran de l’autre allumé et sa page flotte ouverte, dans Photon ou ferros.\nOu touche le nom de cet appareil sur cette page, puis son bouton vert."),
         Msg::JoinShowWords => o.write_str("Hors de portée ? Afficher les mots à copier/coller ou dicter"),
-        Msg::RemoveTypeHandle => o.write_str("Tape ton handle pour retirer cet appareil, puis appuie sur Délier."),
-        Msg::UnbindPill => o.write_str("Délier"),
+        Msg::RemoveTypeHandle => o.write_str("Tape ton handle pour retirer cet appareil, puis appuie sur délier."),
+        Msg::UnbindPill => o.write_str("délier"),
         Msg::RemoveHandleWrong => o.write_str("Ce n\u{2019}est pas le handle de cette identité. Rien n\u{2019}a été envoyé."),
         Msg::RemoveChecking => o.write_str("Vérification du handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

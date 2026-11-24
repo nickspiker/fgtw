@@ -118,8 +118,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Ja, ich will dieses Gerät wirklich hinzufügen, das ist meine Identität und kein Tippfehler"),
         Msg::JoinTogether => o.write_str("Halte die beiden Geräte zusammen, beim anderen den Bildschirm an und seine Flotten-Seite offen, in Photon oder ferros.\nOder berühre dort den Namen dieses Geräts, dann seinen grünen Knopf."),
         Msg::JoinShowWords => o.write_str("Nicht in Reichweite? Wörter zum Kopieren/Einfügen oder Diktieren zeigen"),
-        Msg::RemoveTypeHandle => o.write_str("Gib dein Handle ein, um dieses Gerät zu entfernen, dann drück Lösen."),
-        Msg::UnbindPill => o.write_str("Lösen"),
+        Msg::RemoveTypeHandle => o.write_str("Gib dein Handle ein, um dieses Gerät zu entfernen, dann drück lösen."),
+        Msg::UnbindPill => o.write_str("lösen"),
         Msg::RemoveHandleWrong => o.write_str("Das ist nicht das Handle dieser Identität. Nichts wurde gesendet."),
         Msg::RemoveChecking => o.write_str("Handle wird geprüft\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

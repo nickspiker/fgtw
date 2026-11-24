@@ -121,8 +121,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Так, я справді хочу додати цей пристрій, це моя ідентичність, і це не одрук"),
         Msg::JoinTogether => o.write_str("Приклади пристрої один до одного, на іншому екран увімкнено і відкрито сторінку флоту, у Photon чи ferros.\nАбо торкнися назви цього пристрою на тій сторінці, тоді його зеленої кнопки."),
         Msg::JoinShowWords => o.write_str("Не поруч? Показати слова, щоб скопіювати/вставити чи продиктувати"),
-        Msg::RemoveTypeHandle => o.write_str("Введи свій handle, щоб прибрати цей пристрій, тоді натисни Відв\u{2019}язати."),
-        Msg::UnbindPill => o.write_str("Відв\u{2019}язати"),
+        Msg::RemoveTypeHandle => o.write_str("Введи свій handle, щоб прибрати цей пристрій, тоді натисни відв\u{2019}язати."),
+        Msg::UnbindPill => o.write_str("відв\u{2019}язати"),
         Msg::RemoveHandleWrong => o.write_str("Це не handle цієї ідентичності. Нічого не надіслано."),
         Msg::RemoveChecking => o.write_str("Перевіряю handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

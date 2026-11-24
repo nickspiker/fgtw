@@ -111,8 +111,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Oo, gusto ko talagang idagdag ang device na ito, ito ang aking pagkakakilanlan at hindi typo"),
         Msg::JoinTogether => o.write_str("Pagdikitin ang dalawang device, nakabukas ang screen ng isa at ang pahina ng armada nito, sa Photon o ferros.\nO pindutin ang pangalan ng device na ito sa pahinang iyon, saka ang berdeng button nito."),
         Msg::JoinShowWords => o.write_str("Wala sa abot? Ipakita ang mga salita para kopyahin/i-paste o idikta"),
-        Msg::RemoveTypeHandle => o.write_str("I-type ang iyong handle para alisin ang device na ito, saka pindutin ang I-unbind."),
-        Msg::UnbindPill => o.write_str("I-unbind"),
+        Msg::RemoveTypeHandle => o.write_str("I-type ang iyong handle para alisin ang device na ito, saka pindutin ang i-unbind."),
+        Msg::UnbindPill => o.write_str("i-unbind"),
         Msg::RemoveHandleWrong => o.write_str("Hindi iyan ang handle ng pagkakakilanlang ito. Walang naipadala."),
         Msg::RemoveChecking => o.write_str("Sinusuri ang handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----

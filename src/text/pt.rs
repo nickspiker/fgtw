@@ -111,8 +111,8 @@ pub fn text(m: Msg, o: &mut dyn Write) -> fmt::Result {
         Msg::JoinConfirmYes => o.write_str("Sim, eu realmente quero adicionar este dispositivo, esta é a minha identidade e não é um erro de digitação"),
         Msg::JoinTogether => o.write_str("Junte os dois dispositivos, com a tela do outro ligada e a página da frota aberta, no Photon ou no ferros.\nOu toque no nome deste dispositivo nessa página e depois no botão verde."),
         Msg::JoinShowWords => o.write_str("Fora de alcance? Mostrar palavras para copiar/colar ou ditar"),
-        Msg::RemoveTypeHandle => o.write_str("Digite seu handle para remover este dispositivo e depois toque em Desvincular."),
-        Msg::UnbindPill => o.write_str("Desvincular"),
+        Msg::RemoveTypeHandle => o.write_str("Digite seu handle para remover este dispositivo e depois toque em desvincular."),
+        Msg::UnbindPill => o.write_str("desvincular"),
         Msg::RemoveHandleWrong => o.write_str("Esse não é o handle desta identidade. Nada foi enviado."),
         Msg::RemoveChecking => o.write_str("Conferindo o handle\u{2026}"),
         // ---- the Security page (fgtw::security; owner, 2026-11-24: "not retire, unbind/bind, shit like that. retire means never again which is wrong.") ----
