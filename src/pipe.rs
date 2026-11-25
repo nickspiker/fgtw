@@ -16,6 +16,8 @@ use vsf::types::VsfType;
 /// The rustdesk fork's service tag.
 /// Worker rule: 1–8 chars, `[a-z0-9]`.
 pub const SVC_RUSTDESK: &str = "rd";
+/// The rustdesk fork's DIALLING side: the hub a process that connects out listens on, so the hosting process on the same device keeps [`SVC_RUSTDESK`] to itself ([`RD_FLAG_DIALLER`]).
+pub const SVC_RUSTDESK_DIALLER: &str = "rdc";
 
 /// The pipe URL for a device's receive socket on `seed_host` (e.g. `fgtw.org`).
 pub fn pipe_url(seed_host: &str, device_pubkey: &[u8; 32], svc: Option<&str>) -> String {
@@ -252,6 +254,10 @@ pub const RD_FLAG_FIN: u8 = 2;
 pub const RD_FLAG_NACK: u8 = 4;
 /// The frame carries a [`CandidateOffer`], not stream bytes: the two ends telling each other where to aim a hole punch. Signalling rides the relay pipe because it is the one channel that already works before any direct path exists — which is exactly the bootstrap problem.
 pub const RD_FLAG_PUNCH: u8 = 8;
+/// Set on a SYN or a punch offer sent by the DIALLING side of a rustdesk session: answer on my [`SVC_RUSTDESK_DIALLER`] hub, not my [`SVC_RUSTDESK`] one.
+/// One machine hosts and dials at once from two processes on one device key, and the seed binds one proven pipe per hub, so each process needs a hub of its own: on a shared hub each one's proof closed the other's pipe, and before the proofs the newest socket silently took the other's frames.
+/// A SYN without it comes from a rustdesk that predates the split and listens on its host hub; it is answered there.
+pub const RD_FLAG_DIALLER: u8 = 16;
 /// Fixed header length.
 pub const RD_HEADER_LEN: usize = 4 + 16 + 8 + 1;
 
