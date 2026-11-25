@@ -2,6 +2,8 @@
 
 Status: **plan, 2026-11-10; the owner's decisions are in (below).** Built: the scaffold, Depart, Add, and Join with the departure's typed-handle confirmation (2026-11-22). `fgtw::text` (the shared wording, 8b0f48e) has landed and Photon uses it (photon 06e10e1d).
 
+The graph of join, add and remove as built, with every departure from the owner's rules marked: [GRAPH.md](GRAPH.md) (2026-11-25, for review).
+
 ## Why
 
 Owner, 2026-11-10: everything FGTW moves out of Photon.
