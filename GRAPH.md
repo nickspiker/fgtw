@@ -218,6 +218,14 @@ No departure found here; it matches the 2026-11-22 and 2026-11-24 rules.
 | **D4** | joiner view | "Asking" never says where the request went (handed to which device, posted or not) | K9 | Emma, 2026-11-24 |
 | **D5** | joiner | before attest there is no way to send a log | (support) | the laptop's log, 2026-11-24 |
 
+## ferros (its session's answer, 2026-11-25)
+
+ferros's identity service does not run `flow::join` yet: it runs `photon_core::join` directly (`payloads/fgtw/src/main.rs`).
+- **D0 hits ferros too, already seen:** on the Pro (2026-11-17) the lookup's broadcast went out before the MacBook beaconed, fgtw.org did not answer, the verdict went grey, and a member sat minting a request nobody took. ferros wants the D0 fix.
+- **D2 is already automatic on ferros:** the lookup asks the person's devices on the network and known peers first, then fgtw.org last, with no button (`ask_fgtw`, owner 2026-11-10). Photon should match it.
+- **D4:** ferros shows which state the join is in (a state byte), not which device holds the request; a "handed to" view in `flow::join` would ride the same byte.
+- When ferros adopts `flow::join` it keeps: FGTW then fgtw.org automatically, the kernel-held device key, the roots from the attest screen in RAM only.
+
 ## Proposed fixes, for the owner to choose
 
 **For D0 (the request must reach the device in the person's hand):**
