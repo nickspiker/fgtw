@@ -12,6 +12,7 @@ use vsf::VsfType;
 
 use crate::fleet::scheme;
 use crate::pq::{eggs_from_bytes, eggs_to_bytes, FleetSigner};
+use crate::space::{Entry, Space};
 
 /// A device or identity key.
 pub type Key = [u8; 32];
@@ -45,6 +46,63 @@ impl Field {
             _ => None,
         }
     }
+}
+
+/// The kind of the person's OWN profile facts in their identity space ([`crate::space`]): SELF (the owner, 2026-11-26).
+/// The preferred name and the avatar pin as the person set them, one copy for the whole person, synced to every device of theirs and sealed under the fleet key, so it outlives every device.
+/// Kept by whatever manages the identity (ferros's identity service; Photon's FGTW part on desktop and Android) and readable by every kist, which publishes it to its own contacts as a [`ProfileRecord`] under its own alias, so a friend in one kist learns nothing of the person in another.
+/// The code continues ferros_space's table: 0 to 14 are taken, 255 is the person key.
+pub const SELF: u8 = 15;
+
+/// The id a field of [`SELF`] is kept under: the fleet's scope and the field's label.
+/// One entry per field, so a name set on one device and an avatar set on another in the same minute both stand; one entry holding both would let the later write carry the other field's old value back.
+pub fn self_id(field: Field) -> Vec<VsfType> {
+    vec![VsfType::ke(crate::prefs::FLEET.to_vec()), VsfType::a(vsf::types::Ascii::lit(field.label()))]
+}
+
+/// The person's own value for `field` and the stamp it was written at; None while it was never set.
+/// A cleared field (a removed avatar, a cleared name) reads as an empty value, which is published like any other so the clearing reaches friends too.
+/// The stamp is the revision a kist signs the record under, so every device of the person's signs the same revision for the same value.
+pub fn own(space: &Space, field: Field) -> Option<(Vec<u8>, i64)> {
+    let e = space.get(SELF, &self_id(field))?;
+    if e.gone {
+        return Some((Vec::new(), e.updated));
+    }
+    // WHY: the value was written by another device of the person's, perhaps a later build.
+    // PROOF: a name that is not text or a pin that is not 64 bytes (key ‖ lookup) is nothing a kist can show or sign, so it reads as never set rather than reaching a screen or a signature.
+    let value = e.value.iter().find_map(|v| match (field, v) {
+        (Field::Name, VsfType::x(s)) => Some(s.as_bytes().to_vec()),
+        (Field::AvatarPin, VsfType::ge(b)) if b.len() == 64 => Some(b.clone()),
+        _ => None,
+    })?;
+    Some((value, e.updated))
+}
+
+/// The person set `field` on `by`, one of their devices: a name as VSF text (`x`), a pin as its 64 bytes (`ge`), an empty value as a tombstone so the clearing crosses the fleet like a value.
+/// Refused (false) for a name that is not UTF-8, a pin that is not 64 bytes, an unchanged value, or clearing a field never set. True when the space changed.
+pub fn set_own(space: &mut Space, by: &[u8; 32], field: Field, value: &[u8], now: i64) -> bool {
+    // WHY: the value comes from a screen of the person's device.
+    // PROOF: a pin of another length has no key and lookup to split, and bytes that are not UTF-8 have no `x` form, so either would be written as a fact no device can read back.
+    let typed = match field {
+        _ if value.is_empty() => None,
+        Field::Name => match core::str::from_utf8(value) {
+            Ok(s) => Some(VsfType::x(s.to_string())),
+            Err(_) => return false,
+        },
+        Field::AvatarPin if value.len() == 64 => Some(VsfType::ge(value.to_vec())),
+        Field::AvatarPin => return false,
+    };
+    match own(space, field) {
+        Some((held, _)) if held == value => return false,
+        None if typed.is_none() => return false,
+        _ => {}
+    }
+    let id = self_id(field);
+    // WHY: stamped past the fact's last write rather than at `now` alone.
+    // PROOF: a device whose clock runs behind the one that last wrote would stamp its later choice older, and the merge (greatest stamp wins) would throw the person's newest choice away.
+    let updated = space.get(SELF, &id).map_or(now, |e| now.max(e.updated + 1));
+    let gone = typed.is_none();
+    space.put(Entry { kind: SELF, id, value: typed.into_iter().collect(), updated, by: *by, gone })
 }
 
 /// One profile field as its owner set it.
@@ -376,6 +434,76 @@ mod tests {
         }
         assert!(ProfileRecord::from_value(&VsfType::v(b'r', vec![1, 2, 3])).is_err());
         assert!(ProfileRecord::from_value(&VsfType::x("Bloom".to_string())).is_err());
+    }
+
+    /// A space as another device of the person's holds it after a hand-over: thru its document, as the fleet carries it.
+    fn hand_over(s: &Space) -> Space {
+        Space::from_doc(&s.to_doc(0).unwrap()).unwrap()
+    }
+
+    const PHONE: Key = [1; 32];
+    const LAPTOP: Key = [2; 32];
+
+    #[test]
+    fn self_crosses_the_fleet_with_its_stamp_as_the_revision() {
+        let mut a = Space::new();
+        assert_eq!(own(&a, Field::Name), None, "never set");
+        assert!(set_own(&mut a, &PHONE, Field::Name, "Zoë".as_bytes(), 2000));
+        assert!(!set_own(&mut a, &PHONE, Field::Name, "Zoë".as_bytes(), 2001), "the same name changes nothing");
+        let b = hand_over(&a);
+        assert_eq!(own(&b, Field::Name), Some(("Zoë".as_bytes().to_vec(), 2000)));
+        // Two devices holding the same fact sign the same record: one revision, one value, whichever of them signs.
+        let (value, rev) = own(&b, Field::Name).unwrap();
+        assert_eq!(own(&a, Field::Name), Some((value, rev)));
+    }
+
+    #[test]
+    fn a_name_and_an_avatar_set_on_two_devices_both_stand() {
+        let mut a = Space::new();
+        let mut b = Space::new();
+        assert!(set_own(&mut a, &PHONE, Field::Name, b"Bloom", 3000));
+        assert!(set_own(&mut b, &LAPTOP, Field::AvatarPin, &[0x5A; 64], 3000));
+        a.merge(hand_over(&b));
+        b.merge(hand_over(&a));
+        for s in [&a, &b] {
+            assert_eq!(own(s, Field::Name).map(|(v, _)| v), Some(b"Bloom".to_vec()));
+            assert_eq!(own(s, Field::AvatarPin).map(|(v, _)| v), Some(vec![0x5A; 64]));
+        }
+    }
+
+    #[test]
+    fn a_cleared_avatar_crosses_the_fleet_as_an_empty_value() {
+        let mut a = Space::new();
+        assert!(!set_own(&mut a, &PHONE, Field::AvatarPin, &[], 100), "nothing to clear");
+        assert!(set_own(&mut a, &PHONE, Field::AvatarPin, &[7; 64], 200));
+        let mut b = hand_over(&a);
+        assert!(set_own(&mut b, &LAPTOP, Field::AvatarPin, &[], 300));
+        a.merge(hand_over(&b));
+        assert_eq!(own(&a, Field::AvatarPin), Some((Vec::new(), 300)), "the clearing is a value to publish, newer than the avatar");
+        assert!(!set_own(&mut a, &PHONE, Field::AvatarPin, &[], 400), "already cleared");
+        assert!(set_own(&mut a, &PHONE, Field::AvatarPin, &[8; 64], 400), "and an avatar can come back");
+        assert_eq!(own(&a, Field::AvatarPin), Some((vec![8; 64], 400)));
+    }
+
+    #[test]
+    fn self_refuses_what_no_device_could_read_back() {
+        let mut a = Space::new();
+        assert!(!set_own(&mut a, &PHONE, Field::AvatarPin, &[1; 32], 100), "a pin is 64 bytes");
+        assert!(!set_own(&mut a, &PHONE, Field::Name, &[0xFF, 0xFE], 100), "a name is text");
+        assert!(a.entries().is_empty());
+        // A value another device wrote in a form this build cannot use reads as never set.
+        a.put(Entry { kind: SELF, id: self_id(Field::AvatarPin), value: vec![VsfType::ge(vec![1; 32])], updated: 1, by: PHONE, gone: false });
+        assert_eq!(own(&a, Field::AvatarPin), None);
+    }
+
+    #[test]
+    fn the_later_choice_wins_when_its_device_clock_runs_behind() {
+        let mut a = Space::new();
+        assert!(set_own(&mut a, &PHONE, Field::Name, b"Bloom", 5000));
+        let mut b = hand_over(&a);
+        assert!(set_own(&mut b, &LAPTOP, Field::Name, b"Blossom", 1000));
+        a.merge(hand_over(&b));
+        assert_eq!(own(&a, Field::Name), Some((b"Blossom".to_vec(), 5001)));
     }
 
     #[test]
