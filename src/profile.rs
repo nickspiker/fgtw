@@ -114,12 +114,12 @@ impl ProfileRecord {
         crate::pq::SigningBundle::developer(identity_seed, "FGTW_IDENTITY")
     }
 
-    /// Sign a profile field with the subject's OWN IDENTITY — the full three-scheme basket of [`identity_bundle`], not one egg. The record then verifies against that pinned identity (its party-id Ed25519 key, and the Falcon/SPHINCS+ pubkeys of the bundle once pinned) forever, through every device rotation and ownership change, with no fleet-membership check. `identity_seed` is the caller's own seed (in RAM at attest); it never leaves.
+    /// Sign a profile field with the subject's OWN IDENTITY, at the ENVELOPE tier: Ed25519 + Falcon-512 — two independent hardness families (elliptic-curve + lattice), not one egg, and ~730 bytes so it rides a pong (one datagram). SPHINCS+ (hash, ~8 KB a signature) is deliberately left off the wire — it is the archival backstop, carried only in an at-rest full-basket copy if wanted, never on a status ping (pq::ENVELOPE_TIER, the same tier every per-message envelope uses). The record verifies against the subject's pinned identity (its party-id Ed25519 key, and the Falcon pubkey of the published bundle once pinned) forever, through every device rotation and ownership change, with no fleet-membership check. `identity_seed` is the caller's own seed (in RAM at attest); it never leaves.
     pub fn sign_as_identity(identity_seed: &Key, subject: &Key, field: Field, value: Vec<u8>, rev: i64) -> Self {
         let bundle = Self::identity_bundle(identity_seed);
         let identity = bundle.keypair().public.to_bytes();
         let msg = Self::signing_bytes_identity(subject, field, &value, rev);
-        let sig = eggs_to_bytes(&bundle.eggs(&msg, scheme::MASK_ALL));
+        let sig = eggs_to_bytes(&bundle.eggs(&msg, crate::pq::ENVELOPE_TIER));
         ProfileRecord { subject: *subject, field, value, rev, device: identity, identity: Some(identity), sig }
     }
 
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn an_identity_signed_record_is_the_full_basket_and_needs_no_fleet_membership() {
+    fn an_identity_signed_record_is_two_family_envelope_and_needs_no_fleet_membership() {
         // The owner's rule 2026-11-26: a record signed by the identity never lapses (the signer does not change owners), AND it is the full three-scheme basket, not a single egg (one egg is the one-basket failure the egg system exists to kill).
         let seed = [7u8; 32];
         let bundle = ProfileRecord::identity_bundle(&seed);
@@ -285,14 +285,15 @@ mod tests {
         let rec = ProfileRecord::sign_as_identity(&seed, &HP, Field::Name, b"Zinnia".to_vec(), 100);
         assert_eq!(rec.identity, Some(id_pub), "the record names the identity (party id) that signed it");
 
-        // NOT a single Ed25519 egg: all three independent-assumption schemes are present.
+        // NOT a single Ed25519 egg: two independent families (curve + lattice) at the envelope tier, and NOT SPHINCS+ (too big for a pong — it is the at-rest backstop only).
         let eggs = crate::pq::eggs_from_bytes(&rec.sig).expect("egg list");
-        for want in [scheme::ED25519, scheme::FALCON512, scheme::SPHINCS_PLUS] {
-            assert!(eggs.iter().any(|e| e.scheme == want), "scheme {want} is in the basket");
-        }
-        // The whole basket verifies against the identity's PUBLIC bundle — three independent assumptions, not one curve.
+        assert!(eggs.iter().any(|e| e.scheme == scheme::ED25519), "Ed25519 present");
+        assert!(eggs.iter().any(|e| e.scheme == scheme::FALCON512), "Falcon present");
+        assert!(!eggs.iter().any(|e| e.scheme == scheme::SPHINCS_PLUS), "SPHINCS+ stays off the wire (rides a pong)");
+        assert!(crate::pq::eggs_to_bytes(&eggs).len() < 1024, "fits a datagram");
+        // The envelope basket verifies against the identity's PUBLIC bundle — two independent assumptions, not one curve.
         let msg = ProfileRecord::signing_bytes_identity(&HP, Field::Name, &rec.value, rec.rev);
-        assert!(crate::pq::verify_eggs(&eggs, &bundle.public(), &msg, scheme::MASK_ALL), "Ed25519 + Falcon + SPHINCS+ all verify");
+        assert!(crate::pq::verify_eggs(&eggs, &bundle.public(), &msg, crate::pq::ENVELOPE_TIER), "Ed25519 + Falcon both verify");
 
         // The transitional verify (Ed25519 via the pinned party id) passes with NO device, NO current membership — device churn cannot drop it.
         let is_the_subjects_identity = |subject: &Key, key: &Key, _rev: i64| *subject == HP && *key == id_pub;
@@ -302,7 +303,7 @@ mod tests {
         let mut forged = rec.clone();
         forged.value = b"NotZinnia".to_vec();
         let fmsg = ProfileRecord::signing_bytes_identity(&HP, Field::Name, &forged.value, forged.rev);
-        assert!(!crate::pq::verify_eggs(&crate::pq::eggs_from_bytes(&forged.sig).unwrap(), &bundle.public(), &fmsg, scheme::MASK_ALL));
+        assert!(!crate::pq::verify_eggs(&crate::pq::eggs_from_bytes(&forged.sig).unwrap(), &bundle.public(), &fmsg, crate::pq::ENVELOPE_TIER));
         assert!(!forged.verify(is_the_subjects_identity));
 
         // A stranger's identity cannot speak for the subject.
