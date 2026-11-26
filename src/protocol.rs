@@ -310,6 +310,20 @@ pub fn parse_fleet_resp(bytes: &[u8]) -> Result<([u8; 32], Vec<u8>, [u8; 32]), S
     Ok((field_handle_proof(&section, "hp").ok_or("fleet_resp missing hp")?, field_ge(&section, "ch").ok_or("fleet_resp missing ch")?, sender))
 }
 
+/// The `rotation_push` frame (ferros docs/PHOTON.md "How contacts keep trusting the person"): a Photon's rotation ([`crate::binding::Rotation::to_vsf_bytes`]) for identity `hp`, handed to each contact device. The rotation verifies itself against the chain the contact pinned; the carrier earns no trust.
+pub fn rotation_push(handle_proof: &[u8; 32], rotation: &[u8], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
+    let mut section = VsfSection::new("rotation_push");
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("rt", VsfType::ge(rotation.to_vec()));
+    signed_frame(section, signer, time)
+}
+
+/// Read a `rotation_push`: (handle proof, the rotation's bytes, the sending device). The rotation is not checked here: the receiver checks it against the chain it holds for `hp` ([`crate::binding::Rotation::verify`]).
+pub fn parse_rotation_push(bytes: &[u8]) -> Result<([u8; 32], Vec<u8>, [u8; 32]), String> {
+    let (section, sender) = open_named(bytes, "rotation_push")?;
+    Ok((field_handle_proof(&section, "hp").ok_or("rotation_push missing hp")?, field_ge(&section, "rt").ok_or("rotation_push missing rt")?, sender))
+}
+
 /// The `fanout_resp` frame: a fan-out blob (`fanout_to_bytes`) for fleet `hp`, handed by the device that sealed it to the newcomer it was grown for and to the siblings. Each opens it with its own ira; a header the recovered key does not reproduce is refused.
 pub fn fanout_resp(handle_proof: &[u8; 32], blob: &[u8], signer: &(impl FleetSigner + ?Sized), time: i64) -> Result<Vec<u8>, String> {
     let mut section = VsfSection::new("fanout_resp");
@@ -568,7 +582,10 @@ mod tests {
         let chain = vec![0xABu8; 2000];
         assert_eq!(parse_fleet_resp(&fleet_resp(&hp, &chain, &kp, 1).unwrap()).unwrap(), (hp, chain, kp.public.to_bytes()));
         let blob = vec![0xCDu8; 3000];
-        assert_eq!(parse_fanout_resp(&fanout_resp(&hp, &blob, &kp, 1).unwrap()).unwrap(), (hp, blob, kp.public.to_bytes()));
+        assert_eq!(parse_fanout_resp(&fanout_resp(&hp, &blob, &kp, 1).unwrap()).unwrap(), (hp, blob.clone(), kp.public.to_bytes()));
+        let rotation = vec![0xEFu8; 11000];
+        assert_eq!(parse_rotation_push(&rotation_push(&hp, &rotation, &kp, 1).unwrap()).unwrap(), (hp, rotation, kp.public.to_bytes()));
+        assert!(parse_rotation_push(&fanout_resp(&hp, &blob, &kp, 1).unwrap()).is_err(), "a fan-out is no rotation");
         // The held revision reads back at any width, small (one byte on the wire) or large.
         for rev in [0u64, 7, 2762, 1 << 40] {
             assert_eq!(parse_fanout_req(&fanout_req(&hp, rev, &kp, 1).unwrap()).unwrap(), (hp, rev, kp.public.to_bytes()));
