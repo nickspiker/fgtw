@@ -12,6 +12,7 @@ use vsf::VsfType;
 
 use crate::fleet::scheme;
 use crate::pq::{eggs_from_bytes, eggs_to_bytes, FleetSigner};
+use vsf::eggs::Egg;
 
 /// A device or identity key.
 pub type Key = [u8; 32];
@@ -57,9 +58,11 @@ pub struct ProfileRecord {
     pub value: Vec<u8>,
     /// The Eagle time (oscillations) its owner set it: the revision. Never re-stamped by a carrier.
     pub rev: i64,
-    /// The device that set it, a member of the identity's fleet then.
+    /// The device that set it, a member of the identity's fleet then. For an identity-signed record (`identity` set) this is the identity's own key too, kept so the field is never empty.
     pub device: Key,
-    /// That device's eggs over [`ProfileRecord::signing_bytes`], as an egg-list blob.
+    /// Set when the record is signed by the SUBJECT'S OWN IDENTITY key (the Ed25519 key whose pubkey is the identity party id, `crypto::clutch::identity_party_id`), not a device: then the signer never changes owners and the record stays valid forever, no fleet-membership check (the owner's rule 2026-11-26: "signed by my identity, not a device that might change owners — signed records ALWAYS stay active"). Absent = the legacy device-signed form, which a carrier only trusts while that device is a current member. An older build drops this unknown field.
+    pub identity: Option<Key>,
+    /// The signer's eggs over the matching `signing_bytes` (device form) or `signing_bytes_identity` (identity form), as an egg-list blob.
     pub sig: Vec<u8>,
 }
 
@@ -92,19 +95,45 @@ impl ProfileRecord {
         let msg = Self::signing_bytes(subject, field, &value, rev, &device);
         let mask = signer.bundle().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE);
         let sig = eggs_to_bytes(&signer.eggs(&msg, mask));
-        ProfileRecord { subject: *subject, field, value, rev, device, sig }
+        ProfileRecord { subject: *subject, field, value, rev, device, identity: None, sig }
+    }
+
+    /// What the IDENTITY signs (v2): no device at all, since the signer is the identity itself and does not change across devices. The value rides as its hash, as in the device form.
+    pub fn signing_bytes_identity(subject: &Key, field: Field, value: &[u8], rev: i64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(128);
+        m.extend_from_slice(b"fgtw.profile.v2.identity");
+        m.extend_from_slice(subject);
+        m.extend_from_slice(field.label().as_bytes());
+        m.push(0);
+        m.extend_from_slice(&rev.to_le_bytes());
+        m.extend_from_slice(blake3::hash(value).as_bytes());
+        m
+    }
+
+    /// Sign a profile field with the subject's OWN IDENTITY key — the Ed25519 key `SigningKey::from_bytes(identity_seed)`, whose pubkey is the identity party id every contact pins at first-met (crypto::clutch::identity_party_id). The record then verifies against that pinned identity forever, through every device rotation and ownership change, with no fleet-membership check. `identity_seed` is the caller's own seed (in RAM at attest); it never leaves.
+    pub fn sign_as_identity(identity_seed: &Key, subject: &Key, field: Field, value: Vec<u8>, rev: i64) -> Self {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(identity_seed);
+        let identity = sk.verifying_key().to_bytes();
+        let msg = Self::signing_bytes_identity(subject, field, &value, rev);
+        let sig = eggs_to_bytes(&[Egg { scheme: scheme::ED25519, sig: sk.sign(&msg).to_bytes().to_vec() }]);
+        ProfileRecord { subject: *subject, field, value, rev, device: identity, identity: Some(identity), sig }
     }
 
     /// Whether the record is its owner's: the setting device's Ed25519 egg verifies, and `member` says that device was in the identity's fleet at the revision (the app's fold check).
     pub fn verify(&self, member: impl Fn(&Key, &Key, i64) -> bool) -> bool {
-        if !member(&self.subject, &self.device, self.rev) {
+        // The signer and what it signed depend on the form. Identity-signed: the identity's own key over the v2 bytes — `member` vouches it is the subject's pinned identity (a permanent fact), so the record stays valid through every rotation. Device-signed (legacy): the device key over the v1 bytes — `member` vouches current fleet membership, which is why an old device's record lapses.
+        let (key, msg) = match &self.identity {
+            Some(id) => (id, Self::signing_bytes_identity(&self.subject, self.field, &self.value, self.rev)),
+            None => (&self.device, Self::signing_bytes(&self.subject, self.field, &self.value, self.rev, &self.device)),
+        };
+        if !member(&self.subject, key, self.rev) {
             return false;
         }
-        let msg = Self::signing_bytes(&self.subject, self.field, &self.value, self.rev, &self.device);
         eggs_from_bytes(&self.sig)
             .ok()
             .and_then(|eggs| eggs.into_iter().find(|e| e.scheme == scheme::ED25519))
-            .is_some_and(|e| crate::pq::verify_egg(scheme::ED25519, &self.device, &msg, &e.sig))
+            .is_some_and(|e| crate::pq::verify_egg(scheme::ED25519, key, &msg, &e.sig))
     }
 
     /// Newer than `other` for the same (identity, field): the later revision, and at an equal revision the larger value hash, so every holder picks the same copy.
@@ -130,6 +159,9 @@ impl ProfileRecord {
         }
         sec.add_field("revision", VsfType::e(EtType::e6(self.rev)));
         sec.add_field("device", VsfType::ke(self.device.to_vec()));
+        if let Some(id) = &self.identity {
+            sec.add_field("identity", VsfType::ke(id.to_vec()));
+        }
         sec.add_field("sig", VsfType::ge(self.sig.clone()));
         sec
     }
@@ -165,7 +197,9 @@ impl ProfileRecord {
             Some(VsfType::ge(b)) => b.clone(),
             _ => return Err("profile record missing its signature".to_string()),
         };
-        Ok(ProfileRecord { subject, field, value, rev, device, sig })
+        // Absent on a legacy (device-signed) record and on an older build's document; present carries the identity-signed form.
+        let identity = key("identity");
+        Ok(ProfileRecord { subject, field, value, rev, device, identity, sig })
     }
 
     /// The record as one VSF value, its section's bytes wrapped under [`WRAP`], so it rides a field of another document (a pong tail, a contact document, a settings value) and is read back by its marker, never by position.
@@ -237,6 +271,43 @@ mod tests {
         let mut restamped = rec.clone();
         restamped.rev = 200;
         assert!(!restamped.verify(member_of(me)), "a carrier cannot re-stamp a record");
+    }
+
+    #[test]
+    fn an_identity_signed_record_stays_valid_without_any_fleet_membership() {
+        // The owner's rule 2026-11-26: a record signed by the identity itself never lapses, because the signer does not change owners.
+        let seed = [7u8; 32];
+        let id_pub = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let rec = ProfileRecord::sign_as_identity(&seed, &HP, Field::Name, b"Zinnia".to_vec(), 100);
+        assert_eq!(rec.identity, Some(id_pub), "the record names the identity that signed it");
+
+        // The ONLY thing `member` vouches is that the signer is the subject's pinned identity — never a device, never current fleet membership. This closure consults no device set at all.
+        let is_the_subjects_identity = |subject: &Key, key: &Key, _rev: i64| *subject == HP && *key == id_pub;
+        assert!(rec.verify(is_the_subjects_identity), "verifies against the pinned identity with no membership check");
+
+        // A device-signed record from a non-member would fail here (that is the old BOOP); the identity-signed one does not depend on any device, so a closure that would reject every device still accepts it.
+        let rejects_every_device = |subject: &Key, key: &Key, _rev: i64| *subject == HP && *key == id_pub;
+        assert!(rec.verify(rejects_every_device), "device churn — rotations, ownership changes — cannot drop it");
+
+        // Tampering the value breaks the identity signature.
+        let mut forged = rec.clone();
+        forged.value = b"NotZinnia".to_vec();
+        assert!(!forged.verify(is_the_subjects_identity), "a tampered value does not verify");
+
+        // Someone else's identity in the record is rejected: `member` only vouches the subject's own pinned identity.
+        assert!(!rec.verify(|subject: &Key, key: &Key, _| *subject == HP && *key == [9u8; 32]), "a stranger's identity cannot speak for the subject");
+
+        // Survives the section round-trip with the identity field intact.
+        let back = ProfileRecord::from_section(&rec.to_section()).expect("round-trips");
+        assert_eq!(back, rec, "the identity-signed record encodes and decodes unchanged");
+
+        // A newer identity-signed revision still wins; an older one never does — the resolver is unchanged.
+        let newer = ProfileRecord::sign_as_identity(&seed, &HP, Field::Name, b"Zinnia II".to_vec(), 101);
+        let mut held = alloc::vec::Vec::new();
+        assert_eq!(accept(&mut held, rec.clone(), is_the_subjects_identity), Some(Merged::Adopted));
+        assert_eq!(accept(&mut held, newer.clone(), is_the_subjects_identity), Some(Merged::Adopted));
+        assert_eq!(accept(&mut held, rec, is_the_subjects_identity), Some(Merged::Kept), "an older copy never wins");
+        assert_eq!(current(&held, &HP, Field::Name).and_then(|r| r.name()), Some("Zinnia II"));
     }
 
     #[test]
