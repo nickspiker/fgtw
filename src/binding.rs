@@ -106,6 +106,12 @@ impl Binding {
     /// The binding as a complete VSF file: a header with its provenance, and the section `binding`, each value by its honest type (the handle proof `hP`, the keys `ke`, the option `hp`, the time `e`, the eggs `gm`; the bundle as fgtw carries a bundle everywhere, `ge` of its bytes).
     pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
         let mut sec = vsf::VsfSection::new(SECTION);
+        self.fields_into(&mut sec);
+        vsf::VsfBuilder::new().creation_time_oscillations(self.when).add_section_direct(sec).build().map_err(|e| format!("binding to_vsf: {e}"))
+    }
+
+    /// The binding's fields, written into `sec`: its own document's section, or a [`Rotation`]'s.
+    fn fields_into(&self, sec: &mut vsf::VsfSection) {
         sec.add_field("handle_proof", VsfType::hP(self.handle_proof.to_vec()));
         sec.add_field("developer", VsfType::ke(self.developer.to_vec()));
         sec.add_field("option", VsfType::hp(self.option.to_vec()));
@@ -113,7 +119,11 @@ impl Binding {
         sec.add_field("when", VsfType::e(EtType::e6(self.when)));
         sec.add_field("device", VsfType::ke(self.device.to_vec()));
         sec.add_field("eggs", VsfType::gm(self.sig.clone()));
-        vsf::VsfBuilder::new().creation_time_oscillations(self.when).add_section_direct(sec).build().map_err(|e| format!("binding to_vsf: {e}"))
+    }
+
+    /// The bytes every signature over this binding covers: [`Binding::signing_bytes`] of its own fields.
+    pub fn bytes(&self) -> Vec<u8> {
+        Self::signing_bytes(&self.handle_proof, &self.developer, &self.option, &self.alias, self.when, &self.device)
     }
 
     /// Read a binding back from [`Binding::to_vsf_bytes`]'s form: the file must verify (its provenance and rolling hash) before a field is read, and each field is taken by its type marker. Only the form is checked here; [`Binding::verify`] decides whether it is the person's.
@@ -127,6 +137,11 @@ impl Binding {
         if sec.name != SECTION {
             return Err("not a binding".to_string());
         }
+        Self::from_fields(&sec)
+    }
+
+    /// Read the binding's fields from `sec` (its own document's section, or a [`Rotation`]'s), each by its type marker.
+    fn from_fields(sec: &vsf::VsfSection) -> Result<Self, String> {
         let first = |name: &str| sec.get_field(name).and_then(|f| f.values.first());
         let key = |name: &str| -> Result<Key, String> {
             match first(name) {
@@ -144,6 +159,97 @@ impl Binding {
         };
         let when = sec.eagle("when").ok_or("binding: no time")?;
         Ok(Binding { handle_proof: key("handle_proof")?, developer: key("developer")?, option: key("option")?, alias, when, device: key("device")?, sig })
+    }
+}
+
+/// The section a rotation document carries.
+pub const ROTATION_SECTION: &str = "rotation";
+
+/// The rotation (ferros docs/PHOTON.md "How contacts keep trusting the person"): what each of the person's Photons tells each contact over the friendship they already have, "my Photon key is this alias".
+/// Three signatures over the binding's bytes ([`Binding::bytes`]):
+/// - the fleet member's, the binding itself: the one that carries the weight, since a device the contact already trusts vouches for the alias and nobody who only knows the handle can make it;
+/// - the alias's own, at the envelope tier (Ed25519 and Falcon-512): it holds the key it names, and the contact gets both families' keys to check the alias's records by;
+/// - the old identity key's, where the device holds it (never on ferros): continuity with the pin, worth little alone, since anyone who knows the handle can make it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rotation {
+    pub binding: Binding,
+    /// The alias's eggs over the binding's bytes, as an egg list.
+    pub alias_eggs: Vec<u8>,
+    /// The old identity key's Ed25519 signature over the binding's bytes, when the device holds that key.
+    pub identity_sig: Option<Vec<u8>>,
+}
+
+/// Why a rotation was not taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotationRefused {
+    /// The binding did not hold against the person's chain.
+    Binding(Refused),
+    /// The alias's own eggs do not verify, or fall short of the envelope tier (the alias must hold Falcon-512 too).
+    AliasEggs,
+    /// An identity signature rode along and does not verify under the identity key the contact pinned.
+    Identity,
+}
+
+impl Rotation {
+    /// Make a rotation from this Photon's binding: the alias signs the binding's bytes, and the old identity key does too when `identity_seed` is held.
+    #[cfg(feature = "sign")]
+    pub fn make(binding: Binding, alias: &crate::pq::SigningBundle, identity_seed: Option<&Key>) -> Self {
+        use ed25519_dalek::Signer;
+        let msg = binding.bytes();
+        let alias_eggs = eggs_to_bytes(&alias.eggs(&msg, crate::pq::ENVELOPE_TIER));
+        let identity_sig = identity_seed.map(|s| ed25519_dalek::SigningKey::from_bytes(s).sign(&msg).to_bytes().to_vec());
+        Rotation { binding, alias_eggs, identity_sig }
+    }
+
+    /// Take the rotation: the binding holds against the person's chain as the contact holds it (its signer a current member there now; once taken, the contact keeps the alias, and that signer leaving the fleet later never drops it), the alias signed the same bytes with both families of the envelope tier, and an identity signature, when one rides, verifies under `pinned_identity`, the identity key the contact pinned at first-met.
+    pub fn verify(&self, chain: &MembershipBlob, pinned_identity: &Key) -> Result<(), RotationRefused> {
+        self.binding.verify(chain).map_err(RotationRefused::Binding)?;
+        let msg = self.binding.bytes();
+        if !eggs_from_bytes(&self.alias_eggs).is_ok_and(|eggs| verify_eggs(&eggs, &self.binding.alias, &msg, crate::pq::ENVELOPE_TIER)) {
+            return Err(RotationRefused::AliasEggs);
+        }
+        if let Some(sig) = &self.identity_sig {
+            if !crate::pq::verify_egg(scheme::ED25519, pinned_identity, &msg, sig) {
+                return Err(RotationRefused::Identity);
+            }
+        }
+        Ok(())
+    }
+
+    /// The rotation as a complete VSF file: the section `rotation` holding the binding's fields, the alias's eggs (`gm`) and, when it rides, the identity signature (`ge`, an Ed25519 egg).
+    pub fn to_vsf_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut sec = vsf::VsfSection::new(ROTATION_SECTION);
+        self.binding.fields_into(&mut sec);
+        sec.add_field("alias_eggs", VsfType::gm(self.alias_eggs.clone()));
+        if let Some(sig) = &self.identity_sig {
+            sec.add_field("identity_sig", VsfType::ge(sig.clone()));
+        }
+        vsf::VsfBuilder::new().creation_time_oscillations(self.binding.when).add_section_direct(sec).build().map_err(|e| format!("rotation to_vsf: {e}"))
+    }
+
+    /// Read a rotation back from [`Rotation::to_vsf_bytes`]'s form: the file must verify before a field is read. Only the form is checked here; [`Rotation::verify`] decides whether it is the person's.
+    pub fn from_vsf_bytes(bytes: &[u8]) -> Result<Self, String> {
+        // WHY/PROOF: a rotation arrives from a contact's device; the parse below runs over whatever length it claims, and a rotation is a binding plus two small signatures, inside the binding's bound.
+        if bytes.len() > BYTES_MAX {
+            return Err(format!("rotation: {} bytes is past the {BYTES_MAX} a rotation may be", bytes.len()));
+        }
+        let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| format!("rotation verification: {e}"))?;
+        let sec = header.primary_section(bytes, end).map_err(|e| format!("rotation section: {e}"))?;
+        if sec.name != ROTATION_SECTION {
+            return Err("not a rotation".to_string());
+        }
+        let binding = Binding::from_fields(&sec)?;
+        let first = |name: &str| sec.get_field(name).and_then(|f| f.values.first());
+        let alias_eggs = match first("alias_eggs") {
+            Some(VsfType::gm(b)) => b.clone(),
+            _ => return Err("rotation: no alias eggs".to_string()),
+        };
+        let identity_sig = match first("identity_sig") {
+            Some(VsfType::ge(b)) => Some(b.clone()),
+            None => None,
+            Some(_) => return Err("rotation: identity signature of an unexpected type".to_string()),
+        };
+        Ok(Rotation { binding, alias_eggs, identity_sig })
     }
 }
 
@@ -233,6 +339,47 @@ mod tests {
         let mut x = b.clone();
         x.handle_proof[0] ^= 1;
         assert_eq!(x.verify(&c), Err(Refused::OtherIdentity), "another person's slot");
+    }
+
+    #[test]
+    fn a_rotation_pins_the_alias_a_member_vouched_for() {
+        let a = SigningBundle::derive(b"device a");
+        let c = chain(&a);
+        let mask = c.declared_mask(&a.keypair().public.to_bytes());
+        let (alias_signer, alias) = alias();
+        let identity_seed = [0x2A; 32];
+        let pinned = ed25519_dalek::SigningKey::from_bytes(&identity_seed).verifying_key().to_bytes();
+        let b = Binding::sign(&a, mask, &HP, &DEV, &OPT, alias.clone(), 2_000);
+        let r = Rotation::make(b.clone(), &alias_signer, Some(&identity_seed));
+        assert_eq!(r.verify(&c, &pinned), Ok(()));
+        let back = Rotation::from_vsf_bytes(&r.to_vsf_bytes().unwrap()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.verify(&c, &pinned), Ok(()));
+        // ferros's Photon holds no identity key: the binding and the alias carry it alone.
+        let bare = Rotation::make(b.clone(), &alias_signer, None);
+        assert_eq!(Rotation::from_vsf_bytes(&bare.to_vsf_bytes().unwrap()).unwrap().verify(&c, &pinned), Ok(()));
+        // The pinned bundle checks the alias's records with both families.
+        let rec = crate::profile::ProfileRecord::sign_by(&alias_signer, &HP, crate::profile::Field::Name, b"Bloom".to_vec(), 100);
+        assert!(rec.verify_by(&back.binding.alias));
+    }
+
+    #[test]
+    fn a_rotation_is_refused_for_any_signature_that_does_not_hold() {
+        let a = SigningBundle::derive(b"device a");
+        let c = chain(&a);
+        let mask = c.declared_mask(&a.keypair().public.to_bytes());
+        let (alias_signer, alias) = alias();
+        let identity_seed = [0x2A; 32];
+        let pinned = ed25519_dalek::SigningKey::from_bytes(&identity_seed).verifying_key().to_bytes();
+        let b = Binding::sign(&a, mask, &HP, &DEV, &OPT, alias.clone(), 2_000);
+        assert_eq!(Rotation::make(b.clone(), &alias_signer, Some(&identity_seed)).verify(&c, &[3; 32]), Err(RotationRefused::Identity), "an identity signature under another pin");
+        let other_alias = crate::alias::bundle(&crate::alias::seed(&[8; 32], &DEV, &OPT));
+        assert_eq!(Rotation::make(b.clone(), &other_alias, None).verify(&c, &pinned), Err(RotationRefused::AliasEggs), "the alias named did not sign");
+        let thin = Binding::sign(&a, mask, &HP, &DEV, &OPT, KeyBundle::ed25519_only(&alias.ed25519()), 2_000);
+        assert_eq!(Rotation::make(thin, &alias_signer, None).verify(&c, &pinned), Err(RotationRefused::AliasEggs), "an alias without its Falcon key gives a contact one family to check by");
+        let stranger = SigningBundle::derive(b"stranger");
+        let forged = Binding::sign(&stranger, scheme::MASK_ALL, &HP, &DEV, &OPT, alias, 2_000);
+        assert_eq!(Rotation::make(forged, &alias_signer, Some(&identity_seed)).verify(&c, &pinned), Err(RotationRefused::Binding(Refused::NotMember)), "knowing the handle is not enough");
     }
 
     fn alias_other() -> KeyBundle {

@@ -174,11 +174,24 @@ impl ProfileRecord {
 
     /// Sign a profile field with the subject's OWN IDENTITY, at the ENVELOPE tier: Ed25519 + Falcon-512 — two independent hardness families (elliptic-curve + lattice), not one egg, and ~730 bytes so it rides a pong (one datagram). SPHINCS+ (hash, ~8 KB a signature) is deliberately left off the wire — it is the archival backstop, carried only in an at-rest full-basket copy if wanted, never on a status ping (pq::ENVELOPE_TIER, the same tier every per-message envelope uses). The record verifies against the subject's pinned identity (its party-id Ed25519 key, and the Falcon pubkey of the published bundle once pinned) forever, through every device rotation and ownership change, with no fleet-membership check. `identity_seed` is the caller's own seed (in RAM at attest); it never leaves.
     pub fn sign_as_identity(identity_seed: &Key, subject: &Key, field: Field, value: Vec<u8>, rev: i64) -> Self {
-        let bundle = Self::identity_bundle(identity_seed);
-        let identity = bundle.keypair().public.to_bytes();
+        Self::sign_by(&Self::identity_bundle(identity_seed), subject, field, value, rev)
+    }
+
+    /// Sign a profile field with a bundle that is the subject's own public face in a kist: its alias (fgtw::alias::bundle), whose public bundle the subject's contacts pinned from a rotation ([`crate::binding::Rotation`]). Envelope tier, as [`sign_as_identity`](Self::sign_as_identity): Ed25519 + Falcon-512, small enough for a pong. The alias derives from the person key, which nobody computes from the handle (the owner, 2026-11-26: the identity key it replaces is the handle's, forgeable by anyone who knows it).
+    pub fn sign_by(bundle: &crate::pq::SigningBundle, subject: &Key, field: Field, value: Vec<u8>, rev: i64) -> Self {
+        let signer = bundle.keypair().public.to_bytes();
         let msg = Self::signing_bytes_identity(subject, field, &value, rev);
         let sig = eggs_to_bytes(&bundle.eggs(&msg, crate::pq::ENVELOPE_TIER));
-        ProfileRecord { subject: *subject, field, value, rev, device: identity, identity: Some(identity), sig }
+        ProfileRecord { subject: *subject, field, value, rev, device: signer, identity: Some(signer), sig }
+    }
+
+    /// Whether the record is signed by the holder of `bundle`, a pinned public face of the subject (its alias): the record names that key, and BOTH families of the envelope tier verify against the bundle (Ed25519 and Falcon-512), so a forever-valid record never rests on one curve. A bundle without both families is refused, as is a record whose eggs fall short of them.
+    pub fn verify_by(&self, bundle: &crate::pq::KeyBundle) -> bool {
+        if self.identity != Some(bundle.ed25519()) || !scheme::covers(bundle.mask(), crate::pq::ENVELOPE_TIER) {
+            return false;
+        }
+        let msg = Self::signing_bytes_identity(&self.subject, self.field, &self.value, self.rev);
+        eggs_from_bytes(&self.sig).is_ok_and(|eggs| crate::pq::verify_eggs(&eggs, bundle, &msg, crate::pq::ENVELOPE_TIER))
     }
 
     /// Whether the record is its owner's: the setting device's Ed25519 egg verifies, and `member` says that device was in the identity's fleet at the revision (the app's fold check).
@@ -286,6 +299,11 @@ impl ProfileRecord {
 /// `member` is the app's fold check, as in [`ProfileRecord::verify`].
 pub fn accept(held: &mut Vec<ProfileRecord>, rec: ProfileRecord, member: impl Fn(&Key, &Key, i64) -> bool) -> Option<Merged> {
     rec.verify(member).then(|| merge(held, rec))
+}
+
+/// [`accept`] for a record signed by a pinned public face of its subject: held only when [`ProfileRecord::verify_by`] passes against `bundle` and it names `subject`.
+pub fn accept_by(held: &mut Vec<ProfileRecord>, rec: ProfileRecord, subject: &Key, bundle: &crate::pq::KeyBundle) -> Option<Merged> {
+    (rec.subject == *subject && rec.verify_by(bundle)).then(|| merge(held, rec))
 }
 
 /// Offer a verified record to a held set: adopted when it is the first or newer than what is held for its (identity, field). The caller verifies first.
@@ -434,6 +452,26 @@ mod tests {
         }
         assert!(ProfileRecord::from_value(&VsfType::v(b'r', vec![1, 2, 3])).is_err());
         assert!(ProfileRecord::from_value(&VsfType::x("Bloom".to_string())).is_err());
+    }
+
+    #[test]
+    fn an_alias_signed_record_needs_both_families_against_the_pinned_bundle() {
+        let alias = crate::alias::bundle(&[0x3C; 32]);
+        let pinned = alias.public();
+        let rec = ProfileRecord::sign_by(&alias, &HP, Field::Name, b"Bloom".to_vec(), 100);
+        assert_eq!(rec.identity, Some(pinned.ed25519()));
+        assert!(rec.verify_by(&pinned), "Ed25519 and Falcon both verify against the pinned alias");
+        assert!(!crate::pq::eggs_from_bytes(&rec.sig).unwrap().iter().any(|e| e.scheme == scheme::SPHINCS_PLUS), "SPHINCS+ stays off the wire");
+        assert!(!rec.verify_by(&crate::pq::KeyBundle::ed25519_only(&pinned.ed25519())), "one family is not enough: the Falcon key must be pinned too");
+        let mut forged = rec.clone();
+        forged.value = b"Weed".to_vec();
+        assert!(!forged.verify_by(&pinned));
+        let other = crate::alias::bundle(&[0x3D; 32]).public();
+        assert!(!rec.verify_by(&other), "another alias does not speak for this one");
+        let mut held = Vec::new();
+        assert_eq!(accept_by(&mut held, rec.clone(), &[0x45; 32], &pinned), None, "a record naming another subject is not held");
+        assert_eq!(accept_by(&mut held, rec.clone(), &HP, &pinned), Some(Merged::Adopted));
+        assert_eq!(accept_by(&mut held, rec, &HP, &pinned), Some(Merged::Kept));
     }
 
     /// A space as another device of the person's holds it after a hand-over: thru its document, as the fleet carries it.
