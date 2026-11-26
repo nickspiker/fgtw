@@ -12,7 +12,6 @@ use vsf::VsfType;
 
 use crate::fleet::scheme;
 use crate::pq::{eggs_from_bytes, eggs_to_bytes, FleetSigner};
-use vsf::eggs::Egg;
 
 /// A device or identity key.
 pub type Key = [u8; 32];
@@ -110,13 +109,17 @@ impl ProfileRecord {
         m
     }
 
-    /// Sign a profile field with the subject's OWN IDENTITY key — the Ed25519 key `SigningKey::from_bytes(identity_seed)`, whose pubkey is the identity party id every contact pins at first-met (crypto::clutch::identity_party_id). The record then verifies against that pinned identity forever, through every device rotation and ownership change, with no fleet-membership check. `identity_seed` is the caller's own seed (in RAM at attest); it never leaves.
+    /// The identity's own signing bundle: the Ed25519 half is `Keypair::from_seed(identity_seed)`, so its pubkey IS the party id every contact pins at first-met (crypto::clutch::identity_party_id derives it the same way), and the Falcon-512 + SPHINCS+ halves are derived from the same seed — the release/developer-key pattern (pq::SigningBundle). One seed, three independent-assumption schemes, so a forever-valid signature does not rest on one curve (the owner, 2026-11-26: a single egg is the one-basket failure the egg system exists to kill). The name is part of the key and never changes.
+    pub fn identity_bundle(identity_seed: &Key) -> crate::pq::SigningBundle {
+        crate::pq::SigningBundle::developer(identity_seed, "FGTW_IDENTITY")
+    }
+
+    /// Sign a profile field with the subject's OWN IDENTITY — the full three-scheme basket of [`identity_bundle`], not one egg. The record then verifies against that pinned identity (its party-id Ed25519 key, and the Falcon/SPHINCS+ pubkeys of the bundle once pinned) forever, through every device rotation and ownership change, with no fleet-membership check. `identity_seed` is the caller's own seed (in RAM at attest); it never leaves.
     pub fn sign_as_identity(identity_seed: &Key, subject: &Key, field: Field, value: Vec<u8>, rev: i64) -> Self {
-        use ed25519_dalek::{Signer, SigningKey};
-        let sk = SigningKey::from_bytes(identity_seed);
-        let identity = sk.verifying_key().to_bytes();
+        let bundle = Self::identity_bundle(identity_seed);
+        let identity = bundle.keypair().public.to_bytes();
         let msg = Self::signing_bytes_identity(subject, field, &value, rev);
-        let sig = eggs_to_bytes(&[Egg { scheme: scheme::ED25519, sig: sk.sign(&msg).to_bytes().to_vec() }]);
+        let sig = eggs_to_bytes(&bundle.eggs(&msg, scheme::MASK_ALL));
         ProfileRecord { subject: *subject, field, value, rev, device: identity, identity: Some(identity), sig }
     }
 
@@ -274,38 +277,45 @@ mod tests {
     }
 
     #[test]
-    fn an_identity_signed_record_stays_valid_without_any_fleet_membership() {
-        // The owner's rule 2026-11-26: a record signed by the identity itself never lapses, because the signer does not change owners.
+    fn an_identity_signed_record_is_the_full_basket_and_needs_no_fleet_membership() {
+        // The owner's rule 2026-11-26: a record signed by the identity never lapses (the signer does not change owners), AND it is the full three-scheme basket, not a single egg (one egg is the one-basket failure the egg system exists to kill).
         let seed = [7u8; 32];
-        let id_pub = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let bundle = ProfileRecord::identity_bundle(&seed);
+        let id_pub = bundle.keypair().public.to_bytes();
         let rec = ProfileRecord::sign_as_identity(&seed, &HP, Field::Name, b"Zinnia".to_vec(), 100);
-        assert_eq!(rec.identity, Some(id_pub), "the record names the identity that signed it");
+        assert_eq!(rec.identity, Some(id_pub), "the record names the identity (party id) that signed it");
 
-        // The ONLY thing `member` vouches is that the signer is the subject's pinned identity — never a device, never current fleet membership. This closure consults no device set at all.
+        // NOT a single Ed25519 egg: all three independent-assumption schemes are present.
+        let eggs = crate::pq::eggs_from_bytes(&rec.sig).expect("egg list");
+        for want in [scheme::ED25519, scheme::FALCON512, scheme::SPHINCS_PLUS] {
+            assert!(eggs.iter().any(|e| e.scheme == want), "scheme {want} is in the basket");
+        }
+        // The whole basket verifies against the identity's PUBLIC bundle — three independent assumptions, not one curve.
+        let msg = ProfileRecord::signing_bytes_identity(&HP, Field::Name, &rec.value, rec.rev);
+        assert!(crate::pq::verify_eggs(&eggs, &bundle.public(), &msg, scheme::MASK_ALL), "Ed25519 + Falcon + SPHINCS+ all verify");
+
+        // The transitional verify (Ed25519 via the pinned party id) passes with NO device, NO current membership — device churn cannot drop it.
         let is_the_subjects_identity = |subject: &Key, key: &Key, _rev: i64| *subject == HP && *key == id_pub;
         assert!(rec.verify(is_the_subjects_identity), "verifies against the pinned identity with no membership check");
 
-        // A device-signed record from a non-member would fail here (that is the old BOOP); the identity-signed one does not depend on any device, so a closure that would reject every device still accepts it.
-        let rejects_every_device = |subject: &Key, key: &Key, _rev: i64| *subject == HP && *key == id_pub;
-        assert!(rec.verify(rejects_every_device), "device churn — rotations, ownership changes — cannot drop it");
-
-        // Tampering the value breaks the identity signature.
+        // Tampering breaks both the basket and the transitional check.
         let mut forged = rec.clone();
         forged.value = b"NotZinnia".to_vec();
-        assert!(!forged.verify(is_the_subjects_identity), "a tampered value does not verify");
+        let fmsg = ProfileRecord::signing_bytes_identity(&HP, Field::Name, &forged.value, forged.rev);
+        assert!(!crate::pq::verify_eggs(&crate::pq::eggs_from_bytes(&forged.sig).unwrap(), &bundle.public(), &fmsg, scheme::MASK_ALL));
+        assert!(!forged.verify(is_the_subjects_identity));
 
-        // Someone else's identity in the record is rejected: `member` only vouches the subject's own pinned identity.
-        assert!(!rec.verify(|subject: &Key, key: &Key, _| *subject == HP && *key == [9u8; 32]), "a stranger's identity cannot speak for the subject");
+        // A stranger's identity cannot speak for the subject.
+        assert!(!rec.verify(|subject: &Key, key: &Key, _| *subject == HP && *key == [9u8; 32]));
 
-        // Survives the section round-trip with the identity field intact.
-        let back = ProfileRecord::from_section(&rec.to_section()).expect("round-trips");
-        assert_eq!(back, rec, "the identity-signed record encodes and decodes unchanged");
+        // Round-trips through the section encoding with the identity field intact.
+        assert_eq!(ProfileRecord::from_section(&rec.to_section()).expect("round-trips"), rec);
 
-        // A newer identity-signed revision still wins; an older one never does — the resolver is unchanged.
+        // Newest-wins is unchanged.
         let newer = ProfileRecord::sign_as_identity(&seed, &HP, Field::Name, b"Zinnia II".to_vec(), 101);
         let mut held = alloc::vec::Vec::new();
         assert_eq!(accept(&mut held, rec.clone(), is_the_subjects_identity), Some(Merged::Adopted));
-        assert_eq!(accept(&mut held, newer.clone(), is_the_subjects_identity), Some(Merged::Adopted));
+        assert_eq!(accept(&mut held, newer, is_the_subjects_identity), Some(Merged::Adopted));
         assert_eq!(accept(&mut held, rec, is_the_subjects_identity), Some(Merged::Kept), "an older copy never wins");
         assert_eq!(current(&held, &HP, Field::Name).and_then(|r| r.name()), Some("Zinnia II"));
     }
